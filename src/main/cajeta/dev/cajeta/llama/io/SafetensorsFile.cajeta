@@ -1,0 +1,343 @@
+package dev.cajeta.llama.io;
+
+import cajeta.codec.json.Json;
+import cajeta.codec.json.JsonArray;
+import cajeta.codec.json.JsonObject;
+import cajeta.codec.json.JsonValue;
+import cajeta.collection.HashMap;
+import cajeta.io.file.MappedFile;
+import cajeta.lang.String;
+import cajeta.math.Tensor;
+import dev.cajeta.llama.LlamaException;
+
+/**
+ * One `.safetensors` file, memory-mapped (cajeta-llama plan 5.2.1; spec
+ * §3.1–§3.3). The format: an 8-byte little-endian header length, a JSON
+ * header of `name → {dtype, shape, data_offsets}`, then raw little-endian
+ * tensor bytes — nothing executable, no pickle.
+ *
+ * Three deliberate departures from the `dev.cajeta.ml` reader this
+ * replaces for inference:
+ *
+ * - **Mapped, not slurped.** The file is a `MappedFile`; opening parses
+ *   the header (small) and faults nothing else in. A checkpoint larger
+ *   than RAM opens fine and stays as resident as its touched pages.
+ * - **Native dtype.** F16 and BF16 tensors load as `Tensor<float16>` /
+ *   `Tensor<bfloat16>` — the storage bytes ARE the tensor bytes, so a
+ *   load is one bulk copy (`MappedFile.copyTo` into the tensor's buffer),
+ *   not an element-at-a-time widening loop. A 7B bf16 checkpoint costs
+ *   14 GB resident, not 28 GB of widened f32.
+ * - **Linear header parse.** The directory is built by iterating the
+ *   parsed header's entries by index (`keyAt`/`valueAt`) — never
+ *   `keys()`-inside-a-loop — and name lookup is a `HashMap`. Thousands
+ *   of entries parse in linear time (5.1.5).
+ *
+ * Dtype-typed entry points (`loadF16`/`loadBf16`/`loadF32`) rather than a
+ * generic `load<T>`: a kernel-adjacent `Tensor<T>` needs its concrete
+ * element type at the call site (the same language limit that shapes
+ * `Ewise`'s per-dtype ops), and the binding layer (Unit 6) picks the entry
+ * point from the config's declared dtype anyway.
+ */
+public final class SafetensorsFile {
+    MappedFile map;
+    int64 dataStart;
+    int32 n;
+
+    // Parallel directory arrays, filled once at open.
+    String[] tNames;
+    String[] tDtypes;
+    int64[][] tShapes;
+    int64[] tBegins;
+    int64[] tEnds;
+    HashMap<String, int32> nameIdx;
+
+    /**
+     * Map `path` and parse its header. Throws {@link LlamaException} on a
+     * missing/short file, a header that runs past the file, or a tensor
+     * whose claimed byte range falls outside the payload.
+     */
+    public SafetensorsFile(String path) {
+        this.map = heap MappedFile(path);
+        int64 fileLen = this.map.size();
+        if (fileLen < 8) {
+            throw heap LlamaException("safetensors: '" + path + "' is "
+                + fileLen + " bytes - too short to hold the header length");
+        }
+        int64 hlen = this.readU64(0);
+        if (hlen < 0 || 8 + hlen > fileLen) {
+            throw heap LlamaException("safetensors: '" + path + "' claims a "
+                + hlen + "-byte header in a " + fileLen + "-byte file");
+        }
+        int8[] hb = heap int8[hlen];
+        this.map.read(8, hb, 0, hlen);
+        this.dataStart = 8 + hlen;
+
+        JsonValue hv = Json.parse(hb, hlen);
+        JsonObject hdr = hv.asObject();
+
+        // First pass: count tensor entries (everything but __metadata__).
+        int32 total = hdr.count();
+        int32 tensors = 0;
+        int32 k = 0;
+        while (k < total) {
+            if (!this.isMetaKey(hdr, k)) {
+                tensors = tensors + 1;
+            }
+            k = k + 1;
+        }
+        this.n = tensors;
+        this.tNames = heap String[tensors];
+        this.tDtypes = heap String[tensors];
+        this.tShapes = heap int64[tensors][];
+        this.tBegins = heap int64[tensors];
+        this.tEnds = heap int64[tensors];
+        this.nameIdx = heap HashMap<String, int32>();
+
+        int64 payloadLen = fileLen - this.dataStart;
+        int32 out = 0;
+        k = 0;
+        while (k < total) {
+            if (!this.isMetaKey(hdr, k)) {
+                String name = this.keyString(hdr, k);
+                JsonObject entry = hdr.valueAt(k).asObject();
+                JsonValue dv = entry.get("dtype");
+                if (dv == null) {
+                    throw heap LlamaException("safetensors: '" + name
+                        + "' has no dtype field");
+                }
+                JsonArray shapeArr = entry.get("shape").asArray();
+                JsonArray offs = entry.get("data_offsets").asArray();
+                int64 begin = offs.get(0).asInt64();
+                int64 end = offs.get(1).asInt64();
+                if (begin > end || end > payloadLen) {
+                    throw heap LlamaException("safetensors: '" + name
+                        + "' claims bytes [" + begin + ", " + end
+                        + ") which fall outside the " + payloadLen
+                        + "-byte payload");
+                }
+                int32 nd = shapeArr.count();
+                int64[] shape = heap int64[nd];
+                int32 d = 0;
+                while (d < nd) {
+                    shape[d] = shapeArr.get(d).asInt64();
+                    d = d + 1;
+                }
+                // Owned values move into the directory arrays — a plain
+                // borrow store would dangle when the loop-local drops
+                // (the json-grow-element-uaf lesson, in the other direction).
+                this.tNames[out] #= name;
+                this.tDtypes[out] #= dv.asString();
+                this.tShapes[out] #= shape;
+                this.tBegins[out] = begin;
+                this.tEnds[out] = end;
+                this.nameIdx.put(this.tNames[out], out);
+                out = out + 1;
+            }
+            k = k + 1;
+        }
+    }
+
+    /** Number of tensors in the file (excluding `__metadata__`). */
+    public int32 tensorCount() {
+        return this.n;
+    }
+
+    /** Directory index of `name`, or -1 when absent. */
+    public int32 indexOf(String name) {
+        if (!this.nameIdx.containsKey(name)) {
+            return -1;
+        }
+        return this.nameIdx.get(name);
+    }
+
+    /** Tensor name at directory index `i`. */
+    public String nameAt(int32 i) {
+        return this.tNames[i];
+    }
+
+    /** Stored dtype string at directory index `i` — "F32", "F16", "BF16", …. */
+    public String dtypeOf(int32 i) {
+        return this.tDtypes[i];
+    }
+
+    /** Rank of the tensor at directory index `i`. */
+    public int32 ndimOf(int32 i) {
+        return (int32) this.tShapes[i].count();
+    }
+
+    /** Extent of dimension `d` of the tensor at directory index `i`. */
+    public int64 shapeAt(int32 i, int32 d) {
+        return this.tShapes[i][d];
+    }
+
+    /** Stored byte length of the tensor at directory index `i`. */
+    public int64 byteSizeOf(int32 i) {
+        return this.tEnds[i] - this.tBegins[i];
+    }
+
+    // ── typed loads (native dtype, one bulk copy each) ──────────────────
+
+    /** Load an F16 tensor at its stored dtype. */
+    public #Tensor<float16> loadF16(String name) {
+        int32 i = this.require(name, "F16");
+        Tensor<float16> t = Tensor.zeros<float16>(this.shapeCopy(i));
+        this.copyInto(i, t.hostAddress(), 2, name);
+        return #t;
+    }
+
+    /** Load a BF16 tensor at its stored dtype. */
+    public #Tensor<bfloat16> loadBf16(String name) {
+        int32 i = this.require(name, "BF16");
+        Tensor<bfloat16> t = Tensor.zeros<bfloat16>(this.shapeCopy(i));
+        this.copyInto(i, t.hostAddress(), 2, name);
+        return #t;
+    }
+
+    /** Load an F32 tensor. */
+    public #Tensor<float32> loadF32(String name) {
+        int32 i = this.require(name, "F32");
+        Tensor<float32> t = Tensor.zeros<float32>(this.shapeCopy(i));
+        this.copyInto(i, t.hostAddress(), 4, name);
+        return #t;
+    }
+
+    // ── device loads (5.2.5) ────────────────────────────────────────────
+    //
+    // Straight to the device with no full host materialization: each load
+    // stages exactly ONE tensor on the host, uploads it, and the upload
+    // releases the host mirror (Storage.toDevice, cajeta-llama Unit 3) —
+    // so a whole-model device load peaks at O(largest tensor) of host RAM
+    // plus the reclaimable page cache the copy read through the mapping.
+
+    /** Load an F16 tensor device-resident; host staging is released. */
+    public #Tensor<float16> loadF16Device(String name) {
+        Tensor<float16> t = this.loadF16(name);
+        t.gpu();
+        return #t;
+    }
+
+    /** Load a BF16 tensor device-resident; host staging is released. */
+    public #Tensor<bfloat16> loadBf16Device(String name) {
+        Tensor<bfloat16> t = this.loadBf16(name);
+        t.gpu();
+        return #t;
+    }
+
+    /** Load an F32 tensor device-resident; host staging is released. */
+    public #Tensor<float32> loadF32Device(String name) {
+        Tensor<float32> t = this.loadF32(name);
+        t.gpu();
+        return #t;
+    }
+
+    /** Unmap. Idempotent; loaded tensors are unaffected (they own copies). */
+    public void close() {
+        this.map.close();
+    }
+
+    // ── internals ───────────────────────────────────────────────────────
+
+    /**
+     * Resolve `name` and check its stored dtype is `want`. The error names
+     * the tensor and the dtype in play (5.1.4) — for an unsupported or
+     * mismatched dtype the caller sees both what was asked and what is
+     * stored, plus the supported set.
+     */
+    int32 require(String name, String want) {
+        int32 i = this.indexOf(name);
+        if (i < 0) {
+            throw heap LlamaException("safetensors: no tensor named '"
+                + name + "' in this file");
+        }
+        String have = this.tDtypes[i];
+        if (have != want) {
+            throw heap LlamaException("safetensors: tensor '" + name
+                + "' is stored as " + have + ", not " + want
+                + ". This reader loads F16, BF16 and F32 at native dtype;"
+                + " pick the loader matching the stored dtype.");
+        }
+        return i;
+    }
+
+    /** A fresh owned copy of entry `i`'s shape (Tensor factories consume it). */
+    #int64[] shapeCopy(int32 i) {
+        int64[] src = this.tShapes[i];
+        int32 nd = (int32) src.count();
+        int64[] out = heap int64[nd];
+        int32 d = 0;
+        while (d < nd) {
+            out[d] = src[d];
+            d = d + 1;
+        }
+        return #out;
+    }
+
+    /**
+     * One bulk copy of entry `i`'s bytes into the destination buffer at
+     * `dstAddr` — `MappedFile.copyTo`, no element loop (5.2.2). Validates
+     * the stored byte length against the shape's element count first.
+     */
+    void copyInto(int32 i, int64 dstAddr, int32 elemBytes, String name) {
+        int64 count = 1;
+        int64[] shape = this.tShapes[i];
+        int32 d = 0;
+        while (d < (int32) shape.count()) {
+            count = count * shape[d];
+            d = d + 1;
+        }
+        int64 want = count * (int64) elemBytes;
+        int64 got = this.tEnds[i] - this.tBegins[i];
+        if (got != want) {
+            throw heap LlamaException("safetensors: tensor '" + name
+                + "' spans " + got + " bytes but its shape and dtype need "
+                + want);
+        }
+        int64 copied = this.map.copyTo(this.dataStart + this.tBegins[i],
+                                       dstAddr, want);
+        if (copied != want) {
+            throw heap LlamaException("safetensors: bulk copy for '" + name
+                + "' returned " + copied + " of " + want + " bytes");
+        }
+    }
+
+    /** Little-endian u64 read through the mapping's per-byte probe. */
+    int64 readU64(int64 at) {
+        int64 v = 0;
+        int64 k = 7;
+        while (k >= 0) {
+            int64 b = (int64) this.map.get(at + k);
+            if (b < 0) {
+                b = b + 256;
+            }
+            v = (v << 8) | b;
+            k = k - 1;
+        }
+        return v;
+    }
+
+    /** Is header entry `k` the `__metadata__` provenance blob? */
+    boolean isMetaKey(JsonObject hdr, int32 k) {
+        int32 len = hdr.keyLenAt(k);
+        if (len != 12) {
+            return false;
+        }
+        // "__metadata__"
+        int8[] kb = hdr.keyAt(k);
+        return kb[0] == 95 && kb[1] == 95 && kb[2] == 109 && kb[3] == 101
+            && kb[4] == 116 && kb[5] == 97 && kb[6] == 100 && kb[7] == 97
+            && kb[8] == 116 && kb[9] == 97 && kb[10] == 95 && kb[11] == 95;
+    }
+
+    /** Header entry `k`'s key, decoded as an owned String. */
+    #String keyString(JsonObject hdr, int32 k) {
+        int32 len = hdr.keyLenAt(k);
+        int8[] copy = heap int8[len];
+        int8[] src = hdr.keyAt(k);
+        int32 j = 0;
+        while (j < len) {
+            copy[j] = src[j];
+            j = j + 1;
+        }
+        return #heap String(#copy, len);
+    }
+}

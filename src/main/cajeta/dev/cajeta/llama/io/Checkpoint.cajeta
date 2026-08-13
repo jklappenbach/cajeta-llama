@@ -1,0 +1,191 @@
+package dev.cajeta.llama.io;
+
+import cajeta.codec.json.Json;
+import cajeta.codec.json.JsonObject;
+import cajeta.codec.json.JsonValue;
+import cajeta.collection.ArrayList;
+import cajeta.collection.HashMap;
+import cajeta.io.file.File;
+import cajeta.lang.String;
+import cajeta.math.Tensor;
+import dev.cajeta.llama.LlamaException;
+
+/**
+ * A whole checkpoint as one logical state dict (cajeta-llama plan 5.2.3;
+ * spec §3.4) — one `.safetensors` file, or a Hugging Face sharded layout
+ * where `model.safetensors.index.json` carries a `weight_map` of
+ * `tensor name → shard filename`. Either way the caller sees a single
+ * name → tensor surface; shard resolution is this class's problem.
+ *
+ * `open` decides by filename: a path ending in `.json` is a sharded
+ * index (shard filenames resolve against the index's directory, per the
+ * HF layout); anything else is a single safetensors file.
+ *
+ * Shards open eagerly — each is an mmap + a header parse, cheap and
+ * page-lazy — so a bad shard fails at open, not at the 40th minute of a
+ * long load.
+ */
+public final class Checkpoint {
+    SafetensorsFile[] shards;
+    int32 shardCount;
+    // name → packed location: (shard index << 32) | directory index.
+    HashMap<String, int64> where;
+    int32 n;
+
+    Checkpoint() {
+        this.shards = null;
+        this.shardCount = 0;
+        this.where = heap HashMap<String, int64>();
+        this.n = 0;
+    }
+
+    /** Open a checkpoint — a `.safetensors` file or a sharded index JSON. */
+    public static #Checkpoint open(String path) {
+        Checkpoint c = heap Checkpoint();
+        if (path.endsWith(".json")) {
+            c.openSharded(path);
+        } else {
+            c.openSingle(path);
+        }
+        return #c;
+    }
+
+    /** Tensors across every shard. */
+    public int32 tensorCount() {
+        return this.n;
+    }
+
+    /** `true` when `name` resolves to a tensor in some shard. */
+    public boolean contains(String name) {
+        return this.where.containsKey(name);
+    }
+
+    /** Load an F16 tensor from whichever shard holds it. */
+    public #Tensor<float16> loadF16(String name) {
+        SafetensorsFile f = this.shardFor(name);
+        return f.loadF16(name);
+    }
+
+    /** Load a BF16 tensor from whichever shard holds it. */
+    public #Tensor<bfloat16> loadBf16(String name) {
+        SafetensorsFile f = this.shardFor(name);
+        return f.loadBf16(name);
+    }
+
+    /** Load an F32 tensor from whichever shard holds it. */
+    public #Tensor<float32> loadF32(String name) {
+        SafetensorsFile f = this.shardFor(name);
+        return f.loadF32(name);
+    }
+
+    /** Stored dtype of `name` — for the binding layer's loader pick. */
+    public String dtypeOf(String name) {
+        SafetensorsFile f = this.shardFor(name);
+        return f.dtypeOf(f.indexOf(name));
+    }
+
+    /** Unmap every shard. Loaded tensors are unaffected (they own copies). */
+    public void close() {
+        int32 i = 0;
+        while (i < this.shardCount) {
+            this.shards[i].close();
+            i = i + 1;
+        }
+    }
+
+    // ── internals ───────────────────────────────────────────────────────
+
+    void openSingle(String path) {
+        this.shards = heap SafetensorsFile[1];
+        this.shards[0] #= heap SafetensorsFile(path);
+        this.shardCount = 1;
+        this.indexShard(0);
+    }
+
+    void openSharded(String indexPath) {
+        int8[] raw = File.readAllBytes(indexPath);
+        int64 rawLen = (int64) raw.count();
+        if (rawLen <= 0) {
+            throw heap LlamaException("checkpoint: index '" + indexPath
+                + "' is missing or empty");
+        }
+        JsonValue v = Json.parse(raw, rawLen);
+        JsonObject root = v.asObject();
+        JsonValue wm = root.get("weight_map");
+        if (wm == null) {
+            throw heap LlamaException("checkpoint: index '" + indexPath
+                + "' has no weight_map");
+        }
+        JsonObject weightMap = wm.asObject();
+        String dir = Checkpoint.dirOf(indexPath);
+
+        // Unique shard files, in first-appearance order.
+        HashMap<String, int32> shardIdx = heap HashMap<String, int32>();
+        ArrayList<String> shardFiles = heap ArrayList<String>();
+        int32 k = 0;
+        while (k < weightMap.count()) {
+            String fname = weightMap.valueAt(k).asString();
+            if (!shardIdx.containsKey(fname)) {
+                int32 pos = (int32) shardFiles.count();
+                // The LIST takes ownership; the dedup map's key borrows the
+                // list's element (HashMap.put stores plain args as borrows,
+                // so the key must outlive the loop-local — it's consulted by
+                // containsKey on later iterations).
+                shardFiles.add(#fname);
+                shardIdx.put(shardFiles.get(pos), pos);
+            }
+            k = k + 1;
+        }
+        int32 nShards = (int32) shardFiles.count();
+        this.shards = heap SafetensorsFile[nShards];
+        int32 s = 0;
+        while (s < nShards) {
+            String shardPath = dir + shardFiles.get(s);
+            this.shards[s] #= heap SafetensorsFile(shardPath);
+            s = s + 1;
+        }
+        this.shardCount = nShards;
+        s = 0;
+        while (s < nShards) {
+            this.indexShard(s);
+            s = s + 1;
+        }
+    }
+
+    /** Fold shard `s`'s directory into the checkpoint-wide name map. */
+    void indexShard(int32 s) {
+        SafetensorsFile f = this.shards[s];
+        int32 i = 0;
+        while (i < f.tensorCount()) {
+            int64 packed = ((int64) s << 32) | (int64) i;
+            this.where.put(f.nameAt(i), packed);
+            this.n = this.n + 1;
+            i = i + 1;
+        }
+    }
+
+    /** The shard holding `name`; throws naming the tensor when absent. */
+    SafetensorsFile shardFor(String name) {
+        if (!this.where.containsKey(name)) {
+            throw heap LlamaException("checkpoint: no tensor named '" + name
+                + "' in any shard");
+        }
+        int64 packed = this.where.get(name);
+        int32 s = (int32) (packed >>> 32);
+        return this.shards[s];
+    }
+
+    /** `path` up to and including its last '/' — "" when path has none. */
+    static #String dirOf(String path) {
+        int64 last = -1;
+        int64 at = path.indexOf("/");
+        while (at >= 0) {
+            last = at;
+            at = path.indexOfFrom("/", at + 1);
+        }
+        if (last < 0) {
+            return "";
+        }
+        return path.substring(0, (int32) (last + 1));
+    }
+}

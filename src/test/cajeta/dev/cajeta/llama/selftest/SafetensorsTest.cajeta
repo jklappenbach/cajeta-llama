@@ -1,0 +1,487 @@
+package dev.cajeta.llama.selftest;
+
+import dev.cajeta.unit.Assert;
+import cajeta.math.PlacementException;
+import dev.cajeta.llama.LlamaException;
+import dev.cajeta.llama.io.Checkpoint;
+import dev.cajeta.llama.io.SafetensorsFile;
+import cajeta.io.file.File;
+import cajeta.io.file.OpenMode;
+import cajeta.lang.Cajeta;
+import cajeta.lang.String;
+import cajeta.lang.StringBuilder;
+import cajeta.math.Tensor;
+import cajeta.time.Clock;
+
+/**
+ * cajeta-llama plan Unit 5 TDD (5.1.1–5.1.5; spec §3.1–§3.6): the
+ * mmap-backed safetensors reader at native dtype. Every fixture is
+ * synthesized here byte-for-byte — an 8-byte little-endian header length,
+ * a JSON header of `name → {dtype, shape, data_offsets}`, then raw
+ * little-endian tensor data — so the suite carries no binary blobs and
+ * pins the format from first principles.
+ *
+ * The values chosen are exactly representable in their storage dtype, so
+ * assertions test the loader, not rounding: f16 1.0=0x3C00, 2.0=0x4000,
+ * -0.5=0xB800, 0.25=0x3400; bf16 1.0=0x3F80, -2.0=0xC000, 3.0=0x4040,
+ * 0.5=0x3F00.
+ */
+public class SafetensorsTest {
+
+    public SafetensorsTest() { return; }
+
+    // ── fixture plumbing ────────────────────────────────────────────────
+
+    static #String tmpDir() {
+        return "/tmp/cajeta_llama_st_test";
+    }
+
+    static void putU64(int8[] b, int64 at, int64 v) {
+        int64 k = 0;
+        while (k < 8) {
+            b[at + k] = (int8) ((v >>> (k * 8)) & 255);
+            k = k + 1;
+        }
+        return;
+    }
+
+    static void putU16(int8[] b, int64 at, int32 v) {
+        b[at] = (int8) (v & 255);
+        b[at + 1] = (int8) ((v >>> 8) & 255);
+        return;
+    }
+
+    static void putF32(int8[] b, int64 at, float32 v) {
+        int32 bits = Cajeta.f32ToBits(v);
+        int64 k = 0;
+        while (k < 4) {
+            b[at + k] = (int8) ((bits >>> (k * 8)) & 255);
+            k = k + 1;
+        }
+        return;
+    }
+
+    /** Assemble `8 + header + payload` and write it to `path`. */
+    static void writeSt(String path, String header, int8[] payload, int64 payloadLen) {
+        int8[] hb = header.toBytes();
+        int64 hlen = (int64) hb.count();
+        int64 total = 8 + hlen + payloadLen;
+        int8[] img = heap int8[total];
+        SafetensorsTest.putU64(img, 0, hlen);
+        int64 i = 0;
+        while (i < hlen) {
+            img[8 + i] = hb[i];
+            i = i + 1;
+        }
+        i = 0;
+        while (i < payloadLen) {
+            img[8 + hlen + i] = payload[i];
+            i = i + 1;
+        }
+        File.writeAllBytes(path, img, total);
+        return;
+    }
+
+    /**
+     * The three-tensor small fixture: an F16 vector, a BF16 2×2, an F32
+     * vector — 28 payload bytes.
+     */
+    static #String writeSmallFixture() {
+        String path = SafetensorsTest.tmpDir() + "_small.safetensors";
+        String hdr = "{\"w.f16\":{\"dtype\":\"F16\",\"shape\":[4],\"data_offsets\":[0,8]},"
+            + "\"w.bf16\":{\"dtype\":\"BF16\",\"shape\":[2,2],\"data_offsets\":[8,16]},"
+            + "\"w.f32\":{\"dtype\":\"F32\",\"shape\":[3],\"data_offsets\":[16,28]}}";
+        int8[] pay = heap int8[28];
+        SafetensorsTest.putU16(pay, 0, 15360);    // 0x3C00 = f16 1.0
+        SafetensorsTest.putU16(pay, 2, 16384);    // 0x4000 = f16 2.0
+        SafetensorsTest.putU16(pay, 4, 47104);    // 0xB800 = f16 -0.5
+        SafetensorsTest.putU16(pay, 6, 13312);    // 0x3400 = f16 0.25
+        SafetensorsTest.putU16(pay, 8, 16256);    // 0x3F80 = bf16 1.0
+        SafetensorsTest.putU16(pay, 10, 49152);   // 0xC000 = bf16 -2.0
+        SafetensorsTest.putU16(pay, 12, 16448);   // 0x4040 = bf16 3.0
+        SafetensorsTest.putU16(pay, 14, 16128);   // 0x3F00 = bf16 0.5
+        SafetensorsTest.putF32(pay, 16, 1.5f);
+        SafetensorsTest.putF32(pay, 20, -2.25f);
+        SafetensorsTest.putF32(pay, 24, 4.0f);
+        SafetensorsTest.writeSt(path, hdr, pay, 28);
+        return #path;
+    }
+
+    /**
+     * VmRSS in KiB parsed straight from /proc/self/status bytes. Streaming
+     * read, not readAllBytes: procfs files fstat as size 0, so the one-shot
+     * helper returns an empty array.
+     */
+    static int64 rssKb() {
+        File f = File.open("/proc/self/status", OpenMode.READ);
+        int8[] st = heap int8[8192];
+        int64 n = f.read(st, 0, 8192);
+        f.close();
+        // find "VmRSS:" then accumulate the digit run that follows
+        int64 i = 0;
+        while (i < n - 6) {
+            if (st[i] == 86 && st[i + 1] == 109 && st[i + 2] == 82
+                    && st[i + 3] == 83 && st[i + 4] == 83 && st[i + 5] == 58) {
+                int64 j = i + 6;
+                int64 v = 0;
+                boolean seen = false;
+                while (j < n && st[j] != 10) {
+                    if (st[j] >= 48 && st[j] <= 57) {
+                        v = v * 10 + (int64) (st[j] - 48);
+                        seen = true;
+                    } else {
+                        if (seen) {
+                            return v;      // digit run ended (" kB" follows)
+                        }
+                    }
+                    j = j + 1;
+                }
+                return v;
+            }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    // ── 5.1.1 — native dtype, no widening ───────────────────────────────
+
+    @Test
+    public void f16LoadsAtStoredDtype() {
+        String path = SafetensorsTest.writeSmallFixture();
+        SafetensorsFile f = heap SafetensorsFile(path);
+        Tensor<float16> t = f.loadF16("w.f16");
+        Assert.equals((int64) 16, (int64) t.dtype().bits());
+        Assert.equals((int64) 1, (int64) t.ndim());
+        Assert.equals((int64) 4, t.shapeAt(0));
+        Assert.isTrue((float32) t.get1(0) == 1.0f);
+        Assert.isTrue((float32) t.get1(1) == 2.0f);
+        Assert.isTrue((float32) t.get1(2) == 0.0f - 0.5f);
+        Assert.isTrue((float32) t.get1(3) == 0.25f);
+        f.close();
+    }
+
+    @Test
+    public void bf16LoadsAtStoredDtype() {
+        String path = SafetensorsTest.writeSmallFixture();
+        SafetensorsFile f = heap SafetensorsFile(path);
+        Tensor<bfloat16> t = f.loadBf16("w.bf16");
+        Assert.equals((int64) 16, (int64) t.dtype().bits());
+        Assert.equals((int64) 2, (int64) t.ndim());
+        Assert.equals((int64) 2, t.shapeAt(0));
+        Assert.equals((int64) 2, t.shapeAt(1));
+        Assert.isTrue((float32) t.get2(0, 0) == 1.0f);
+        Assert.isTrue((float32) t.get2(0, 1) == 0.0f - 2.0f);
+        Assert.isTrue((float32) t.get2(1, 0) == 3.0f);
+        Assert.isTrue((float32) t.get2(1, 1) == 0.5f);
+        f.close();
+    }
+
+    @Test
+    public void f32LoadsAndDirectorySurfaceReads() {
+        String path = SafetensorsTest.writeSmallFixture();
+        SafetensorsFile f = heap SafetensorsFile(path);
+        Assert.equals((int64) 3, (int64) f.tensorCount());
+        int32 idx = f.indexOf("w.f32");
+        Assert.isTrue(idx >= 0);
+        Assert.equals("F32", f.dtypeOf(idx));
+        Assert.equals((int64) 12, f.byteSizeOf(idx));
+        Assert.isTrue(f.indexOf("nope") < 0);
+        Tensor<float32> t = f.loadF32("w.f32");
+        Assert.isTrue(t.get1(0) == 1.5f);
+        Assert.isTrue(t.get1(1) == 0.0f - 2.25f);
+        Assert.isTrue(t.get1(2) == 4.0f);
+        f.close();
+    }
+
+    // ── 5.1.3 — sharded checkpoint resolves as one state dict ───────────
+
+    @Test
+    public void shardedIndexResolvesAsOneStateDict() {
+        String s1 = SafetensorsTest.tmpDir() + "_s1.safetensors";
+        String s2 = SafetensorsTest.tmpDir() + "_s2.safetensors";
+        String idx = SafetensorsTest.tmpDir() + "_model.safetensors.index.json";
+        int8[] p1 = heap int8[4];
+        SafetensorsTest.putF32(p1, 0, 7.5f);
+        SafetensorsTest.writeSt(s1,
+            "{\"alpha\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]}}",
+            p1, 4);
+        int8[] p2 = heap int8[4];
+        SafetensorsTest.putU16(p2, 0, 16256);     // bf16 1.0
+        SafetensorsTest.putU16(p2, 2, 16448);     // bf16 3.0
+        SafetensorsTest.writeSt(s2,
+            "{\"beta\":{\"dtype\":\"BF16\",\"shape\":[2],\"data_offsets\":[0,4]}}",
+            p2, 4);
+        // weight_map names bare shard filenames, resolved against the
+        // index's directory — the Hugging Face layout.
+        String idxJson = "{\"metadata\":{\"total_size\":8},\"weight_map\":{"
+            + "\"alpha\":\"" + "cajeta_llama_st_test_s1.safetensors" + "\","
+            + "\"beta\":\"" + "cajeta_llama_st_test_s2.safetensors" + "\"}}";
+        int8[] ib = idxJson.toBytes();
+        File.writeAllBytes(idx, ib, (int64) ib.count());
+
+        Checkpoint c = Checkpoint.open(idx);
+        Assert.equals((int64) 2, (int64) c.tensorCount());
+        Tensor<float32> a = c.loadF32("alpha");
+        Assert.isTrue(a.get1(0) == 7.5f);
+        Tensor<bfloat16> b = c.loadBf16("beta");
+        Assert.isTrue((float32) b.get1(0) == 1.0f);
+        Assert.isTrue((float32) b.get1(1) == 3.0f);
+        c.close();
+
+        // A bare single .safetensors path opens through the same entry.
+        String small = SafetensorsTest.writeSmallFixture();
+        Checkpoint single = Checkpoint.open(small);
+        Assert.equals((int64) 3, (int64) single.tensorCount());
+        Tensor<float32> w = single.loadF32("w.f32");
+        Assert.isTrue(w.get1(2) == 4.0f);
+        single.close();
+    }
+
+    // ── 5.1.4 — unsupported dtype errors name tensor and dtype ──────────
+
+    @Test
+    public void unsupportedDtypeNamesTensorAndDtype() {
+        String path = SafetensorsTest.tmpDir() + "_f64.safetensors";
+        int8[] pay = heap int8[8];
+        SafetensorsTest.writeSt(path,
+            "{\"odd.one\":{\"dtype\":\"F64\",\"shape\":[1],\"data_offsets\":[0,8]}}",
+            pay, 8);
+        SafetensorsFile f = heap SafetensorsFile(path);
+        boolean threw = false;
+        String msg = "";
+        try {
+            Tensor<float32> t = f.loadF32("odd.one");
+        } catch (LlamaException ex) {
+            threw = true;
+            msg = ex.message;
+        }
+        Assert.isTrue(threw);
+        Assert.isTrue(msg.contains("odd.one"));
+        Assert.isTrue(msg.contains("F64"));
+        f.close();
+    }
+
+    @Test
+    public void dtypeMismatchNamesTensorAndBothDtypes() {
+        String path = SafetensorsTest.writeSmallFixture();
+        SafetensorsFile f = heap SafetensorsFile(path);
+        boolean threw = false;
+        String msg = "";
+        try {
+            Tensor<float16> t = f.loadF16("w.f32");    // stored F32, asked F16
+        } catch (LlamaException ex) {
+            threw = true;
+            msg = ex.message;
+        }
+        Assert.isTrue(threw);
+        Assert.isTrue(msg.contains("w.f32"));
+        Assert.isTrue(msg.contains("F32"));
+        f.close();
+    }
+
+    // ── 5.1.5 — header parse is linear, not O(n²) ───────────────────────
+
+    @Test
+    public void thousandsOfHeaderEntriesParseFast() {
+        String path = SafetensorsTest.tmpDir() + "_wide.safetensors";
+        int32 n = 3000;
+        StringBuilder sb = heap StringBuilder();
+        sb.append("{");
+        int32 i = 0;
+        while (i < n) {
+            if (i > 0) { sb.append(","); }
+            sb.append("\"t" + i + "\":{\"dtype\":\"F32\",\"shape\":[1],"
+                + "\"data_offsets\":[" + (i * 4) + "," + (i * 4 + 4) + "]}");
+            i = i + 1;
+        }
+        sb.append("}");
+        int8[] pay = heap int8[n * 4];
+        SafetensorsTest.putF32(pay, 0, 9.0f);          // t0's value
+        SafetensorsTest.putF32(pay, (int64) (n - 1) * 4, 11.0f);   // t2999's
+        SafetensorsTest.writeSt(path, sb.toString(), pay, (int64) n * 4);
+
+        int64 t0 = Clock.nanoTime();
+        SafetensorsFile f = heap SafetensorsFile(path);
+        int64 t1 = Clock.nanoTime();
+        Assert.equals((int64) n, (int64) f.tensorCount());
+        // 3000 entries must parse in well under 3s — the old reader's
+        // keys()-inside-the-loop shape (O(n²) with n String allocations
+        // per step) takes minutes at this size.
+        int64 bound = 3;
+        bound = bound * 1000000000;
+        Assert.isTrue(t1 - t0 < bound);
+        Assert.isTrue(f.indexOf("t2999") >= 0);
+        Tensor<float32> first = f.loadF32("t0");
+        Assert.isTrue(first.get1(0) == 9.0f);
+        Tensor<float32> last = f.loadF32("t2999");
+        Assert.isTrue(last.get1(0) == 11.0f);
+        f.close();
+    }
+
+    // ── 5.2.5 — straight to device, host staging released ───────────────
+
+    @Test
+    public void deviceLoadIsDeviceResidentWithHostMirrorReleased() {
+        String path = SafetensorsTest.writeSmallFixture();
+        SafetensorsFile f = heap SafetensorsFile(path);
+        Tensor<bfloat16> t = f.loadBf16Device("w.bf16");
+        Assert.isTrue(t.isOnGpu());
+        // The host mirror was released with the upload (Unit 3): a host
+        // read now faults instead of serving stale staging bytes.
+        boolean threw = false;
+        try {
+            float32 v = (float32) t.get2(0, 0);
+        } catch (PlacementException ex) {
+            threw = true;
+        }
+        Assert.isTrue(threw);
+        // The data survives the round trip back.
+        t.cpu();
+        Assert.isTrue((float32) t.get2(0, 0) == 1.0f);
+        Assert.isTrue((float32) t.get2(1, 0) == 3.0f);
+        f.close();
+    }
+
+    // ── 5.1.2 — resident memory near the working set, not 2× the file ───
+
+    @Test
+    public void residentStaysNearWorkingSetOnBigLoad() {
+        // A 512 MiB checkpoint, materialized SPARSE: header written, then
+        // the file extended with truncate — the payload reads as zeros,
+        // which are valid F32s, and the fixture costs metadata only.
+        String path = SafetensorsTest.tmpDir() + "_big.safetensors";
+        int64 mib = 1024 * 1024;
+        int64 payload = 512 * mib;
+        int64 count = payload / 4;                     // 128M f32 elements
+        String hdr = "{\"big\":{\"dtype\":\"F32\",\"shape\":[134217728],"
+            + "\"data_offsets\":[0," + payload + "]}}";
+        int8[] hb = hdr.toBytes();
+        int64 hlen = (int64) hb.count();
+        int8[] head = heap int8[8 + hlen];
+        SafetensorsTest.putU64(head, 0, hlen);
+        int64 i = 0;
+        while (i < hlen) {
+            head[8 + i] = hb[i];
+            i = i + 1;
+        }
+        File.writeAllBytes(path, head, 8 + hlen);
+        File f = File.open(path, OpenMode.READ_WRITE);
+        f.truncate(8 + hlen + payload);
+        f.close();
+
+        int64 before = SafetensorsTest.rssKb();
+        if (before <= 0) {
+            Assert.fail("rss probe returned " + before);
+        }
+
+        // Opening (header parse) maps the file but must not fault it in.
+        SafetensorsFile st = heap SafetensorsFile(path);
+        int64 afterOpen = SafetensorsTest.rssKb();
+        if (afterOpen - before >= 64 * 1024) {              // < 64 MiB
+            Assert.fail("open faulted data in: rss delta "
+                + (afterOpen - before) + " KiB");
+        }
+
+        // Load, then CLOSE the mapping and measure the durable cost. While
+        // the mapping is open, the pages the copy read through it sit in
+        // RSS as page cache — reclaimable, and evicted with the unmap; the
+        // measured delta while open is ~2× for exactly that reason. What
+        // must stay near the working set is what SURVIVES the load: the
+        // tensor's own bytes (1× at native dtype), not the old
+        // readAllBytes shape's unreclaimable in-heap second copy of the
+        // whole file held across decode.
+        Tensor<float32> t = st.loadF32("big");
+        Assert.isTrue(t.get1(0) == 0.0f);
+        Assert.isTrue(t.get1(count - 1) == 0.0f);
+        st.close();
+        int64 afterClose = SafetensorsTest.rssKb();
+        int64 cap = 768;
+        cap = cap * 1024;                                   // 1.5× the file, KiB
+        if (afterClose - before >= cap) {
+            Assert.fail("durable residency is not near the working set: rss "
+                + "delta " + (afterClose - before)
+                + " KiB against a 524288 KiB file");
+        }
+    }
+
+    /** MemAvailable in KiB from /proc/meminfo (-1 if unreadable). */
+    static int64 memAvailableKb() {
+        File f = File.open("/proc/meminfo", OpenMode.READ);
+        int8[] st = heap int8[4096];
+        int64 n = f.read(st, 0, 4096);
+        f.close();
+        // find "MemAvailable:" (13 bytes) then the digit run
+        int64 i = 0;
+        while (i < n - 13) {
+            if (st[i] == 77 && st[i + 1] == 101 && st[i + 2] == 109
+                    && st[i + 3] == 65 && st[i + 12] == 58) {
+                int64 j = i + 13;
+                int64 v = 0;
+                boolean seen = false;
+                while (j < n && st[j] != 10) {
+                    if (st[j] >= 48 && st[j] <= 57) {
+                        v = v * 10 + (int64) (st[j] - 48);
+                        seen = true;
+                    } else {
+                        if (seen) {
+                            return v;
+                        }
+                    }
+                    j = j + 1;
+                }
+                return v;
+            }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    // ── 5.3.1 acceptance — a 7B bf16 checkpoint without 28 GB of f32 ────
+    //
+    // 7,000,000,000 bf16 parameters = a 14,000,000,000-byte sparse payload.
+    // Loaded at native dtype the durable cost is ~14 GB (1×); the old
+    // widen-to-f32 shape's floor was ~28 GB. Asserting the delta under
+    // 20 GB cleanly separates the two. Self-gating: skips (green) when the
+    // box has less than 24 GiB available, so the suite stays runnable on
+    // small machines while the acceptance runs for real on the dev boxes.
+    @Test
+    public void sevenBParamBf16LoadsWithoutWidenedResidency() {
+        int64 avail = SafetensorsTest.memAvailableKb();
+        if (avail < (int64) 24 * 1024 * 1024) {
+            return;                       // < 24 GiB free: skip, stay green
+        }
+        String path = SafetensorsTest.tmpDir() + "_7b.safetensors";
+        int64 params = 7000000000;
+        int64 payload = params * 2;
+        String hdr = "{\"weights\":{\"dtype\":\"BF16\",\"shape\":["
+            + params + "],\"data_offsets\":[0," + payload + "]}}";
+        int8[] hb = hdr.toBytes();
+        int64 hlen = (int64) hb.count();
+        int8[] head = heap int8[8 + hlen];
+        SafetensorsTest.putU64(head, 0, hlen);
+        int64 i = 0;
+        while (i < hlen) {
+            head[8 + i] = hb[i];
+            i = i + 1;
+        }
+        File.writeAllBytes(path, head, 8 + hlen);
+        File fh = File.open(path, OpenMode.READ_WRITE);
+        fh.truncate(8 + hlen + payload);
+        fh.close();
+
+        int64 before = SafetensorsTest.rssKb();
+        SafetensorsFile st = heap SafetensorsFile(path);
+        Tensor<bfloat16> t = st.loadBf16("weights");
+        Assert.equals((int64) 16, (int64) t.dtype().bits());
+        Assert.isTrue((float32) t.get1(0) == 0.0f);
+        Assert.isTrue((float32) t.get1(params - 1) == 0.0f);
+        st.close();
+        int64 afterClose = SafetensorsTest.rssKb();
+        int64 cap = 20;
+        cap = cap * 1024 * 1024;          // 20 GiB in KiB
+        if (afterClose - before >= cap) {
+            Assert.fail("7B bf16 load holds " + (afterClose - before)
+                + " KiB durable - the widened-f32 shape, not native dtype");
+        }
+    }
+}

@@ -1,0 +1,17 @@
+package dev.cajeta.llama;
+
+import cajeta.error.RecoverableException;
+import cajeta.lang.String;
+
+/**
+ * Thrown on engine misuse and on load-time failures a caller can act on —
+ * a malformed checkpoint, an unsupported dtype, a tensor absent from a
+ * state dict. Recoverable, mirroring `MlException` and the stdlib's
+ * `LinAlgException`/`BroadcastException` discipline.
+ */
+public class LlamaException extends RecoverableException {
+    public LlamaException(String message) {
+        this.message = message;
+        this.cause = 0;
+    }
+}

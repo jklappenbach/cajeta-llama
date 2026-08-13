@@ -69,7 +69,10 @@ echo ">> building llama library .cja"
     dev.cajeta.llama.Llama.run "$here/src/main/cajeta" "$out" >/dev/null
 
 echo ">> building + running the test binary"
-"$CAJETA" --emit=exe --profile=test \
+# --xpu-backend=cpu: the engine's device paths (device-resident weight loads,
+# later the decode kernels) are exercised on the portable CPU backend, the
+# PlacementDispatchTests discipline — real KernelBuffers, no silicon needed.
+"$CAJETA" --emit=exe --profile=test --xpu-backend=cpu \
     --classpath="$out/llama.cja,$unit_cja" \
     -o "$out/llamatests" \
     dev.cajeta.llama.selftest.TestMain.run "$here/src/test/cajeta" "$out" >/dev/null
