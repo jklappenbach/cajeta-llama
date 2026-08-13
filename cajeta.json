@@ -1,0 +1,84 @@
+{
+    // cajeta-llama — a decoder-only LLM inference engine for the cajeta
+    // ecosystem: load Llama-family open weights (safetensors, GGUF), run
+    // KV-cached incremental decode on any XPU backend, sample, detokenize.
+    // llama.cpp supplies the architecture; none of its code is reused
+    // (cajeta-llama-spec §1.2 — @Native marshals no C structs/callbacks).
+    //
+    // A LIBRARY project: no `entry-method`, so the build emits a reusable
+    // `.cja`. The CLI (plan Unit 19) is one caller of the batching API.
+    //
+    // VERSIONING — `details.version` is the SINGLE source of truth, per the
+    // cajeta-ml precedent.
+
+    "details": {
+        "name":               "dev.cajeta.llama",
+        "version":            "0.1.0",
+        "description":        "cajeta-llama — decoder-only LLM inference: safetensors/GGUF loading, paged-KV incremental decode, continuous batching, sampling",
+        "license":            "Apache-2.0",
+        "authors":            ["Julian Klappenbach"],
+        "cajeta-lang-version": "1.0"
+    },
+
+    "settings": {
+        // Weight loading memory-maps checkpoint files (MappedFile) and the
+        // prefix block store persists KV pages; both need the filesystem.
+        "capabilities": ["filesystem"],
+
+        // The core stdlib (cajeta.math, cajeta.xpu, cajeta.io.file,
+        // cajeta.codec.json, cajeta.collection.ltm, …) is built into the
+        // toolchain — not declared.
+        "dependencies": {},
+
+        // The suite is driven by cajeta-unit's reflective @Test discovery;
+        // run-tests.sh resolves the archive (sibling checkout, then store,
+        // then a sha256-verified Olla fetch at this pin).
+        "dev-dependencies": {
+            "dev.cajeta.unit": "0.2.2"
+        },
+
+        "repositories": [
+            { "name": "central", "url": "https://olla.cajeta.dev",
+              "priority": 0 }
+        ],
+
+        // NO `entry-method` — this is a library; the build emits a .cja.
+        "build": {
+            "source-root": "src/main/cajeta",
+            "target": "host"
+        }
+    },
+
+    "tasks": {
+
+        "build": {
+            "description": "Compile sources to a .cja library archive",
+            "actions": [
+                { "action": "build", "flavor": "debug", "id": "art" }
+            ],
+            "outputs": { "path": "${art.path}", "sha256": "${art.sha256}" }
+        },
+
+        "test": {
+            "description": "Build + run the library's test suite",
+            "actions": [
+                { "action": "exec", "command": "./run-tests.sh" }
+            ]
+        },
+
+        "release": {
+            "description": "Release build of the .cja",
+            "actions": [
+                { "action": "build", "flavor": "release", "id": "art" }
+            ],
+            "outputs": { "path": "${art.path}", "sha256": "${art.sha256}" }
+        },
+
+        "clean": {
+            "description": "Remove build outputs",
+            "actions": [
+                { "action": "exec", "command": "rm -rf build" }
+            ]
+        }
+    }
+}

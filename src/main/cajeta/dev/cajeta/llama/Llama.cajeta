@@ -1,0 +1,19 @@
+package dev.cajeta.llama;
+
+/**
+ * cajeta-llama — decoder-only LLM inference for the cajeta ecosystem:
+ * safetensors/GGUF weight loading at native dtype, KV-cached incremental
+ * decode over `cajeta.math.Tensor` + `cajeta.xpu`, continuous batching,
+ * sampling and detokenization. llama.cpp supplies the architecture; none of
+ * its code is reused (cajeta-llama-spec §1.2).
+ *
+ * This is the library entry class (the `--emit=cja` root). The surface lands
+ * unit by unit per `agents/cajeta-llama-plan.md`.
+ */
+public final class Llama {
+    /** The library version. */
+    public static #String version() { return "0.1.0"; }
+
+    /** `--emit=cja` entry. */
+    public static int32 run() { return 0; }
+}
