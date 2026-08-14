@@ -1,0 +1,27 @@
+package dev.cajeta.llama.tok;
+
+/** Growable int8 buffer for decode output. */
+final class ByteBuf {
+
+    int8[] b;
+    int32 n;
+
+    ByteBuf() {
+        this.b = heap int8[64];
+        this.n = 0;
+    }
+
+    void add(int8 v) {
+        if (this.n >= (int32) this.b.count()) {
+            int8[] bigger = heap int8[this.n * 2];
+            int32 i = 0;
+            while (i < this.n) {
+                bigger[i] = this.b[i];
+                i = i + 1;
+            }
+            this.b #= bigger;
+        }
+        this.b[this.n] = v;
+        this.n = this.n + 1;
+    }
+}

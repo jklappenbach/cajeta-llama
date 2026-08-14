@@ -1,0 +1,1290 @@
+package dev.cajeta.llama.tok;
+
+import cajeta.codec.json.JsonReader;
+import cajeta.codec.json.JsonToken;
+import cajeta.collection.ArrayList;
+import cajeta.io.file.File;
+import cajeta.lang.String;
+import cajeta.lang.Ucd;
+import dev.cajeta.llama.LlamaException;
+
+/**
+ * The tokenizer pipeline (spec §7): normalizer → pre-tokenizer → BPE
+ * model → decoder, ONE component pipeline for both target families
+ * rather than two parallel stacks. Llama 3.x / Qwen2 are ByteLevel +
+ * BPE; Llama 2 / Mistral are SentencePiece = metaspace transform + BPE
+ * + byte fallback. The merge loop is shared; the families differ only
+ * in the components around it.
+ *
+ * Three vocabulary sources feed the same pipeline: a HF
+ * `tokenizer.json` ({@link #fromHfJson}), GGUF `tokenizer.ggml.*`
+ * metadata arrays ({@link #fromGgml}), and a raw SentencePiece
+ * `tokenizer.model` via {@link SpProto} feeding {@link #fromGgml}.
+ *
+ * The pre-tokenizer's split regex is NOT a regex engine: the declared
+ * pattern string is matched against known literals and dispatched to a
+ * dedicated scanner ({@link #GPT4_PATTERN}); an unrecognized pattern
+ * errors naming it rather than splitting subtly wrong (spec 7.9's
+ * honesty applied to patterns).
+ */
+public final class Tokenizer {
+
+    public static final int32 FAM_BYTELEVEL = 0;
+    public static final int32 FAM_SP = 1;
+
+    /** The Qwen2 split pattern (also GPT-4o-family). */
+    static final String GPT4_PATTERN =
+        "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+
+    public int32 family;
+    boolean nfc;
+    boolean prependMeta;      // Prepend "▁" normalizer
+    boolean replaceSpace;     // Replace " " -> "▁" normalizer
+    boolean byteFallback;
+    boolean fuseUnk;
+    int32 unkId;
+    boolean useScores;        // ggml llama: merge rank from scores
+    float32[] scores;
+    String unkTok;            // declared unk token text, or null
+
+    ArrayList<String> pool;   // OWNS every token / merge-key String
+    int32[] tokIds;           // registered token i -> its id
+    int32[] tokPool;          // registered token i -> its pool index
+    int32 tokN;
+    int32[] idToIdx;          // id -> pool index (-1 = unassigned)
+    int32 maxId;
+    StrIntMap vocab;          // token -> id      (keys borrow pool)
+    StrIntMap ranks;          // "l r" -> rank    (keys borrow pool)
+
+    int32[] addedIds;         // added/special token ids
+    int32 addedN;
+
+    int32[] b2u;              // byte -> alphabet codepoint (256)
+    int32[] u2b;              // alphabet codepoint -> byte (512, -1 none)
+    String splitPattern;
+
+    Tokenizer() {
+        this.family = Tokenizer.FAM_BYTELEVEL;
+        this.nfc = false;
+        this.prependMeta = false;
+        this.replaceSpace = false;
+        this.byteFallback = false;
+        this.fuseUnk = false;
+        this.unkId = 0 - 1;
+        this.useScores = false;
+        this.scores = null;
+        this.unkTok = null;
+        this.pool = heap ArrayList<String>();
+        this.tokIds = heap int32[1024];
+        this.tokPool = heap int32[1024];
+        this.tokN = 0;
+        this.idToIdx = null;
+        this.maxId = 0 - 1;
+        this.vocab = heap StrIntMap(1024);
+        this.ranks = heap StrIntMap(1024);
+        this.addedIds = heap int32[64];
+        this.addedN = 0;
+        this.b2u = null;
+        this.u2b = null;
+        this.splitPattern = null;
+    }
+
+    // ── vocabulary assembly ─────────────────────────────────────────────
+
+    void addToken(#String tok, int32 id) {
+        if (this.tokN >= (int32) this.tokIds.count()) {
+            int32[] bigger = heap int32[this.tokN * 2];
+            int32[] bigger2 = heap int32[this.tokN * 2];
+            int32 i = 0;
+            while (i < this.tokN) {
+                bigger[i] = this.tokIds[i];
+                bigger2[i] = this.tokPool[i];
+                i = i + 1;
+            }
+            this.tokIds #= bigger;
+            this.tokPool #= bigger2;
+        }
+        this.pool.add(#tok);
+        int32 pi = (int32) this.pool.count() - 1;
+        this.tokIds[this.tokN] = id;
+        this.tokPool[this.tokN] = pi;
+        this.vocab.put(this.pool.get(pi), id);
+        this.tokN = this.tokN + 1;
+        if (id > this.maxId) {
+            this.maxId = id;
+        }
+    }
+
+    void addMerge(#String key, int32 rank) {
+        this.pool.add(#key);
+        this.ranks.put(this.pool.get((int32) this.pool.count() - 1), rank);
+    }
+
+    void addAdded(int32 id) {
+        if (this.addedN >= (int32) this.addedIds.count()) {
+            int32[] bigger = heap int32[this.addedN * 2];
+            int32 i = 0;
+            while (i < this.addedN) {
+                bigger[i] = this.addedIds[i];
+                i = i + 1;
+            }
+            this.addedIds #= bigger;
+        }
+        this.addedIds[this.addedN] = id;
+        this.addedN = this.addedN + 1;
+    }
+
+    /** Build id→index, byte alphabet, and validate the split pattern. */
+    void finish() {
+        this.idToIdx = heap int32[this.maxId + 1];
+        int32 i = 0;
+        while (i <= this.maxId) {
+            this.idToIdx[i] = 0 - 1;
+            i = i + 1;
+        }
+        i = 0;
+        while (i < this.tokN) {
+            this.idToIdx[this.tokIds[i]] = this.tokPool[i];
+            i = i + 1;
+        }
+        if (this.family == Tokenizer.FAM_BYTELEVEL) {
+            if (this.splitPattern != null
+                    && this.splitPattern.equals(Tokenizer.GPT4_PATTERN)
+                        == false) {
+                throw heap LlamaException("tokenizer: unsupported "
+                    + "pre-tokenizer split pattern '" + this.splitPattern
+                    + "' (supported: the GPT-4/Qwen2 pattern)");
+            }
+            this.buildAlphabet();
+        }
+    }
+
+    /** GPT-2 bytes↔unicode alphabet. */
+    void buildAlphabet() {
+        this.b2u = heap int32[256];
+        this.u2b = heap int32[512];
+        int32 i = 0;
+        while (i < 512) {
+            this.u2b[i] = 0 - 1;
+            i = i + 1;
+        }
+        int32 extra = 0;
+        int32 b = 0;
+        while (b < 256) {
+            boolean printable = (b >= 33 && b <= 126)
+                || (b >= 161 && b <= 172) || (b >= 174 && b <= 255);
+            int32 cp = 0;
+            if (printable) {
+                cp = b;
+            } else {
+                cp = 256 + extra;
+                extra = extra + 1;
+            }
+            this.b2u[b] = cp;
+            this.u2b[cp] = b;
+            b = b + 1;
+        }
+    }
+
+    public int32 vocabSize() {
+        return this.tokN;
+    }
+
+    public int32 addedCount() {
+        return this.addedN;
+    }
+
+    public String tokenOf(int32 id) {
+        if (id < 0 || id > this.maxId || this.idToIdx[id] < 0) {
+            throw heap LlamaException("tokenizer: id " + id
+                + " is not in the vocabulary");
+        }
+        return this.pool.get(this.idToIdx[id]);
+    }
+
+    public int32 idOf(String tok) {
+        return this.vocab.get(tok);
+    }
+
+    // ── HF tokenizer.json ───────────────────────────────────────────────
+
+    public static #Tokenizer fromHfJson(String path) {
+        int8[] raw = File.readAllBytes(path);
+        int64 rawLen = (int64) raw.count();
+        if (rawLen <= 0) {
+            throw heap LlamaException("tokenizer: '" + path
+                + "' is missing or empty");
+        }
+        Tokenizer t = heap Tokenizer();
+        t.family = Tokenizer.FAM_SP;   // no pre_tokenizer = SP family
+        JsonReader r = heap JsonReader(raw, rawLen);
+        if (r.next() != JsonToken.START_OBJECT) {
+            throw heap LlamaException("tokenizer: '" + path
+                + "' is not a JSON object");
+        }
+        while (true) {
+            int32 tk = r.next();
+            if (tk == JsonToken.END_OBJECT || tk == JsonToken.END) {
+                break;
+            }
+            if (tk != JsonToken.KEY) {
+                continue;
+            }
+            String key = r.currentDecodedString();
+            if (key.equals("normalizer")) {
+                t.parseNormalizer(r);
+            } else if (key.equals("pre_tokenizer")) {
+                t.parsePreTok(r);
+            } else if (key.equals("model")) {
+                t.parseModel(r);
+            } else if (key.equals("added_tokens")) {
+                t.parseAdded(r);
+            } else {
+                Tokenizer.skipValue(r);
+            }
+        }
+        t.finish();
+        if (t.unkTok != null) {
+            t.unkId = t.vocab.get(t.unkTok);
+        }
+        return #t;
+    }
+
+    void parseNormalizer(JsonReader r) {
+        int32 tk = r.next();
+        if (tk == JsonToken.NULL) {
+            return;
+        }
+        this.normObj(r);
+    }
+
+    /** One normalizer object, START_OBJECT already consumed by caller's next(). */
+    void normObj(JsonReader r) {
+        // Reads keys until END_OBJECT. type decides interpretation.
+        while (true) {
+            int32 tk = r.next();
+            if (tk == JsonToken.END_OBJECT || tk == JsonToken.END) {
+                return;
+            }
+            if (tk != JsonToken.KEY) {
+                continue;
+            }
+            String key = r.currentDecodedString();
+            if (key.equals("type")) {
+                r.next();
+                String ty = r.currentDecodedString();
+                if (ty.equals("NFC")) {
+                    this.nfc = true;
+                } else if (ty.equals("Sequence")) {
+                    // handled via "normalizers" below
+                } else if (ty.equals("Prepend")) {
+                    // content read via "prepend" key
+                } else if (ty.equals("Replace")) {
+                    // pattern/content keys below
+                } else {
+                    throw heap LlamaException("tokenizer: unsupported "
+                        + "normalizer type '" + ty + "'");
+                }
+            } else if (key.equals("normalizers")) {
+                if (r.next() != JsonToken.START_ARRAY) {
+                    throw heap LlamaException(
+                        "tokenizer: normalizers is not an array");
+                }
+                while (true) {
+                    int32 e = r.next();
+                    if (e == JsonToken.END_ARRAY || e == JsonToken.END) {
+                        break;
+                    }
+                    if (e == JsonToken.START_OBJECT) {
+                        this.normObj(r);
+                    }
+                }
+            } else if (key.equals("prepend")) {
+                r.next();
+                String p = r.currentDecodedString();
+                if (p.equals("▁")) {
+                    this.prependMeta = true;
+                } else {
+                    throw heap LlamaException("tokenizer: unsupported "
+                        + "Prepend content '" + p + "'");
+                }
+            } else if (key.equals("pattern")) {
+                // Replace pattern {String: " "} — verify it's a space.
+                if (r.next() == JsonToken.START_OBJECT) {
+                    while (true) {
+                        int32 e = r.next();
+                        if (e == JsonToken.END_OBJECT
+                                || e == JsonToken.END) {
+                            break;
+                        }
+                        if (e == JsonToken.KEY) {
+                            r.next();
+                            String pv = r.currentDecodedString();
+                            if (pv.equals(" ") == false) {
+                                throw heap LlamaException("tokenizer: "
+                                    + "unsupported Replace pattern '"
+                                    + pv + "'");
+                            }
+                        }
+                    }
+                }
+            } else if (key.equals("content")) {
+                r.next();
+                String c = r.currentDecodedString();
+                if (c.equals("▁")) {
+                    this.replaceSpace = true;
+                } else {
+                    throw heap LlamaException("tokenizer: unsupported "
+                        + "Replace content '" + c + "'");
+                }
+            } else {
+                Tokenizer.skipValue(r);
+            }
+        }
+    }
+
+    void parsePreTok(JsonReader r) {
+        int32 tk = r.next();
+        if (tk == JsonToken.NULL) {
+            return;               // SP family: no pre-tokenizer
+        }
+        this.preTokObj(r);
+    }
+
+    void preTokObj(JsonReader r) {
+        while (true) {
+            int32 tk = r.next();
+            if (tk == JsonToken.END_OBJECT || tk == JsonToken.END) {
+                return;
+            }
+            if (tk != JsonToken.KEY) {
+                continue;
+            }
+            String key = r.currentDecodedString();
+            if (key.equals("type")) {
+                r.next();
+                String ty = r.currentDecodedString();
+                if (ty.equals("ByteLevel")) {
+                    this.family = Tokenizer.FAM_BYTELEVEL;
+                } else if (ty.equals("Sequence")) {
+                    // members under "pretokenizers"
+                } else if (ty.equals("Split")) {
+                    // pattern under "pattern"/"Regex"
+                } else if (ty.equals("Metaspace")) {
+                    this.family = Tokenizer.FAM_SP;
+                    this.replaceSpace = true;
+                    this.prependMeta = true;
+                } else {
+                    throw heap LlamaException("tokenizer: unsupported "
+                        + "pre-tokenizer type '" + ty + "'");
+                }
+            } else if (key.equals("pretokenizers")) {
+                if (r.next() != JsonToken.START_ARRAY) {
+                    throw heap LlamaException(
+                        "tokenizer: pretokenizers is not an array");
+                }
+                while (true) {
+                    int32 e = r.next();
+                    if (e == JsonToken.END_ARRAY || e == JsonToken.END) {
+                        break;
+                    }
+                    if (e == JsonToken.START_OBJECT) {
+                        this.preTokObj(r);
+                    }
+                }
+            } else if (key.equals("pattern")) {
+                if (r.next() == JsonToken.START_OBJECT) {
+                    while (true) {
+                        int32 e = r.next();
+                        if (e == JsonToken.END_OBJECT
+                                || e == JsonToken.END) {
+                            break;
+                        }
+                        if (e == JsonToken.KEY) {
+                            r.next();
+                            String pat = r.currentDecodedString();
+                            this.splitPattern #= pat;
+                        }
+                    }
+                }
+            } else {
+                Tokenizer.skipValue(r);
+            }
+        }
+    }
+
+    /** Consume the model object; records `unkTok` when one is declared. */
+    void parseModel(JsonReader r) {
+        if (r.next() != JsonToken.START_OBJECT) {
+            throw heap LlamaException("tokenizer: model is not an object");
+        }
+        while (true) {
+            int32 tk = r.next();
+            if (tk == JsonToken.END_OBJECT || tk == JsonToken.END) {
+                break;
+            }
+            if (tk != JsonToken.KEY) {
+                continue;
+            }
+            String key = r.currentDecodedString();
+            if (key.equals("type")) {
+                r.next();
+                String ty = r.currentDecodedString();
+                if (ty.equals("BPE") == false) {
+                    throw heap LlamaException("tokenizer: model type '"
+                        + ty + "' is unsupported (supported: BPE; "
+                        + "Unigram and WordPiece are out of scope)");
+                }
+            } else if (key.equals("unk_token")) {
+                int32 v = r.next();
+                if (v == JsonToken.STRING) {
+                    String u = r.currentDecodedString();
+                    this.unkTok #= u;
+                }
+            } else if (key.equals("byte_fallback")) {
+                r.next();
+                this.byteFallback = r.currentBoolean();
+            } else if (key.equals("fuse_unk")) {
+                r.next();
+                this.fuseUnk = r.currentBoolean();
+            } else if (key.equals("vocab")) {
+                if (r.next() != JsonToken.START_OBJECT) {
+                    throw heap LlamaException(
+                        "tokenizer: vocab is not an object");
+                }
+                while (true) {
+                    int32 e = r.next();
+                    if (e == JsonToken.END_OBJECT || e == JsonToken.END) {
+                        break;
+                    }
+                    if (e == JsonToken.KEY) {
+                        String tok = r.currentDecodedString();
+                        r.next();
+                        int32 id = (int32) r.currentNumberAsInt64();
+                        // added_tokens may have registered this exact
+                        // (token, id) pair already — don't double-count.
+                        if (this.vocab.get(tok) != id) {
+                            this.addToken(#tok, id);
+                        }
+                    }
+                }
+            } else if (key.equals("merges")) {
+                if (r.next() != JsonToken.START_ARRAY) {
+                    throw heap LlamaException(
+                        "tokenizer: merges is not an array");
+                }
+                int32 rank = 0;
+                while (true) {
+                    int32 e = r.next();
+                    if (e == JsonToken.END_ARRAY || e == JsonToken.END) {
+                        break;
+                    }
+                    if (e == JsonToken.STRING) {
+                        String m = r.currentDecodedString();
+                        this.addMerge(#m, rank);
+                        rank = rank + 1;
+                    } else if (e == JsonToken.START_ARRAY) {
+                        // ["l", "r"] modern spelling
+                        r.next();
+                        String l = r.currentDecodedString();
+                        r.next();
+                        String rr = r.currentDecodedString();
+                        String m2 = l + " " + rr;
+                        this.addMerge(#m2, rank);
+                        rank = rank + 1;
+                        r.next();      // END_ARRAY of the pair
+                    }
+                }
+            } else {
+                Tokenizer.skipValue(r);
+            }
+        }
+    }
+
+    void parseAdded(JsonReader r) {
+        if (r.next() != JsonToken.START_ARRAY) {
+            throw heap LlamaException(
+                "tokenizer: added_tokens is not an array");
+        }
+        while (true) {
+            int32 tk = r.next();
+            if (tk == JsonToken.END_ARRAY || tk == JsonToken.END) {
+                return;
+            }
+            if (tk != JsonToken.START_OBJECT) {
+                continue;
+            }
+            int32 id = 0 - 1;
+            String content = null;
+            while (true) {
+                int32 e = r.next();
+                if (e == JsonToken.END_OBJECT || e == JsonToken.END) {
+                    break;
+                }
+                if (e != JsonToken.KEY) {
+                    continue;
+                }
+                String key = r.currentDecodedString();
+                if (key.equals("id")) {
+                    r.next();
+                    id = (int32) r.currentNumberAsInt64();
+                } else if (key.equals("content")) {
+                    r.next();
+                    content = "" + r.currentDecodedString();
+                } else {
+                    Tokenizer.skipValue(r);
+                }
+            }
+            if (id >= 0 && content != null) {
+                // Register in the vocabulary if absent (added tokens
+                // may or may not duplicate vocab entries).
+                if (this.vocab.get(content) < 0) {
+                    this.addToken(#content, id);
+                }
+                this.addAdded(id);
+            }
+        }
+    }
+
+    /** Skip the value after a KEY (any nesting). */
+    static void skipValue(JsonReader r) {
+        int32 tk = r.next();
+        if (tk != JsonToken.START_OBJECT && tk != JsonToken.START_ARRAY) {
+            return;
+        }
+        int32 depth = 1;
+        while (depth > 0) {
+            int32 e = r.next();
+            if (e == JsonToken.START_OBJECT
+                    || e == JsonToken.START_ARRAY) {
+                depth = depth + 1;
+            } else if (e == JsonToken.END_OBJECT
+                    || e == JsonToken.END_ARRAY) {
+                depth = depth - 1;
+            } else if (e == JsonToken.END) {
+                return;
+            }
+        }
+    }
+
+    // ── GGUF tokenizer.ggml.* metadata (spec 7.6) ───────────────────────
+
+    /**
+     * Build from GGUF-normalized metadata: `model` selects the family
+     * ("gpt2" = ByteLevel+BPE with `pre` naming the split; "llama" =
+     * SentencePiece with score-driven merges), `tokens`/`scores`/
+     * `types` are the vocabulary arrays, `merges` the "l r" list
+     * (gpt2 only). No external file, no protobuf.
+     */
+    public static #Tokenizer fromGgml(String model, String pre,
+            String[] toks, float32[] scoresIn, int32[] types,
+            String[] mergesArr) {
+        Tokenizer t = heap Tokenizer();
+        if (model.equals("gpt2")) {
+            t.family = Tokenizer.FAM_BYTELEVEL;
+            if (pre.equals("qwen2") == false) {
+                throw heap LlamaException("tokenizer: unsupported "
+                    + "tokenizer.ggml.pre '" + pre
+                    + "' (supported: qwen2)");
+            }
+        } else if (model.equals("llama")) {
+            t.family = Tokenizer.FAM_SP;
+            t.byteFallback = true;
+            t.fuseUnk = true;
+            t.prependMeta = true;
+            t.replaceSpace = true;
+            t.useScores = true;
+        } else {
+            throw heap LlamaException("tokenizer: tokenizer.ggml.model '"
+                + model + "' is unsupported (supported: gpt2, llama; "
+                + "Unigram and WordPiece are out of scope)");
+        }
+        int32 n = (int32) toks.count();
+        int32 i = 0;
+        while (i < n) {
+            String s = toks[i];
+            String copy = "" + s;
+            t.addToken(#copy, i);
+            int32 ty = 1;
+            if (types != null) {
+                ty = types[i];
+            }
+            if (ty == 2) {           // UNKNOWN
+                t.unkId = i;
+            }
+            if (ty == 3 || ty == 4) { // CONTROL / USER_DEFINED
+                t.addAdded(i);
+            }
+            i = i + 1;
+        }
+        if (t.useScores) {
+            float32[] sc = heap float32[n];
+            i = 0;
+            while (i < n) {
+                sc[i] = scoresIn[i];
+                i = i + 1;
+            }
+            t.scores #= sc;
+        }
+        if (mergesArr != null) {
+            int32 m = (int32) mergesArr.count();
+            i = 0;
+            while (i < m) {
+                String k = "" + mergesArr[i];
+                t.addMerge(#k, i);
+                i = i + 1;
+            }
+        }
+        t.finish();
+        return #t;
+    }
+
+    // ── encoding ────────────────────────────────────────────────────────
+
+    /** Encode UTF-8 text to token ids (no BOS/EOS added). */
+    public #int32[] encode(String text) {
+        int32 n = text.byteLength();
+        int8[] b = heap int8[n];
+        int32 i = 0;
+        while (i < n) {
+            b[i] = (int8) text.byteAt(i);
+            i = i + 1;
+        }
+        return #this.encodeBytes(b, n);
+    }
+
+    /** Encode raw bytes (need not be valid UTF-8) to token ids. */
+    public #int32[] encodeBytes(int8[] b, int32 n) {
+        IdBuf out = heap IdBuf();
+        // Added-token split: emit segments between exact matches.
+        int32 seg = 0;
+        int32 p = 0;
+        while (p < n) {
+            int32 hitId = 0 - 1;
+            int32 hitLen = 0;
+            int32 a = 0;
+            while (a < this.addedN) {
+                String c = this.tokenOf(this.addedIds[a]);
+                int32 cl = c.byteLength();
+                if (cl > 0 && cl > hitLen && p + cl <= n) {
+                    boolean match = true;
+                    int32 j = 0;
+                    while (j < cl) {
+                        if (b[p + j] != (int8) c.byteAt(j)) {
+                            match = false;
+                            j = cl;
+                        } else {
+                            j = j + 1;
+                        }
+                    }
+                    if (match) {
+                        hitId = this.addedIds[a];
+                        hitLen = cl;
+                    }
+                }
+                a = a + 1;
+            }
+            if (hitId >= 0) {
+                if (p > seg) {
+                    this.encodeSegment(b, seg, p, out);
+                }
+                out.add(hitId);
+                p = p + hitLen;
+                seg = p;
+            } else {
+                p = p + 1;
+            }
+        }
+        if (n > seg) {
+            this.encodeSegment(b, seg, n, out);
+        }
+        return #out.take();
+    }
+
+    void encodeSegment(int8[] b, int32 from, int32 to, IdBuf out) {
+        // Decode to codepoints; an invalid byte becomes a RAW single-byte
+        // symbol (raw[] flags it) so non-UTF-8 round-trips (spec 7.7).
+        int32 max = to - from;
+        int32[] cps = heap int32[max + 1];
+        boolean[] raw = heap boolean[max + 1];
+        int32 cn = 0;
+        boolean anyRaw = false;
+        int32 p = from;
+        while (p < to) {
+            int32 b0 = (int32) b[p] & 255;
+            int32 len = 1;
+            int32 cp = b0;
+            boolean ok = true;
+            if (b0 < 128) {
+                len = 1;
+            } else if (b0 >= 192 && b0 < 224) {
+                len = 2;
+                cp = b0 & 31;
+            } else if (b0 >= 224 && b0 < 240) {
+                len = 3;
+                cp = b0 & 15;
+            } else if (b0 >= 240 && b0 < 248) {
+                len = 4;
+                cp = b0 & 7;
+            } else {
+                ok = false;
+            }
+            if (ok && len > 1) {
+                if (p + len > to) {
+                    ok = false;
+                } else {
+                    int32 k = 1;
+                    while (k < len) {
+                        int32 bk = (int32) b[p + k] & 255;
+                        if (bk < 128 || bk >= 192) {
+                            ok = false;
+                            k = len;
+                        } else {
+                            cp = (cp << 6) | (bk & 63);
+                            k = k + 1;
+                        }
+                    }
+                }
+            }
+            if (ok) {
+                cps[cn] = cp;
+                raw[cn] = false;
+                cn = cn + 1;
+                p = p + len;
+            } else {
+                cps[cn] = b0;
+                raw[cn] = true;
+                anyRaw = true;
+                cn = cn + 1;
+                p = p + 1;
+            }
+        }
+        if (this.family == Tokenizer.FAM_SP) {
+            this.encodeSp(cps, raw, cn, out);
+        } else {
+            this.encodeByteLevel(b, from, to, cps, raw, cn, anyRaw, out);
+        }
+    }
+
+    // ── SP (metaspace + BPE + byte fallback) ────────────────────────────
+
+    void encodeSp(int32[] cps, boolean[] raw, int32 cn, IdBuf out) {
+        // Normalizer: prepend U+2581, replace spaces with U+2581.
+        int32[] ncps = heap int32[cn + 1];
+        boolean[] nraw = heap boolean[cn + 1];
+        int32 nn = 0;
+        if (this.prependMeta) {
+            ncps[nn] = 0x2581;
+            nraw[nn] = false;
+            nn = nn + 1;
+        }
+        int32 i = 0;
+        while (i < cn) {
+            int32 cp = cps[i];
+            if (this.replaceSpace && cp == 32 && raw[i] == false) {
+                cp = 0x2581;
+            }
+            ncps[nn] = cp;
+            nraw[nn] = raw[i];
+            nn = nn + 1;
+            i = i + 1;
+        }
+        // Symbols: one per codepoint (raw bytes stay single).
+        String[] syms = heap String[nn];
+        i = 0;
+        while (i < nn) {
+            if (nraw[i]) {
+                syms[i] #= Tokenizer.byteStr(ncps[i]);
+            } else {
+                syms[i] #= Tokenizer.cpStr(ncps[i]);
+            }
+            i = i + 1;
+        }
+        int32 remaining = this.bpe(syms, nn);
+        this.emitSpSymbols(syms, remaining, out);
+    }
+
+    void emitSpSymbols(String[] syms, int32 n, IdBuf out) {
+        int32 i = 0;
+        boolean lastWasUnk = false;
+        while (i < n) {
+            int32 id = this.vocab.get(syms[i]);
+            if (id >= 0) {
+                out.add(id);
+                lastWasUnk = false;
+            } else if (this.byteFallback) {
+                // every byte of the symbol as <0xXX>
+                String s = syms[i];
+                int32 bl = s.byteLength();
+                int32 j = 0;
+                while (j < bl) {
+                    String bt = Tokenizer.byteTokenName(
+                        (int32) s.byteAt(j) & 255);
+                    int32 bid = this.vocab.get(bt);
+                    if (bid < 0) {
+                        throw heap LlamaException("tokenizer: byte "
+                            + "fallback token " + bt
+                            + " missing from vocab");
+                    }
+                    out.add(bid);
+                    j = j + 1;
+                }
+                lastWasUnk = false;
+            } else if (this.unkId >= 0) {
+                if (this.fuseUnk == false || lastWasUnk == false) {
+                    out.add(this.unkId);
+                }
+                lastWasUnk = true;
+            } else {
+                throw heap LlamaException("tokenizer: symbol '" + syms[i]
+                    + "' not in vocab and no unk/byte fallback");
+            }
+            i = i + 1;
+        }
+    }
+
+    // ── ByteLevel (+ GPT-4 split scanner) ───────────────────────────────
+
+    void encodeByteLevel(int8[] b, int32 from, int32 to, int32[] cps,
+            boolean[] raw, int32 cn, boolean anyRaw, IdBuf out) {
+        // NFC on clean text only (malformed input cannot be normalized;
+        // the reference corpus is NFC already).
+        int32[] ucps = cps;
+        boolean[] uraw = raw;
+        int32 un = cn;
+        int32[] ncps = null;      // hoisted: must outlive the if block
+        boolean[] nraw = null;
+        if (this.nfc && anyRaw == false && cn > 0) {
+            int8[] seg = heap int8[to - from];
+            int32 i = 0;
+            while (i < to - from) {
+                seg[i] = b[from + i];
+                i = i + 1;
+            }
+            String s = heap String(#seg, to - from);
+            String normed = s.nfc();
+            int32 nl = normed.byteLength();
+            int8[] nb = heap int8[nl];
+            i = 0;
+            while (i < nl) {
+                nb[i] = (int8) normed.byteAt(i);
+                i = i + 1;
+            }
+            ncps = heap int32[nl + 1];
+            nraw = heap boolean[nl + 1];
+            un = Tokenizer.decodeAll(nb, nl, ncps, nraw);
+            ucps = ncps;
+            uraw = nraw;
+        }
+        // Split into pieces; BPE each piece over alphabet symbols.
+        int32 i = 0;
+        while (i < un) {
+            int32 end = this.pieceEnd(ucps, uraw, i, un);
+            this.bpePiece(ucps, uraw, i, end, out);
+            i = end;
+        }
+    }
+
+    static int32 decodeAll(int8[] b, int32 n, int32[] cps,
+            boolean[] raw) {
+        int32 cn = 0;
+        int32 p = 0;
+        while (p < n) {
+            int32 b0 = (int32) b[p] & 255;
+            int32 len = 1;
+            int32 cp = b0;
+            if (b0 >= 240) {
+                len = 4;
+                cp = ((b0 & 7) << 18)
+                    | (((int32) b[p + 1] & 63) << 12)
+                    | (((int32) b[p + 2] & 63) << 6)
+                    | ((int32) b[p + 3] & 63);
+            } else if (b0 >= 224) {
+                len = 3;
+                cp = ((b0 & 15) << 12)
+                    | (((int32) b[p + 1] & 63) << 6)
+                    | ((int32) b[p + 2] & 63);
+            } else if (b0 >= 192) {
+                len = 2;
+                cp = ((b0 & 31) << 6) | ((int32) b[p + 1] & 63);
+            }
+            cps[cn] = cp;
+            raw[cn] = false;
+            cn = cn + 1;
+            p = p + len;
+        }
+        return cn;
+    }
+
+    static boolean isLet(int32 cp) {
+        return Ucd.isLetter(cp) == 1;
+    }
+
+    static boolean isNum(int32 cp) {
+        return Ucd.isNumber(cp) == 1;
+    }
+
+    static boolean isWs(int32 cp) {
+        return Ucd.isWhiteSpace(cp) == 1;
+    }
+
+    static boolean isNl(int32 cp) {
+        return cp == 13 || cp == 10;
+    }
+
+    /**
+     * The GPT-4/Qwen2 pattern as a scanner: returns the end (exclusive)
+     * of the piece starting at `i`. Alternatives tried in the regex's
+     * order; raw bytes classify through Ucd like their codepoint value
+     * (Cc/Cn → the punctuation-run rule).
+     */
+    int32 pieceEnd(int32[] cps, boolean[] raw, int32 i, int32 n) {
+        int32 cp = cps[i];
+        // 1. (?i:'s|'t|'re|'ve|'m|'ll|'d)
+        if (cp == 39 && i + 1 < n) {
+            int32 c1 = cps[i + 1] | 32;
+            if (c1 == 115 || c1 == 116 || c1 == 109 || c1 == 100) {
+                return i + 2;      // 's 't 'm 'd
+            }
+            if (i + 2 < n) {
+                int32 c2 = cps[i + 2] | 32;
+                if ((c1 == 114 && c2 == 101)
+                        || (c1 == 118 && c2 == 101)
+                        || (c1 == 108 && c2 == 108)) {
+                    return i + 3;  // 're 've 'll
+                }
+            }
+        }
+        // 2. [^\r\n\p{L}\p{N}]?\p{L}+
+        if (Tokenizer.isLet(cp)) {
+            int32 j = i + 1;
+            while (j < n && Tokenizer.isLet(cps[j])) {
+                j = j + 1;
+            }
+            return j;
+        }
+        if (Tokenizer.isNl(cp) == false && Tokenizer.isNum(cp) == false
+                && i + 1 < n && Tokenizer.isLet(cps[i + 1])) {
+            int32 j = i + 2;
+            while (j < n && Tokenizer.isLet(cps[j])) {
+                j = j + 1;
+            }
+            return j;
+        }
+        // 3. \p{N}
+        if (Tokenizer.isNum(cp)) {
+            return i + 1;
+        }
+        // 4. ` ?[^\s\p{L}\p{N}]+[\r\n]*`
+        int32 s = i;
+        if (cp == 32) {
+            s = i + 1;
+        }
+        if (s < n && Tokenizer.isWs(cps[s]) == false
+                && Tokenizer.isLet(cps[s]) == false
+                && Tokenizer.isNum(cps[s]) == false) {
+            int32 j = s + 1;
+            while (j < n && Tokenizer.isWs(cps[j]) == false
+                    && Tokenizer.isLet(cps[j]) == false
+                    && Tokenizer.isNum(cps[j]) == false) {
+                j = j + 1;
+            }
+            while (j < n && Tokenizer.isNl(cps[j])) {
+                j = j + 1;
+            }
+            return j;
+        }
+        // whitespace run [i, e)
+        int32 e = i;
+        while (e < n && Tokenizer.isWs(cps[e])) {
+            e = e + 1;
+        }
+        if (e > i) {
+            // 5. \s*[\r\n]+ — longest prefix of the run ending in newline
+            int32 lastNl = 0 - 1;
+            int32 k = i;
+            while (k < e) {
+                if (Tokenizer.isNl(cps[k])) {
+                    lastNl = k;
+                }
+                k = k + 1;
+            }
+            if (lastNl >= 0) {
+                return lastNl + 1;
+            }
+            // 6. \s+(?!\S) — to end, or all but the last ws char
+            if (e >= n) {
+                return e;
+            }
+            if (e - i > 1) {
+                return e - 1;
+            }
+            // 7. \s+
+            return e;
+        }
+        // Fallback: single codepoint (unreachable for well-formed input).
+        return i + 1;
+    }
+
+    void bpePiece(int32[] cps, boolean[] raw, int32 from, int32 to,
+            IdBuf out) {
+        // Piece bytes → alphabet symbols (one per byte).
+        int32 maxBytes = (to - from) * 4;
+        int8[] pb = heap int8[maxBytes + 1];
+        int32 bn = 0;
+        int32 i = from;
+        while (i < to) {
+            if (raw[i]) {
+                pb[bn] = (int8) cps[i];
+                bn = bn + 1;
+            } else {
+                bn = bn + Tokenizer.utf8Append(pb, bn, cps[i]);
+            }
+            i = i + 1;
+        }
+        String[] syms = heap String[bn];
+        i = 0;
+        while (i < bn) {
+            String s = Tokenizer.cpStr(this.b2u[(int32) pb[i] & 255]);
+            syms[i] #= s;
+            i = i + 1;
+        }
+        int32 remaining = this.bpe(syms, bn);
+        i = 0;
+        while (i < remaining) {
+            int32 id = this.vocab.get(syms[i]);
+            if (id < 0) {
+                throw heap LlamaException("tokenizer: byte-level symbol '"
+                    + syms[i] + "' not in vocab");
+            }
+            out.add(id);
+            i = i + 1;
+        }
+    }
+
+    // ── the shared merge loop ───────────────────────────────────────────
+
+    /**
+     * Greedy BPE over `syms[0..n)` in place; returns the remaining
+     * symbol count. Rank-driven (merge table) or score-driven (ggml
+     * llama: pair mergeable iff the concatenation is in the vocab,
+     * best = highest score).
+     */
+    int32 bpe(String[] syms, int32 n) {
+        while (n > 1) {
+            int32 best = 0 - 1;
+            int32 bestRank = 0;
+            float32 bestScore = 0.0f;
+            int32 i = 0;
+            while (i < n - 1) {
+                if (this.useScores) {
+                    String cat = syms[i] + syms[i + 1];
+                    int32 id = this.vocab.get(cat);
+                    if (id >= 0) {
+                        float32 sc = this.scores[id];
+                        if (best < 0 || sc > bestScore) {
+                            best = i;
+                            bestScore = sc;
+                        }
+                    }
+                } else {
+                    String key = syms[i] + " " + syms[i + 1];
+                    int32 rk = this.ranks.get(key);
+                    if (rk >= 0) {
+                        if (best < 0 || rk < bestRank) {
+                            best = i;
+                            bestRank = rk;
+                        }
+                    }
+                }
+                i = i + 1;
+            }
+            if (best < 0) {
+                return n;
+            }
+            String merged = syms[best] + syms[best + 1];
+            syms[best] #= merged;
+            i = best + 1;
+            while (i < n - 1) {
+                syms[i] #= syms[i + 1];
+                i = i + 1;
+            }
+            n = n - 1;
+        }
+        return n;
+    }
+
+    // ── decoding ────────────────────────────────────────────────────────
+
+    /** Decode ids to the represented bytes (spec 7.7 round-trip). */
+    public #int8[] decode(int32[] ids, int32 n) {
+        ByteBuf out = heap ByteBuf();
+        int32 i = 0;
+        while (i < n) {
+            String tok = this.tokenOf(ids[i]);
+            if (this.family == Tokenizer.FAM_BYTELEVEL) {
+                this.decodeByteLevelTok(tok, out);
+            } else {
+                this.decodeSpTok(tok, out);
+            }
+            i = i + 1;
+        }
+        // SP decoder Strip: one leading space (start: 1).
+        int32 skip = 0;
+        if (this.family == Tokenizer.FAM_SP && out.n > 0
+                && out.b[0] == (int8) 32) {
+            skip = 1;
+        }
+        int8[] res = heap int8[out.n - skip];
+        i = 0;
+        while (i < out.n - skip) {
+            res[i] = out.b[i + skip];
+            i = i + 1;
+        }
+        return #res;
+    }
+
+    void decodeByteLevelTok(String tok, ByteBuf out) {
+        int32 bl = tok.byteLength();
+        int8[] tb = heap int8[bl];
+        int32 i = 0;
+        while (i < bl) {
+            tb[i] = (int8) tok.byteAt(i);
+            i = i + 1;
+        }
+        int32[] cps = heap int32[bl + 1];
+        boolean[] raw = heap boolean[bl + 1];
+        int32 cn = Tokenizer.decodeAll(tb, bl, cps, raw);
+        i = 0;
+        while (i < cn) {
+            int32 cp = cps[i];
+            int32 b = 0 - 1;
+            if (cp < 512) {
+                b = this.u2b[cp];
+            }
+            if (b >= 0) {
+                out.add((int8) b);
+            } else {
+                // Added/special token content: passes through verbatim.
+                int8[] tmp = heap int8[4];
+                int32 k = Tokenizer.utf8Append(tmp, 0, cp);
+                int32 j = 0;
+                while (j < k) {
+                    out.add(tmp[j]);
+                    j = j + 1;
+                }
+            }
+            i = i + 1;
+        }
+    }
+
+    void decodeSpTok(String tok, ByteBuf out) {
+        // <0xXX> byte token?
+        int32 bv = Tokenizer.byteTokenValue(tok);
+        if (bv >= 0) {
+            out.add((int8) bv);
+            return;
+        }
+        // U+2581 (E2 96 81) -> space, bytewise.
+        int32 bl = tok.byteLength();
+        int32 i = 0;
+        while (i < bl) {
+            int32 b0 = (int32) tok.byteAt(i) & 255;
+            if (b0 == 0xE2 && i + 2 < bl
+                    && ((int32) tok.byteAt(i + 1) & 255) == 0x96
+                    && ((int32) tok.byteAt(i + 2) & 255) == 0x81) {
+                out.add((int8) 32);
+                i = i + 3;
+            } else {
+                out.add((int8) b0);
+                i = i + 1;
+            }
+        }
+    }
+
+    // ── small helpers ───────────────────────────────────────────────────
+
+    static #String cpStr(int32 cp) {
+        int8[] b = heap int8[4];
+        int32 n = Tokenizer.utf8Append(b, 0, cp);
+        int8[] exact = heap int8[n];
+        int32 i = 0;
+        while (i < n) {
+            exact[i] = b[i];
+            i = i + 1;
+        }
+        return heap String(#exact, n);
+    }
+
+    static #String byteStr(int32 b) {
+        int8[] one = heap int8[1];
+        one[0] = (int8) b;
+        return heap String(#one, 1);
+    }
+
+    static int32 utf8Append(int8[] out, int32 o, int32 cp) {
+        if (cp < 0x80) {
+            out[o] = (int8) cp;
+            return 1;
+        }
+        if (cp < 0x800) {
+            out[o] = (int8) (0xC0 | (cp >>> 6));
+            out[o + 1] = (int8) (0x80 | (cp & 0x3F));
+            return 2;
+        }
+        if (cp < 0x10000) {
+            out[o] = (int8) (0xE0 | (cp >>> 12));
+            out[o + 1] = (int8) (0x80 | ((cp >>> 6) & 0x3F));
+            out[o + 2] = (int8) (0x80 | (cp & 0x3F));
+            return 3;
+        }
+        out[o] = (int8) (0xF0 | (cp >>> 18));
+        out[o + 1] = (int8) (0x80 | ((cp >>> 12) & 0x3F));
+        out[o + 2] = (int8) (0x80 | ((cp >>> 6) & 0x3F));
+        out[o + 3] = (int8) (0x80 | (cp & 0x3F));
+        return 4;
+    }
+
+    static final String HEX = "0123456789ABCDEF";
+
+    static #String byteTokenName(int32 b) {
+        int8[] t = heap int8[6];
+        t[0] = (int8) 60;                      // <
+        t[1] = (int8) 48;                      // 0
+        t[2] = (int8) 120;                     // x
+        t[3] = (int8) Tokenizer.HEX.byteAt((b >>> 4) & 15);
+        t[4] = (int8) Tokenizer.HEX.byteAt(b & 15);
+        t[5] = (int8) 62;                      // >
+        return heap String(#t, 6);
+    }
+
+    /** Value of a `<0xXX>` token, or -1. */
+    static int32 byteTokenValue(String tok) {
+        if (tok.byteLength() != 6) {
+            return 0 - 1;
+        }
+        if (tok.byteAt(0) != 60 || tok.byteAt(1) != 48
+                || tok.byteAt(2) != 120 || tok.byteAt(5) != 62) {
+            return 0 - 1;
+        }
+        int32 hi = Tokenizer.hexVal(tok.byteAt(3));
+        int32 lo = Tokenizer.hexVal(tok.byteAt(4));
+        if (hi < 0 || lo < 0) {
+            return 0 - 1;
+        }
+        return hi * 16 + lo;
+    }
+
+    static int32 hexVal(int32 c) {
+        if (c >= 48 && c <= 57) {
+            return c - 48;
+        }
+        if (c >= 65 && c <= 70) {
+            return c - 55;
+        }
+        if (c >= 97 && c <= 102) {
+            return c - 87;
+        }
+        return 0 - 1;
+    }
+}

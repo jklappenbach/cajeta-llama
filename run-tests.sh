@@ -64,8 +64,39 @@ fi
 [[ -f "$unit_cja" ]] || { echo "could not resolve a dev.cajeta.unit archive" >&2; exit 1; }
 echo ">> cajeta-unit: $unit_cja"
 
+# dev.cajeta.codec (ProtobufCursor for raw tokenizer.model, spec 7.10):
+# sibling checkout first (the cajeta-unit pattern), then store, then a
+# sha256-verified Olla fetch.
+CODEC_VER="$(sed -n 's/.*"dev\.cajeta\.codec"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+    "$here/cajeta.json" | head -1)"
+CODEC_REPO="${CODEC_REPO:-$here/../cajeta-codec}"
+codec_cja=""
+if [[ -d "$CODEC_REPO" ]]; then
+    echo ">> building dev.cajeta.codec from checkout ($CODEC_REPO)"
+    ( cd "$CODEC_REPO" && "$CAJETA" build >/dev/null )
+    codec_cja="$(ls -t "$CODEC_REPO"/build/archive/dev.cajeta.codec-*.cja 2>/dev/null | head -1)"
+fi
+if [[ -z "$codec_cja" ]]; then
+    codec_cja="$OLLA_HOME/dev.cajeta.codec/$CODEC_VER/dev.cajeta.codec-$CODEC_VER.cja"
+fi
+if [[ ! -f "$codec_cja" ]]; then
+    codec_cja="$here/build/.unit-cache/dev.cajeta.codec-$CODEC_VER.cja"
+    if [[ ! -f "$codec_cja" ]]; then
+        echo ">> fetching dev.cajeta.codec $CODEC_VER from $OLLA_URL"
+        meta="$(curl -fsS "$OLLA_URL/v2/resolve?name=dev.cajeta.codec&version=$CODEC_VER")"
+        sha="$(printf '%s' "$meta" | sed -n 's/.*"sha256":"sha256:\([0-9a-f]*\)".*/\1/p')"
+        [[ -n "$sha" ]] || { echo "/v2/resolve gave no sha256 for codec" >&2; exit 1; }
+        mkdir -p "$(dirname "$codec_cja")"
+        curl -fsS -o "$codec_cja" "$OLLA_URL/v2/blob/$sha"
+        got="$(sha256_of "$codec_cja")"
+        [[ "$got" == "$sha" ]] || { rm -f "$codec_cja"; echo "sha256 mismatch fetching codec" >&2; exit 1; }
+    fi
+fi
+echo ">> dev.cajeta.codec: $codec_cja"
+
 echo ">> building llama library .cja"
 "$CAJETA" --emit=cja -o "$out/llama.cja" \
+    --classpath="$codec_cja" \
     dev.cajeta.llama.Llama.run "$here/src/main/cajeta" "$out" >/dev/null
 
 echo ">> building + running the test binary"
@@ -73,7 +104,7 @@ echo ">> building + running the test binary"
 # later the decode kernels) are exercised on the portable CPU backend, the
 # PlacementDispatchTests discipline — real KernelBuffers, no silicon needed.
 "$CAJETA" --emit=exe --profile=test --xpu-backend=cpu \
-    --classpath="$out/llama.cja,$unit_cja" \
+    --classpath="$out/llama.cja,$unit_cja,$codec_cja" \
     -o "$out/llamatests" \
     dev.cajeta.llama.selftest.TestMain.run "$here/src/test/cajeta" "$out" >/dev/null
 
@@ -85,7 +116,7 @@ echo ">> building + running the test binary under --release --live-set=bounded"
 # codegen with the bounded live-set discipline — not only the test profile.
 "$CAJETA" --emit=exe --profile=test --release --live-set=bounded \
     --xpu-backend=cpu \
-    --classpath="$out/llama.cja,$unit_cja" \
+    --classpath="$out/llama.cja,$unit_cja,$codec_cja" \
     -o "$out/llamatests-release" \
     dev.cajeta.llama.selftest.TestMain.run "$here/src/test/cajeta" "$out" >/dev/null
 

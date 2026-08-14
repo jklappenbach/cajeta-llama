@@ -1,0 +1,193 @@
+package dev.cajeta.llama.selftest;
+
+import dev.cajeta.unit.Assert;
+import dev.cajeta.llama.tok.SpProto;
+import dev.cajeta.llama.tok.Tokenizer;
+import cajeta.io.file.File;
+import cajeta.io.file.OpenMode;
+import cajeta.lang.String;
+import dev.cajeta.llama.LlamaException;
+
+/**
+ * cajeta-llama plan Unit 12 TDD (engine half) — the tokenizer pipeline
+ * (spec 7.1–7.10). Exact-match against HF `tokenizers` reference ids
+ * over the fixture corpus, for both families, from all three
+ * vocabulary sources.
+ */
+public class TokTest {
+
+    public TokTest() { return; }
+
+    static final String QWEN = "src/test/fixtures/tok/qwen2-tokenizer.json";
+    static final String LLAMA = "src/test/fixtures/tok/llama2-tokenizer.json";
+    static final String SPM = "src/test/fixtures/tok/llama2-tokenizer.model";
+    static final String FIX = "src/test/fixtures/tok/expected-ids.json";
+
+    static void assertRow(Tokenizer t, String text, int32[] ids,
+            int32 from, int32 to) {
+        int32[] got = t.encode(text);
+        Assert.equals((int64) (to - from), (int64) got.count());
+        int32 j = 0;
+        while (j < to - from) {
+            Assert.equals((int64) ids[from + j], (int64) got[j]);
+            j = j + 1;
+        }
+    }
+
+    // ── 12.1.3 — HF tokenizer.json parses ───────────────────────────────
+
+    @Test
+    public void hfJsonParsesVocabMergesAddedSpecial() {
+        Tokenizer q = Tokenizer.fromHfJson(TokTest.QWEN);
+        Assert.equals((int64) 151665, (int64) q.vocabSize());
+        Assert.equals((int64) 22, (int64) q.addedCount());
+        Assert.equals((int64) 151643, (int64) q.idOf("<|endoftext|>"));
+        Assert.equals("!", q.tokenOf(0));
+        Assert.equals((int64) Tokenizer.FAM_BYTELEVEL, (int64) q.family);
+        Tokenizer l = Tokenizer.fromHfJson(TokTest.LLAMA);
+        Assert.equals((int64) 32000, (int64) l.vocabSize());
+        Assert.equals((int64) 3, (int64) l.addedCount());
+        Assert.equals((int64) 0, (int64) l.idOf("<unk>"));
+        Assert.equals((int64) 1, (int64) l.idOf("<s>"));
+        Assert.equals((int64) Tokenizer.FAM_SP, (int64) l.family);
+    }
+
+    // ── 12.1.4 — ByteLevel+BPE exact match (Qwen2) ──────────────────────
+
+    @Test
+    public void byteLevelCorpusMatchesReference() {
+        TokFix f = TokFix.load(TokTest.FIX);
+        Tokenizer q = Tokenizer.fromHfJson(TokTest.QWEN);
+        int32 i = 0;
+        while (i < f.n) {
+            TokTest.assertRow(q, f.corpus.get(i), f.qwenIds,
+                f.qwenOff[i], f.qwenOff[i + 1]);
+            i = i + 1;
+        }
+    }
+
+    // ── 12.1.5 — Metaspace+BPE+byte-fallback exact match (Llama 2) ──────
+
+    @Test
+    public void metaspaceCorpusMatchesReference() {
+        TokFix f = TokFix.load(TokTest.FIX);
+        Tokenizer l = Tokenizer.fromHfJson(TokTest.LLAMA);
+        int32 i = 0;
+        while (i < f.n) {
+            TokTest.assertRow(l, f.corpus.get(i), f.llamaIds,
+                f.llamaOff[i], f.llamaOff[i + 1]);
+            i = i + 1;
+        }
+    }
+
+    // ── 12.1.6 — GGUF metadata builds the same pipeline ─────────────────
+
+    @Test
+    public void ggmlMetadataBuildsSamePipeline() {
+        // The llama family from GGUF-shaped arrays (tokens/scores/types
+        // — here read out of the raw SP model, no GGUF file needed)
+        // must encode identically to the HF-declared pipeline.
+        SpProto sp = SpProto.read(TokTest.SPM);
+        Tokenizer g = Tokenizer.fromGgml("llama", "default", sp.pieces,
+            sp.scores, sp.types, null);
+        Tokenizer h = Tokenizer.fromHfJson(TokTest.LLAMA);
+        TokFix f = TokFix.load(TokTest.FIX);
+        int32 i = 0;
+        while (i < f.n) {
+            TokTest.assertRow(g, f.corpus.get(i), f.llamaIds,
+                f.llamaOff[i], f.llamaOff[i + 1]);
+            i = i + 1;
+        }
+        Assert.equals((int64) h.vocabSize(), (int64) g.vocabSize());
+    }
+
+    // ── 12.1.7 — non-UTF-8 bytes round-trip, both families ──────────────
+
+    @Test
+    public void tokensRoundTripInvalidUtf8() {
+        int8[] bad = heap int8[6];
+        bad[0] = (int8) 97;          // 'a'
+        bad[1] = (int8) 0xC3;        // truncated 2-byte lead
+        bad[2] = (int8) 40;          // '('
+        bad[3] = (int8) 0xFF;        // never valid in UTF-8
+        bad[4] = (int8) 0x80;        // stray continuation
+        bad[5] = (int8) 98;          // 'b'
+        Tokenizer q = Tokenizer.fromHfJson(TokTest.QWEN);
+        int32[] qi = q.encodeBytes(bad, 6);
+        int8[] qb = q.decode(qi, (int32) qi.count());
+        Assert.equals((int64) 6, (int64) qb.count());
+        int32 i = 0;
+        while (i < 6) {
+            Assert.isTrue(qb[i] == bad[i]);
+            i = i + 1;
+        }
+        Tokenizer l = Tokenizer.fromHfJson(TokTest.LLAMA);
+        int32[] li = l.encodeBytes(bad, 6);
+        int8[] lb = l.decode(li, (int32) li.count());
+        Assert.equals((int64) 6, (int64) lb.count());
+        i = 0;
+        while (i < 6) {
+            Assert.isTrue(lb[i] == bad[i]);
+            i = i + 1;
+        }
+    }
+
+    // ── 12.1.8 — unsupported model types error naming them ──────────────
+
+    @Test
+    public void unsupportedModelTypeNamesIt() {
+        String path = "/tmp/cajeta_llama_tok_ugm.json";
+        File w = File.open(path, OpenMode.WRITE);
+        String doc = "{\"model\": {\"type\": \"Unigram\", \"vocab\": []}}";
+        int32 n = doc.byteLength();
+        int8[] b = heap int8[n];
+        int32 i = 0;
+        while (i < n) {
+            b[i] = (int8) doc.byteAt(i);
+            i = i + 1;
+        }
+        w.write(b, 0, (int64) n);
+        w.close();
+        boolean threw = false;
+        try {
+            Tokenizer bad = Tokenizer.fromHfJson(path);
+            Assert.isTrue(bad.vocabSize() < 0);   // unreachable
+        } catch (LlamaException ex) {
+            threw = true;
+            Assert.isTrue(ex.getMessage().contains("Unigram"));
+        }
+        Assert.isTrue(threw);
+        // GGUF path names the model string too.
+        String[] toks = heap String[1];
+        toks[0] = "x";
+        threw = false;
+        try {
+            Tokenizer bad2 = Tokenizer.fromGgml("unigram", "default",
+                toks, null, null, null);
+            Assert.isTrue(bad2.vocabSize() < 0);  // unreachable
+        } catch (LlamaException ex2) {
+            threw = true;
+            Assert.isTrue(ex2.getMessage().contains("unigram"));
+        }
+        Assert.isTrue(threw);
+    }
+
+    // ── 12.1.9 — raw SentencePiece model decodes to the same vocab ──────
+
+    @Test
+    public void spProtoVocabMatchesJson() {
+        SpProto sp = SpProto.read(TokTest.SPM);
+        Tokenizer h = Tokenizer.fromHfJson(TokTest.LLAMA);
+        Assert.equals((int64) 32000, (int64) sp.n);
+        int32 i = 0;
+        while (i < sp.n) {
+            Assert.equals(h.tokenOf(i), sp.pieces[i]);
+            i = i + 1;
+        }
+        // Types carry through: <unk> is UNKNOWN, <s> is CONTROL, and
+        // the byte tokens are BYTE.
+        Assert.equals((int64) 2, (int64) sp.types[0]);
+        Assert.equals((int64) 3, (int64) sp.types[1]);
+        Assert.equals((int64) 6, (int64) sp.types[3]);   // <0x00>
+    }
+}

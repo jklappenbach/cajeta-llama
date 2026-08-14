@@ -27,8 +27,12 @@
 
         // The core stdlib (cajeta.math, cajeta.xpu, cajeta.io.file,
         // cajeta.codec.json, cajeta.collection.ltm, …) is built into the
-        // toolchain — not declared.
-        "dependencies": {},
+        // toolchain — not declared. dev.cajeta.codec supplies
+        // ProtobufCursor for raw SentencePiece tokenizer.model reading
+        // (spec 7.10) — the cursor, not the typed facade.
+        "dependencies": {
+            "dev.cajeta.codec": "0.8.1"
+        },
 
         // The suite is driven by cajeta-unit's reflective @Test discovery;
         // run-tests.sh resolves the archive (sibling checkout, then store,

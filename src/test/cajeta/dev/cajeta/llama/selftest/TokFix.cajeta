@@ -1,0 +1,141 @@
+package dev.cajeta.llama.selftest;
+
+import cajeta.codec.json.JsonReader;
+import cajeta.codec.json.JsonToken;
+import cajeta.collection.ArrayList;
+import cajeta.io.file.File;
+import cajeta.lang.String;
+import dev.cajeta.llama.LlamaException;
+
+/**
+ * The tokenizer reference fixture: a corpus of strings and the exact
+ * token ids HF `tokenizers` produces for each, per family
+ * (`add_special_tokens=False`). Streamed with `JsonReader` +
+ * `currentDecodedString` — corpus entries contain `\n`, `\t`, quotes.
+ * Per-string id runs are flat arrays sliced by offsets.
+ */
+public final class TokFix {
+
+    public ArrayList<String> corpus;
+    public int32 n;
+    public int32[] qwenIds;
+    public int32[] qwenOff;
+    public int32[] llamaIds;
+    public int32[] llamaOff;
+
+    TokFix() {
+        this.corpus = heap ArrayList<String>();
+        this.n = 0;
+        this.qwenIds = null;
+        this.qwenOff = null;
+        this.llamaIds = null;
+        this.llamaOff = null;
+    }
+
+    public static #TokFix load(String path) {
+        int8[] raw = File.readAllBytes(path);
+        int64 rawLen = (int64) raw.count();
+        if (rawLen <= 0) {
+            throw heap LlamaException("tok fixture missing: " + path);
+        }
+        TokFix f = heap TokFix();
+        JsonReader r = heap JsonReader(raw, rawLen);
+        if (r.next() != JsonToken.START_OBJECT) {
+            throw heap LlamaException("tok fixture: not an object");
+        }
+        while (true) {
+            int32 tk = r.next();
+            if (tk == JsonToken.END_OBJECT || tk == JsonToken.END) {
+                break;
+            }
+            if (tk != JsonToken.KEY) {
+                continue;
+            }
+            String key = r.currentDecodedString();
+            if (key.equals("corpus")) {
+                if (r.next() != JsonToken.START_ARRAY) {
+                    throw heap LlamaException("tok fixture: bad corpus");
+                }
+                while (true) {
+                    int32 e = r.next();
+                    if (e == JsonToken.END_ARRAY) {
+                        break;
+                    }
+                    String s = r.currentDecodedString();
+                    f.corpus.add(#s);
+                }
+                f.n = (int32) f.corpus.count();
+            } else if (key.equals("qwen2")) {
+                f.readFamily(r, true);
+            } else if (key.equals("llama2")) {
+                f.readFamily(r, false);
+            }
+        }
+        return #f;
+    }
+
+    static #int32[] grown(int32[] src, int32 used) {
+        int32[] bigger = heap int32[used * 2];
+        int32 i = 0;
+        while (i < used) {
+            bigger[i] = src[i];
+            i = i + 1;
+        }
+        return #bigger;
+    }
+
+    void readFamily(JsonReader r, boolean isQwen) {
+        if (r.next() != JsonToken.START_ARRAY) {
+            throw heap LlamaException("tok fixture: bad family array");
+        }
+        int32[] ids = heap int32[4096];
+        int32 idN = 0;
+        int32[] off = heap int32[256];
+        int32 offN = 0;
+        off[0] = 0;
+        offN = 1;
+        while (true) {
+            int32 tk = r.next();
+            if (tk == JsonToken.END_ARRAY) {
+                break;
+            }
+            if (tk != JsonToken.START_ARRAY) {
+                throw heap LlamaException("tok fixture: bad id row");
+            }
+            while (true) {
+                int32 e = r.next();
+                if (e == JsonToken.END_ARRAY) {
+                    break;
+                }
+                if (idN >= (int32) ids.count()) {
+                    // `#`-returning call: the local TAKES title. A plain
+                    // `ids = bigger` would borrow a block-scoped array.
+                    ids = TokFix.grown(ids, idN);
+                }
+                ids[idN] = (int32) r.currentNumberAsInt64();
+                idN = idN + 1;
+            }
+            off[offN] = idN;
+            offN = offN + 1;
+        }
+        int32[] exactIds = heap int32[idN];
+        int32 i = 0;
+        while (i < idN) {
+            exactIds[i] = ids[i];
+            i = i + 1;
+        }
+        int32[] exactOff = heap int32[offN];
+        i = 0;
+        while (i < offN) {
+            exactOff[i] = off[i];
+            i = i + 1;
+        }
+        if (isQwen) {
+            this.qwenIds #= exactIds;
+            this.qwenOff #= exactOff;
+        } else {
+            this.llamaIds #= exactIds;
+            this.llamaOff #= exactOff;
+        }
+    }
+}

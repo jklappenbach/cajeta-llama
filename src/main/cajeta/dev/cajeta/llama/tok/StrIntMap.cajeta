@@ -1,0 +1,102 @@
+package dev.cajeta.llama.tok;
+
+import cajeta.lang.String;
+
+/**
+ * Open-addressing String -> int32 map for the tokenizer's vocab and
+ * merge-rank tables (up to ~151k entries for Qwen2). Linear probing
+ * over `String.hash()`; grows at 70% load. Misses return -1 — token
+ * ids and merge ranks are both non-negative.
+ */
+final class StrIntMap {
+
+    String[] keys;
+    int32[] vals;
+    int32 cap;
+    int32 n;
+
+    StrIntMap(int32 initialCap) {
+        int32 c = 16;
+        while (c < initialCap) {
+            c = c * 2;
+        }
+        this.cap = c;
+        this.keys = heap String[c];
+        this.vals = heap int32[c];
+        this.n = 0;
+    }
+
+    int32 slotFor(String k) {
+        int64 h = k.hash();
+        int32 mask = this.cap - 1;
+        int32 i = (int32) (h & (int64) mask);
+        if (i < 0) {
+            i = i + this.cap;
+        }
+        while (true) {
+            if (this.keys[i] == null) {
+                return i;
+            }
+            if (this.keys[i].equals(k)) {
+                return i;
+            }
+            i = (i + 1) & mask;
+        }
+    }
+
+    void put(String k, int32 v) {
+        if (this.n * 10 >= this.cap * 7) {
+            this.grow();
+        }
+        int32 i = this.slotFor(k);
+        if (this.keys[i] == null) {
+            this.keys[i] = k;
+            this.n = this.n + 1;
+        }
+        this.vals[i] = v;
+    }
+
+    /** Value for `k`, or -1 when absent. */
+    int32 get(String k) {
+        int32 i = this.slotFor(k);
+        if (this.keys[i] == null) {
+            return 0 - 1;
+        }
+        return this.vals[i];
+    }
+
+    int32 count() {
+        return this.n;
+    }
+
+    void grow() {
+        // Build the new tables in locals and read the OLD ones through
+        // the fields — the fields still hold title until the `#=` below.
+        // (Saving a borrow of the old array and then overwriting the
+        // field drops it under the borrow: a use-after-free.)
+        int32 oc = this.cap;
+        int32 nc = oc * 2;
+        int32 mask = nc - 1;
+        String[] nk = heap String[nc];
+        int32[] nv = heap int32[nc];
+        int32 i = 0;
+        while (i < oc) {
+            if (this.keys[i] != null) {
+                int64 h = this.keys[i].hash();
+                int32 j = (int32) (h & (int64) mask);
+                if (j < 0) {
+                    j = j + nc;
+                }
+                while (nk[j] != null) {
+                    j = (j + 1) & mask;
+                }
+                nk[j] = this.keys[i];      // borrow, as in put()
+                nv[j] = this.vals[i];
+            }
+            i = i + 1;
+        }
+        this.keys #= nk;
+        this.vals #= nv;
+        this.cap = nc;
+    }
+}

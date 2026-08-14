@@ -1,0 +1,79 @@
+package dev.cajeta.llama.tok;
+
+import cajeta.io.file.File;
+import cajeta.lang.Cajeta;
+import cajeta.lang.String;
+import dev.cajeta.codec.protobuf.ProtobufCursor;
+import dev.cajeta.llama.LlamaException;
+
+/**
+ * Raw SentencePiece `tokenizer.model` reading (spec 7.10): the
+ * `ModelProto`'s repeated `pieces` field (1), each piece a submessage
+ * of `piece` (1, string), `score` (2, float/fixed32), `type` (3,
+ * varint; 1=NORMAL, 2=UNKNOWN, 3=CONTROL, 4=USER_DEFINED, 6=BYTE).
+ *
+ * Uses `dev.cajeta.codec.protobuf.ProtobufCursor` directly —
+ * `repeatedCount`/`slotOfNth` for the repeated field — NOT the typed
+ * `Protobuf.parse<T>` facade (a documented stub until cajeta-two's
+ * ProtobufSynthesizer lands).
+ */
+public final class SpProto {
+
+    public String[] pieces;
+    public float32[] scores;
+    public int32[] types;
+    public int32 n;
+
+    SpProto(int32 count) {
+        this.pieces = heap String[count];
+        this.scores = heap float32[count];
+        this.types = heap int32[count];
+        this.n = count;
+    }
+
+    /** Read every piece (string, score, type) from a ModelProto file. */
+    public static #SpProto read(String path) {
+        int8[] raw = File.readAllBytes(path);
+        int64 rawLen = (int64) raw.count();
+        if (rawLen <= 0) {
+            throw heap LlamaException("sp model: '" + path
+                + "' is missing or empty");
+        }
+        ProtobufCursor c = heap ProtobufCursor(raw, rawLen);
+        int32 count = c.repeatedCount(1);
+        if (count <= 0) {
+            throw heap LlamaException("sp model: '" + path
+                + "' has no pieces (field 1)");
+        }
+        SpProto out = heap SpProto(count);
+        int32 k = 0;
+        while (k < count) {
+            int32 slot = c.slotOfNth(1, k);
+            int8[] sub = c.readBytes(slot);
+            int64 subLen = (int64) sub.count();
+            ProtobufCursor pc = heap ProtobufCursor(sub, subLen);
+            if (pc.has(1)) {
+                int8[] pb = pc.readBytes(pc.slotOf(1));
+                int32 pn = (int32) pb.count();
+                String s = heap String(#pb, pn);
+                out.pieces[k] #= s;
+            } else {
+                String empty = "";
+                out.pieces[k] = empty;
+            }
+            if (pc.has(2)) {
+                int32 bits = pc.readFixed32(pc.slotOf(2));
+                out.scores[k] = Cajeta.bitsToF32(bits);
+            } else {
+                out.scores[k] = 0.0f;
+            }
+            if (pc.has(3)) {
+                out.types[k] = (int32) pc.readVarint(pc.slotOf(3));
+            } else {
+                out.types[k] = 1;
+            }
+            k = k + 1;
+        }
+        return #out;
+    }
+}

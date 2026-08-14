@@ -1,0 +1,37 @@
+package dev.cajeta.llama.tok;
+
+/** Growable int32 buffer for token-id output. */
+final class IdBuf {
+
+    int32[] b;
+    int32 n;
+
+    IdBuf() {
+        this.b = heap int32[64];
+        this.n = 0;
+    }
+
+    void add(int32 v) {
+        if (this.n >= (int32) this.b.count()) {
+            int32[] bigger = heap int32[this.n * 2];
+            int32 i = 0;
+            while (i < this.n) {
+                bigger[i] = this.b[i];
+                i = i + 1;
+            }
+            this.b #= bigger;
+        }
+        this.b[this.n] = v;
+        this.n = this.n + 1;
+    }
+
+    #int32[] take() {
+        int32[] exact = heap int32[this.n];
+        int32 i = 0;
+        while (i < this.n) {
+            exact[i] = this.b[i];
+            i = i + 1;
+        }
+        return #exact;
+    }
+}
