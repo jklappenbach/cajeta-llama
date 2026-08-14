@@ -1,0 +1,265 @@
+package dev.cajeta.llama.chat;
+
+import cajeta.codec.json.Json;
+import cajeta.codec.json.JsonReader;
+import cajeta.codec.json.JsonToken;
+import cajeta.codec.json.JsonValue;
+import cajeta.io.file.File;
+import cajeta.lang.String;
+import dev.cajeta.llama.LlamaException;
+
+/**
+ * Chat-prompt rendering (spec 7.11–7.14, 13.18): the model's OWN
+ * `chat_template` is interpreted — from `tokenizer_config.json` for HF
+ * repos, from `tokenizer.chat_template` for GGUF. No template table
+ * ships beside it: two renderers that can disagree is worse than one
+ * that fails loudly, which is the lesson `llama.cpp`'s `--jinja` and
+ * Ollama's drifting table both record.
+ *
+ * `renderPre` is permanent API surface (7.13), not a stopgap: a caller
+ * that has already rendered a prompt passes it through untouched.
+ */
+public final class ChatTemplate {
+
+    Tpl tpl;
+    String bosToken;
+    String eosToken;
+    String nowText;
+
+    ChatTemplate(#Tpl t, String bos, String eos) {
+        this.tpl #= t;
+        this.bosToken = "" + bos;
+        this.eosToken = "" + eos;
+        this.nowText = "01 Jan 2026";
+    }
+
+    /**
+     * The clock `strftime_now()` reads. Injectable so a template that
+     * stamps a date renders deterministically under test (13.1.8).
+     */
+    public void setNow(String text) {
+        this.nowText = "" + text;
+    }
+
+    public String bos() {
+        return this.bosToken;
+    }
+
+    public String eos() {
+        return this.eosToken;
+    }
+
+    /** Compile a template held as text (the GGUF path, 7.11). */
+    public static #ChatTemplate fromString(String template, String name,
+            String bos, String eos) {
+        Tpl t = TplParser.parse(template, name);
+        return heap ChatTemplate(#t, bos, eos);
+    }
+
+    /**
+     * Read `chat_template` (and the bos/eos tokens) from an HF
+     * `tokenizer_config.json` (7.11).
+     *
+     * Streamed with `JsonReader.currentDecodedString`, NOT the parsed
+     * `JsonValue` tree: tree accessors hand back the token's VERBATIM
+     * bytes — escapes undecoded, which is the codec's deliberate
+     * zero-copy design (spec 13.7) — and a template still carrying
+     * `\n` and `\"` is not a template. Decoding is exactly what the
+     * Unit 12 accessor exists for.
+     */
+    public static #ChatTemplate fromTokenizerConfig(String path) {
+        int8[] raw = File.readAllBytes(path);
+        int64 rawLen = (int64) raw.count();
+        if (rawLen <= 0) {
+            throw heap LlamaException("chat template: '" + path
+                + "' is missing or empty");
+        }
+        JsonReader r = heap JsonReader(raw, rawLen);
+        if (r.next() != JsonToken.START_OBJECT) {
+            throw heap LlamaException("chat template: '" + path
+                + "' is not a JSON object");
+        }
+        String text = null;
+        String bos = "";
+        String eos = "";
+        while (true) {
+            int32 tk = r.next();
+            if (tk == JsonToken.END_OBJECT || tk == JsonToken.END) {
+                break;
+            }
+            if (tk != JsonToken.KEY) {
+                continue;
+            }
+            String key = r.currentDecodedString();
+            if (key.equals("chat_template")) {
+                int32 vt = r.next();
+                if (vt == JsonToken.STRING) {
+                    text = r.currentDecodedString();
+                } else if (vt == JsonToken.START_ARRAY) {
+                    // Some repos ship a list of named templates.
+                    text = ChatTemplate.pickNamedTemplate(r);
+                } else {
+                    ChatTemplate.skipValue(r, vt);
+                }
+            } else if (key.equals("bos_token")) {
+                bos = ChatTemplate.readToken(r);
+            } else if (key.equals("eos_token")) {
+                eos = ChatTemplate.readToken(r);
+            } else {
+                ChatTemplate.skipValue(r, r.next());
+            }
+        }
+        if (text == null) {
+            throw heap LlamaException("chat template: '" + path
+                + "' declares no chat_template");
+        }
+        return #ChatTemplate.fromString(text, path, bos, eos);
+    }
+
+    /** A `[{name, template}, ...]` chat_template: "default" wins. */
+    static #String pickNamedTemplate(JsonReader r) {
+        String chosen = null;
+        String fallback = null;
+        while (true) {
+            int32 tk = r.next();
+            if (tk == JsonToken.END_ARRAY || tk == JsonToken.END) {
+                break;
+            }
+            if (tk != JsonToken.START_OBJECT) {
+                continue;
+            }
+            String nm = null;
+            String tv = null;
+            while (true) {
+                int32 e = r.next();
+                if (e == JsonToken.END_OBJECT || e == JsonToken.END) {
+                    break;
+                }
+                if (e != JsonToken.KEY) {
+                    continue;
+                }
+                String k = r.currentDecodedString();
+                int32 vt = r.next();
+                if (k.equals("name") && vt == JsonToken.STRING) {
+                    nm = r.currentDecodedString();
+                } else if (k.equals("template") && vt == JsonToken.STRING) {
+                    tv = r.currentDecodedString();
+                } else {
+                    ChatTemplate.skipValue(r, vt);
+                }
+            }
+            if (tv != null) {
+                if (fallback == null) {
+                    fallback = "" + tv;
+                }
+                if (nm != null && nm.equals("default")) {
+                    chosen = "" + tv;
+                }
+            }
+        }
+        if (chosen != null) {
+            return #chosen;
+        }
+        return #fallback;
+    }
+
+    /** `bos_token` is a string in some repos, `{content: "..."}` in
+     *  others. */
+    static #String readToken(JsonReader r) {
+        int32 vt = r.next();
+        if (vt == JsonToken.STRING) {
+            return #r.currentDecodedString();
+        }
+        if (vt == JsonToken.START_OBJECT) {
+            String content = "";
+            while (true) {
+                int32 e = r.next();
+                if (e == JsonToken.END_OBJECT || e == JsonToken.END) {
+                    break;
+                }
+                if (e != JsonToken.KEY) {
+                    continue;
+                }
+                String k = r.currentDecodedString();
+                int32 kv = r.next();
+                if (k.equals("content") && kv == JsonToken.STRING) {
+                    content = r.currentDecodedString();
+                } else {
+                    ChatTemplate.skipValue(r, kv);
+                }
+            }
+            return #content;
+        }
+        ChatTemplate.skipValue(r, vt);
+        return "";
+    }
+
+    /** Skip a value whose opening token has already been read. */
+    static void skipValue(JsonReader r, int32 opened) {
+        if (opened != JsonToken.START_OBJECT
+                && opened != JsonToken.START_ARRAY) {
+            return;
+        }
+        int32 depth = 1;
+        while (depth > 0) {
+            int32 e = r.next();
+            if (e == JsonToken.START_OBJECT || e == JsonToken.START_ARRAY) {
+                depth = depth + 1;
+            } else if (e == JsonToken.END_OBJECT
+                    || e == JsonToken.END_ARRAY) {
+                depth = depth - 1;
+            } else if (e == JsonToken.END) {
+                return;
+            }
+        }
+    }
+
+    /**
+     * Render `messages` (a JSON array of role/content objects), with
+     * optional `tools`, into the model's prompt text.
+     */
+    public #String render(JsonValue messages, JsonValue tools,
+            boolean addGenerationPrompt) {
+        TplEval ev = heap TplEval(this.tpl, this.nowText);
+        ev.push("messages", #TplEval.copy(messages));
+        if (tools != null) {
+            ev.push("tools", #TplEval.copy(tools));
+        }
+        ev.push("add_generation_prompt",
+            #TplEval.bool(addGenerationPrompt));
+        ev.push("bos_token", #TplEval.str(this.bosToken));
+        ev.push("eos_token", #TplEval.str(this.eosToken));
+        ev.run(this.tpl.root);
+        return #ev.out.take();
+    }
+
+    /** Render from JSON source text — the convenient entry point. */
+    public #String renderJson(String messagesJson, String toolsJson,
+            boolean addGenerationPrompt) {
+        JsonValue msgs = ChatTemplate.parseJson(messagesJson);
+        JsonValue tools = null;
+        if (toolsJson != null && toolsJson.byteLength() > 0) {
+            tools = ChatTemplate.parseJson(toolsJson);
+        }
+        return #this.render(msgs, tools, addGenerationPrompt);
+    }
+
+    static #JsonValue parseJson(String text) {
+        int32 n = text.byteLength();
+        int8[] b = heap int8[n];
+        int32 i = 0;
+        while (i < n) {
+            b[i] = (int8) text.byteAt(i);
+            i = i + 1;
+        }
+        return #Json.parse(b, (int64) n);
+    }
+
+    /**
+     * 7.13 — a caller-supplied, already-rendered prompt bypasses the
+     * template entirely. Permanent API surface.
+     */
+    public static #String renderPre(String prompt) {
+        return "" + prompt;
+    }
+}

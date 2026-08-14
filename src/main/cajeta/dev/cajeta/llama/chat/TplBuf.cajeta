@@ -1,0 +1,91 @@
+package dev.cajeta.llama.chat;
+
+import cajeta.lang.String;
+
+/** Growable byte buffer for template text accumulation and output. */
+final class TplBuf {
+
+    int8[] b;
+    int32 n;
+
+    TplBuf() {
+        this.b = heap int8[256];
+        this.n = 0;
+    }
+
+    void ensure(int32 extra) {
+        int32 need = this.n + extra;
+        if (need > (int32) this.b.count()) {
+            int32 cap = (int32) this.b.count() * 2;
+            while (cap < need) {
+                cap = cap * 2;
+            }
+            int8[] bigger = heap int8[cap];
+            int32 i = 0;
+            while (i < this.n) {
+                bigger[i] = this.b[i];
+                i = i + 1;
+            }
+            this.b #= bigger;
+        }
+    }
+
+    void addByte(int32 v) {
+        this.ensure(1);
+        this.b[this.n] = (int8) v;
+        this.n = this.n + 1;
+    }
+
+    void addStr(String s) {
+        int32 m = s.byteLength();
+        this.ensure(m);
+        int32 i = 0;
+        while (i < m) {
+            this.b[this.n + i] = (int8) s.byteAt(i);
+            i = i + 1;
+        }
+        this.n = this.n + m;
+    }
+
+    /** Drop the trailing horizontal whitespace back to a newline; true
+     *  when everything from the last newline to the end was blank
+     *  (the `lstrip_blocks` condition). */
+    boolean lstripToLine() {
+        int32 k = this.n;
+        while (k > 0) {
+            int32 c = (int32) this.b[k - 1] & 255;
+            if (c == 32 || c == 9) {
+                k = k - 1;
+            } else if (c == 10) {
+                this.n = k;
+                return true;
+            } else {
+                return false;
+            }
+        }
+        this.n = 0;      // start of template counts as a line start
+        return true;
+    }
+
+    /** Drop ALL trailing whitespace (explicit `-` control). */
+    void rstripAll() {
+        while (this.n > 0) {
+            int32 c = (int32) this.b[this.n - 1] & 255;
+            if (c == 32 || c == 9 || c == 10 || c == 13) {
+                this.n = this.n - 1;
+            } else {
+                return;
+            }
+        }
+    }
+
+    #String take() {
+        int8[] exact = heap int8[this.n];
+        int32 i = 0;
+        while (i < this.n) {
+            exact[i] = this.b[i];
+            i = i + 1;
+        }
+        return heap String(#exact, this.n);
+    }
+}

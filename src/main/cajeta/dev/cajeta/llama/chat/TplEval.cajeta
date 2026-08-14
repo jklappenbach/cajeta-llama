@@ -1,0 +1,1393 @@
+package dev.cajeta.llama.chat;
+
+import cajeta.codec.json.JsonArray;
+import cajeta.codec.json.JsonObject;
+import cajeta.codec.json.JsonValue;
+import cajeta.lang.String;
+import dev.cajeta.llama.LlamaException;
+
+/**
+ * The chat-template interpreter (spec 7.11–7.14). Values are
+ * `JsonValue` — the model's own shape, per 13.18 — with cajeta `null`
+ * standing for Jinja's *undefined* (distinct from `JsonValue` NULL,
+ * which is Jinja's `none`); `is defined` is exactly that distinction.
+ *
+ * Scopes are a flat name/value stack: templates hold a handful of names
+ * and lookups walk backwards, so a map per frame would cost more than
+ * it saves. `for` and macro invocation push a frame and truncate on
+ * exit.
+ */
+final class TplEval {
+
+    Tpl t;
+    TplBuf out;
+    String[] names;
+    JsonValue[] vals;
+    int32 depth;
+    // macro table
+    String[] macroNames;
+    int32[] macroNodes;
+    int32 macroN;
+    String nowText;          // injected clock (13.1.8)
+
+    TplEval(Tpl tpl, String nowText) {
+        this.t = tpl;
+        this.out = heap TplBuf();
+        this.names = heap String[64];
+        this.vals = heap JsonValue[64];
+        this.depth = 0;
+        this.macroNames = heap String[8];
+        this.macroNodes = heap int32[8];
+        this.macroN = 0;
+        this.nowText = "" + nowText;
+    }
+
+    // ── scope ──────────────────────────────────────────────────────────
+
+    void push(String name, #JsonValue v) {
+        if (this.depth >= (int32) this.vals.count()) {
+            int32 cap = this.depth * 2;
+            String[] nn = heap String[cap];
+            JsonValue[] nv = heap JsonValue[cap];
+            int32 i = 0;
+            while (i < this.depth) {
+                nn[i] = this.names[i];
+                nv[i] = this.vals[i];
+                i = i + 1;
+            }
+            this.names #= nn;
+            this.vals #= nv;
+        }
+        this.names[this.depth] = name;
+        this.vals[this.depth] #= v;
+        this.depth = this.depth + 1;
+    }
+
+    /** Rebind in place when the name exists (Jinja `set` semantics at
+     *  the current scope), else define it. */
+    void assign(String name, #JsonValue v) {
+        int32 i = this.depth - 1;
+        while (i >= 0) {
+            if (this.names[i].equals(name)) {
+                this.vals[i] #= v;
+                return;
+            }
+            i = i - 1;
+        }
+        this.push(name, #v);
+    }
+
+    #JsonValue lookup(String name) {
+        int32 i = this.depth - 1;
+        while (i >= 0) {
+            if (this.names[i].equals(name)) {
+                return #TplEval.copy(this.vals[i]);
+            }
+            i = i - 1;
+        }
+        return null;                     // undefined
+    }
+
+    int32 macroOf(String name) {
+        int32 i = 0;
+        while (i < this.macroN) {
+            if (this.macroNames[i].equals(name)) {
+                return this.macroNodes[i];
+            }
+            i = i + 1;
+        }
+        return 0 - 1;
+    }
+
+    void addMacro(String name, int32 node) {
+        if (this.macroN >= (int32) this.macroNodes.count()) {
+            int32 cap = this.macroN * 2;
+            String[] nn = heap String[cap];
+            int32[] ni = heap int32[cap];
+            int32 i = 0;
+            while (i < this.macroN) {
+                nn[i] = this.macroNames[i];
+                ni[i] = this.macroNodes[i];
+                i = i + 1;
+            }
+            this.macroNames #= nn;
+            this.macroNodes #= ni;
+        }
+        this.macroNames[this.macroN] = name;
+        this.macroNodes[this.macroN] = node;
+        this.macroN = this.macroN + 1;
+    }
+
+    // ── value helpers ──────────────────────────────────────────────────
+
+    /**
+     * A STRING value that OWNS its bytes.
+     *
+     * `setString(String)` stores the String's buffer as a BORROW and
+     * says so: "the String's lifetime must outlive this JsonValue".
+     * Every value here is built from a temporary — a filter result, a
+     * `~` concatenation, an object key — so the borrow dangles the
+     * moment that temporary drops, and the damage surfaces much later
+     * inside `asString()` on an unrelated read. Transfer instead.
+     */
+    static #JsonValue str(String s) {
+        JsonValue v = heap JsonValue();
+        int8[] w = s.toBytes();
+        v.setStringOwned(#w, s.byteLength());
+        return #v;
+    }
+
+    static #JsonValue num(int64 n) {
+        JsonValue v = heap JsonValue();
+        v.setNumber(n);
+        return #v;
+    }
+
+    static #JsonValue bool(boolean b) {
+        JsonValue v = heap JsonValue();
+        v.setBoolean(b);
+        return #v;
+    }
+
+    static boolean truthy(JsonValue v) {
+        if (v == null) {
+            return false;                       // undefined
+        }
+        int32 k = v.kind();
+        if (k == JsonValue.NULL) {
+            return false;
+        }
+        if (k == JsonValue.BOOLEAN) {
+            return v.asBoolean();
+        }
+        if (k == JsonValue.NUMBER) {
+            return v.asInt64() != 0;
+        }
+        if (k == JsonValue.STRING) {
+            return v.asBytesLength() > 0;
+        }
+        if (k == JsonValue.ARRAY) {
+            return v.asArray().count() > 0;
+        }
+        return v.asObject().count() > 0;
+    }
+
+    /** Jinja's `str()` for interpolation. */
+    static #String text(JsonValue v) {
+        if (v == null) {
+            return "";
+        }
+        int32 k = v.kind();
+        if (k == JsonValue.NULL) {
+            return "None";
+        }
+        if (k == JsonValue.BOOLEAN) {
+            if (v.asBoolean()) {
+                return "True";
+            }
+            return "False";
+        }
+        if (k == JsonValue.NUMBER) {
+            if (v.isFloat()) {
+                return "" + v.asFloat64();
+            }
+            return "" + v.asInt64();
+        }
+        if (k == JsonValue.STRING) {
+            return v.asString();
+        }
+        return #TplEval.jsonText(v, false, 0);
+    }
+
+    /** `tojson`: compact by default, or indented when asked. */
+    static #String jsonText(JsonValue v, boolean indent, int32 level) {
+        TplBuf b = heap TplBuf();
+        TplEval.writeJson(b, v, indent, level);
+        return #b.take();
+    }
+
+    static void writeJson(TplBuf b, JsonValue v, boolean indent,
+            int32 level) {
+        if (v == null) {
+            b.addStr("null");
+            return;
+        }
+        int32 k = v.kind();
+        if (k == JsonValue.NULL) {
+            b.addStr("null");
+            return;
+        }
+        if (k == JsonValue.BOOLEAN) {
+            if (v.asBoolean()) {
+                b.addStr("true");
+            } else {
+                b.addStr("false");
+            }
+            return;
+        }
+        if (k == JsonValue.NUMBER) {
+            if (v.isFloat()) {
+                b.addStr("" + v.asFloat64());
+            } else {
+                b.addStr("" + v.asInt64());
+            }
+            return;
+        }
+        if (k == JsonValue.STRING) {
+            TplEval.writeJsonString(b, v.asString());
+            return;
+        }
+        if (k == JsonValue.ARRAY) {
+            JsonArray arr = v.asArray();
+            int32 n = arr.count();
+            b.addByte(91);
+            int32 i = 0;
+            while (i < n) {
+                if (i > 0) {
+                    b.addByte(44);
+                    if (indent) {
+                        b.addByte(10);
+                    } else {
+                        b.addByte(32);
+                    }
+                } else if (indent) {
+                    b.addByte(10);
+                }
+                if (indent) {
+                    TplEval.pad(b, level + 1);
+                }
+                TplEval.writeJson(b, arr.get(i), indent, level + 1);
+                i = i + 1;
+            }
+            if (indent && n > 0) {
+                b.addByte(10);
+                TplEval.pad(b, level);
+            }
+            b.addByte(93);
+            return;
+        }
+        JsonObject o = v.asObject();
+        int32 n2 = o.count();
+        b.addByte(123);
+        int32 j = 0;
+        while (j < n2) {
+            if (j > 0) {
+                b.addByte(44);
+                if (indent) {
+                    b.addByte(10);
+                } else {
+                    b.addByte(32);
+                }
+            } else if (indent) {
+                b.addByte(10);
+            }
+            if (indent) {
+                TplEval.pad(b, level + 1);
+            }
+            String key = TplEval.keyOf(o, j);
+            TplEval.writeJsonString(b, key);
+            b.addByte(58);
+            b.addByte(32);
+            TplEval.writeJson(b, o.valueAt(j), indent, level + 1);
+            j = j + 1;
+        }
+        if (indent && n2 > 0) {
+            b.addByte(10);
+            TplEval.pad(b, level);
+        }
+        b.addByte(125);
+    }
+
+    static void pad(TplBuf b, int32 level) {
+        int32 i = 0;
+        while (i < level * 4) {
+            b.addByte(32);
+            i = i + 1;
+        }
+    }
+
+    static void writeJsonString(TplBuf b, String s) {
+        b.addByte(34);
+        int32 n = s.byteLength();
+        int32 i = 0;
+        while (i < n) {
+            int32 c = s.byteAt(i) & 255;
+            if (c == 34) {
+                b.addByte(92);
+                b.addByte(34);
+            } else if (c == 92) {
+                b.addByte(92);
+                b.addByte(92);
+            } else if (c == 10) {
+                b.addByte(92);
+                b.addByte(110);
+            } else if (c == 13) {
+                b.addByte(92);
+                b.addByte(114);
+            } else if (c == 9) {
+                b.addByte(92);
+                b.addByte(116);
+            } else if (c < 32) {
+                b.addStr("\\u00");
+                b.addByte(TplEval.hexDigit((c >>> 4) & 15));
+                b.addByte(TplEval.hexDigit(c & 15));
+            } else {
+                b.addByte(c);
+            }
+            i = i + 1;
+        }
+        b.addByte(34);
+    }
+
+    static int32 hexDigit(int32 v) {
+        if (v < 10) {
+            return 48 + v;
+        }
+        return 97 + (v - 10);
+    }
+
+    // ── statement execution ────────────────────────────────────────────
+
+    void run(int32 head) {
+        int32 i = head;
+        while (i >= 0) {
+            this.exec(i);
+            i = this.t.nx(i);
+        }
+    }
+
+    void exec(int32 i) {
+        int32 k = this.t.k(i);
+        if (k == Tpl.N_TEXT) {
+            this.out.addStr(this.t.strOf(i));
+            return;
+        }
+        if (k == Tpl.N_OUT) {
+            JsonValue v = this.eval(this.t.a(i));
+            this.out.addStr(TplEval.text(v));
+            return;
+        }
+        if (k == Tpl.N_IF) {
+            if (TplEval.truthy(this.eval(this.t.a(i)))) {
+                this.run(this.t.b(i));
+            } else {
+                this.run(this.t.c(i));
+            }
+            return;
+        }
+        if (k == Tpl.N_SET) {
+            JsonValue v = this.eval(this.t.a(i));
+            this.assign(this.t.strOf(i), #v);
+            return;
+        }
+        if (k == Tpl.N_MACRO) {
+            this.addMacro(this.t.strOf(i), i);
+            return;
+        }
+        if (k == Tpl.N_FOR) {
+            this.execFor(i);
+            return;
+        }
+        throw heap LlamaException("chat template: unhandled node kind "
+            + k);
+    }
+
+    void execFor(int32 i) {
+        JsonValue seq = this.eval(this.t.a(i));
+        int32 nameCount = this.t.d(i);
+        String spec = this.t.strOf(i);
+        String n1 = spec;
+        String n2 = null;
+        if (nameCount > 1) {
+            int32 comma = 0;
+            int32 m = spec.byteLength();
+            int32 z = 0;
+            while (z < m) {
+                if (spec.byteAt(z) == 44) {
+                    comma = z;
+                    z = m;
+                } else {
+                    z = z + 1;
+                }
+            }
+            n1 = spec.substring(0, comma);
+            n2 = spec.substring(comma + 1, spec.byteLength());
+        }
+        int32 count = 0;
+        JsonArray arr = null;
+        JsonObject obj = null;
+        if (seq != null && seq.kind() == JsonValue.ARRAY) {
+            arr = seq.asArray();
+            count = arr.count();
+        } else if (seq != null && seq.kind() == JsonValue.OBJECT) {
+            obj = seq.asObject();
+            count = obj.count();
+        } else if (seq != null && seq.kind() == JsonValue.STRING) {
+            throw heap LlamaException("chat template '" + this.t.name
+                + "': {% for %} over a string at line "
+                + this.t.line(i) + " is outside the dialect");
+        }
+        if (count == 0) {
+            this.run(this.t.c(i));       // for/else
+            return;
+        }
+        int32 mark = this.depth;
+        int32 idx = 0;
+        while (idx < count) {
+            this.depth = mark;           // fresh frame each iteration
+            JsonValue item = null;
+            if (arr != null) {
+                item = arr.get(idx);
+                if (nameCount > 1 && item != null
+                        && item.kind() == JsonValue.ARRAY) {
+                    JsonArray pair = item.asArray();
+                    this.push(n1, #TplEval.copy(pair.get(0)));
+                    this.push(n2, #TplEval.copy(pair.get(1)));
+                } else {
+                    this.push(n1, #TplEval.copy(item));
+                }
+            } else {
+                String key = TplEval.keyOf(obj, idx);
+                JsonValue kv = TplEval.str(key);
+                this.push(n1, #kv);
+                if (nameCount > 1) {
+                    this.push(n2, #TplEval.copy(obj.valueAt(idx)));
+                }
+            }
+            this.push("loop", #this.loopVar(idx, count, arr));
+            this.run(this.t.b(i));
+            idx = idx + 1;
+        }
+        this.depth = mark;
+    }
+
+    #JsonValue loopVar(int32 idx, int32 count, JsonArray arr) {
+        JsonObject o = heap JsonObject();
+        TplEval.putKey(o, "index0", TplEval.num((int64) idx));
+        TplEval.putKey(o, "index", TplEval.num((int64) (idx + 1)));
+        TplEval.putKey(o, "revindex0",
+            TplEval.num((int64) (count - idx - 1)));
+        TplEval.putKey(o, "revindex",
+            TplEval.num((int64) (count - idx)));
+        TplEval.putKey(o, "length", TplEval.num((int64) count));
+        TplEval.putKey(o, "first", TplEval.bool(idx == 0));
+        TplEval.putKey(o, "last", TplEval.bool(idx == count - 1));
+        // previtem / nextitem: real templates branch on them.
+        if (arr != null) {
+            if (idx > 0) {
+                TplEval.putKeyBorrowed(o, "previtem", arr.get(idx - 1));
+            }
+            if (idx + 1 < count) {
+                TplEval.putKeyBorrowed(o, "nextitem", arr.get(idx + 1));
+            }
+        }
+        JsonValue v = heap JsonValue();
+        v.setObject(#o);
+        return #v;
+    }
+
+    /**
+     * A JsonObject key as a String, with the bytes COPIED. `keyAt`
+     * hands back a BORROW of the object's own key storage; passing
+     * that to `heap String(#...)` gives the String title to memory the
+     * object still owns and still frees — the freed key then reads
+     * back as garbage.
+     */
+    static #String keyOf(JsonObject o, int32 j) {
+        int32 kl = o.keyLenAt(j);
+        int8[] src = o.keyAt(j);
+        int8[] dst = heap int8[kl];
+        int32 i = 0;
+        while (i < kl) {
+            dst[i] = src[i];
+            i = i + 1;
+        }
+        return heap String(#dst, kl);
+    }
+
+    static void putKey(JsonObject o, String key, #JsonValue v) {
+        int32 n = key.byteLength();
+        int8[] kb = heap int8[n];
+        int32 i = 0;
+        while (i < n) {
+            kb[i] = (int8) key.byteAt(i);
+            i = i + 1;
+        }
+        o.put(#kb, n, #v);
+    }
+
+    /** Copy a borrowed value into the object (the object owns its
+     *  members; the source tree outlives neither safely nor usefully). */
+    static void putKeyBorrowed(JsonObject o, String key, JsonValue v) {
+        TplEval.putKey(o, key, TplEval.copy(v));
+    }
+
+    static #JsonValue copy(JsonValue v) {
+        JsonValue r = heap JsonValue();
+        if (v == null) {
+            r.setNull();
+            return #r;
+        }
+        int32 k = v.kind();
+        if (k == JsonValue.NULL) {
+            r.setNull();
+        } else if (k == JsonValue.BOOLEAN) {
+            r.setBoolean(v.asBoolean());
+        } else if (k == JsonValue.NUMBER) {
+            if (v.isFloat()) {
+                r.setFloat(v.asFloat64());
+            } else {
+                r.setNumber(v.asInt64());
+            }
+        } else if (k == JsonValue.STRING) {
+            // Copy the bytes and TRANSFER them: setString(String) would
+            // borrow, and the copy must not depend on the source living
+            // on (see `str`).
+            int32 sn = v.asBytesLength();
+            int8[] sb = v.asBytes();
+            int8[] dst = heap int8[sn];
+            int32 z = 0;
+            while (z < sn) {
+                dst[z] = sb[z];
+                z = z + 1;
+            }
+            r.setStringOwned(#dst, sn);
+        } else if (k == JsonValue.ARRAY) {
+            JsonArray src = v.asArray();
+            JsonArray dst = heap JsonArray();
+            int32 i = 0;
+            while (i < src.count()) {
+                dst.add(TplEval.copy(src.get(i)));
+                i = i + 1;
+            }
+            r.setArray(#dst);
+        } else {
+            JsonObject src2 = v.asObject();
+            JsonObject dst2 = heap JsonObject();
+            int32 j = 0;
+            while (j < src2.count()) {
+                int8[] kb = src2.keyAt(j);
+                int32 kl = src2.keyLenAt(j);
+                int8[] kc = heap int8[kl];
+                int32 z = 0;
+                while (z < kl) {
+                    kc[z] = kb[z];
+                    z = z + 1;
+                }
+                dst2.put(#kc, kl, TplEval.copy(src2.valueAt(j)));
+                j = j + 1;
+            }
+            r.setObject(#dst2);
+        }
+        return #r;
+    }
+
+    // ── expression evaluation ──────────────────────────────────────────
+
+    #JsonValue eval(int32 i) {
+        if (i < 0) {
+            return null;
+        }
+        int32 k = this.t.k(i);
+        if (k == Tpl.E_STR) {
+            return #TplEval.str(this.t.strOf(i));
+        }
+        if (k == Tpl.E_NUM) {
+            String s = this.t.strOf(i);
+            return #TplEval.num(TplEval.parseInt(s));
+        }
+        if (k == Tpl.E_TRUE) {
+            return #TplEval.bool(true);
+        }
+        if (k == Tpl.E_FALSE) {
+            return #TplEval.bool(false);
+        }
+        if (k == Tpl.E_NONE) {
+            JsonValue v = heap JsonValue();
+            v.setNull();
+            return #v;
+        }
+        if (k == Tpl.E_NAME) {
+            return #this.lookup(this.t.strOf(i));
+        }
+        if (k == Tpl.E_ATTR) {
+            JsonValue o = this.eval(this.t.a(i));
+            return #TplEval.member(o, this.t.strOf(i));
+        }
+        if (k == Tpl.E_INDEX) {
+            JsonValue o = this.eval(this.t.a(i));
+            JsonValue idx = this.eval(this.t.b(i));
+            return #TplEval.indexOf(o, idx);
+        }
+        if (k == Tpl.E_SLICE) {
+            return #this.evalSlice(i);
+        }
+        if (k == Tpl.E_NOT) {
+            return #TplEval.bool(TplEval.truthy(this.eval(this.t.a(i)))
+                == false);
+        }
+        if (k == Tpl.E_NEG) {
+            JsonValue v = this.eval(this.t.a(i));
+            return #TplEval.num(0 - TplEval.asNum(v));
+        }
+        if (k == Tpl.E_COND) {
+            if (TplEval.truthy(this.eval(this.t.a(i)))) {
+                return #this.eval(this.t.b(i));
+            }
+            return #this.eval(this.t.c(i));
+        }
+        if (k == Tpl.E_BIN) {
+            return #this.evalBin(i);
+        }
+        if (k == Tpl.E_TEST) {
+            return #this.evalTest(i);
+        }
+        if (k == Tpl.E_FILTER) {
+            return #this.evalFilter(i);
+        }
+        if (k == Tpl.E_LIST) {
+            JsonArray arr = heap JsonArray();
+            int32 it = this.t.a(i);
+            while (it >= 0) {
+                arr.add(TplEval.copy(this.eval(it)));
+                it = this.t.nx(it);
+            }
+            JsonValue v = heap JsonValue();
+            v.setArray(#arr);
+            return #v;
+        }
+        if (k == Tpl.E_DICT) {
+            JsonObject o = heap JsonObject();
+            int32 p = this.t.a(i);
+            while (p >= 0) {
+                JsonValue key = this.eval(this.t.a(p));
+                TplEval.putKey(o, TplEval.text(key),
+                    TplEval.copy(this.eval(this.t.b(p))));
+                p = this.t.nx(p);
+            }
+            JsonValue v = heap JsonValue();
+            v.setObject(#o);
+            return #v;
+        }
+        if (k == Tpl.E_CALL) {
+            return #this.evalCall(i);
+        }
+        throw heap LlamaException("chat template '" + this.t.name
+            + "': unhandled expression kind " + k + " at line "
+            + this.t.line(i));
+    }
+
+    static int64 parseInt(String s) {
+        int64 r = 0;
+        int32 i = 0;
+        int32 n = s.byteLength();
+        while (i < n) {
+            int32 c = s.byteAt(i);
+            if (c >= 48 && c <= 57) {
+                r = r * 10 + (int64) (c - 48);
+            }
+            i = i + 1;
+        }
+        return r;
+    }
+
+    static int64 asNum(JsonValue v) {
+        if (v == null) {
+            return 0;
+        }
+        if (v.kind() == JsonValue.NUMBER) {
+            return v.asInt64();
+        }
+        if (v.kind() == JsonValue.STRING) {
+            return TplEval.parseInt(v.asString());
+        }
+        if (v.kind() == JsonValue.BOOLEAN) {
+            if (v.asBoolean()) {
+                return 1;
+            }
+        }
+        return 0;
+    }
+
+    static #JsonValue member(JsonValue o, String name) {
+        if (o == null || o.kind() != JsonValue.OBJECT) {
+            return null;
+        }
+        JsonValue got = o.asObject().get(name);
+        if (got == null) {
+            return null;
+        }
+        return #TplEval.copy(got);
+    }
+
+    static #JsonValue indexOf(JsonValue o, JsonValue idx) {
+        if (o == null || idx == null) {
+            return null;
+        }
+        if (o.kind() == JsonValue.ARRAY) {
+            JsonArray a = o.asArray();
+            int32 i = (int32) TplEval.asNum(idx);
+            if (i < 0) {
+                i = a.count() + i;
+            }
+            if (i < 0 || i >= a.count()) {
+                return null;
+            }
+            return #TplEval.copy(a.get(i));
+        }
+        if (o.kind() == JsonValue.OBJECT) {
+            JsonValue got = o.asObject().get(TplEval.text(idx));
+            if (got == null) {
+                return null;
+            }
+            return #TplEval.copy(got);
+        }
+        return null;
+    }
+
+    #JsonValue evalSlice(int32 i) {
+        JsonValue o = this.eval(this.t.a(i));
+        if (o == null) {
+            return null;
+        }
+        int32 start = 0;
+        int32 stop = 0;
+        boolean isStr = o.kind() == JsonValue.STRING;
+        int32 n = 0;
+        JsonArray arr = null;
+        String s = null;
+        if (isStr) {
+            s = o.asString();
+            n = s.byteLength();
+        } else if (o.kind() == JsonValue.ARRAY) {
+            arr = o.asArray();
+            n = arr.count();
+        } else {
+            return null;
+        }
+        stop = n;
+        if (this.t.b(i) >= 0) {
+            start = (int32) TplEval.asNum(this.eval(this.t.b(i)));
+            if (this.t.k(this.t.b(i)) == Tpl.E_NEG) {
+                start = 0 - start;
+                start = n - start;
+            }
+            if (start < 0) {
+                start = n + start;
+            }
+        }
+        if (this.t.c(i) >= 0) {
+            stop = (int32) TplEval.asNum(this.eval(this.t.c(i)));
+            if (this.t.k(this.t.c(i)) == Tpl.E_NEG) {
+                stop = 0 - stop;
+                stop = n - stop;
+            }
+            if (stop < 0) {
+                stop = n + stop;
+            }
+        }
+        if (start < 0) {
+            start = 0;
+        }
+        if (stop > n) {
+            stop = n;
+        }
+        if (isStr) {
+            if (stop <= start) {
+                return #TplEval.str("");
+            }
+            return #TplEval.str(s.substring(start, stop));
+        }
+        JsonArray dst = heap JsonArray();
+        int32 j = start;
+        while (j < stop) {
+            dst.add(TplEval.copy(arr.get(j)));
+            j = j + 1;
+        }
+        JsonValue v = heap JsonValue();
+        v.setArray(#dst);
+        return #v;
+    }
+
+    #JsonValue evalBin(int32 i) {
+        String op = this.t.strOf(i);
+        if (op.equals("and")) {
+            JsonValue l = this.eval(this.t.a(i));
+            if (TplEval.truthy(l) == false) {
+                return #l;
+            }
+            return #this.eval(this.t.b(i));
+        }
+        if (op.equals("or")) {
+            JsonValue l2 = this.eval(this.t.a(i));
+            if (TplEval.truthy(l2)) {
+                return #l2;
+            }
+            return #this.eval(this.t.b(i));
+        }
+        JsonValue l3 = this.eval(this.t.a(i));
+        JsonValue r = this.eval(this.t.b(i));
+        if (op.equals("~")) {
+            return #TplEval.str(TplEval.text(l3) + TplEval.text(r));
+        }
+        if (op.equals("==")) {
+            return #TplEval.bool(TplEval.eq(l3, r));
+        }
+        if (op.equals("!=")) {
+            return #TplEval.bool(TplEval.eq(l3, r) == false);
+        }
+        if (op.equals("in")) {
+            return #TplEval.bool(TplEval.contains(r, l3));
+        }
+        if (op.equals("notin")) {
+            return #TplEval.bool(TplEval.contains(r, l3) == false);
+        }
+        if (op.equals("+")) {
+            if (l3 != null && l3.kind() == JsonValue.STRING) {
+                return #TplEval.str(TplEval.text(l3) + TplEval.text(r));
+            }
+            if (l3 != null && l3.kind() == JsonValue.ARRAY) {
+                JsonArray dst = heap JsonArray();
+                JsonArray la = l3.asArray();
+                int32 z = 0;
+                while (z < la.count()) {
+                    dst.add(TplEval.copy(la.get(z)));
+                    z = z + 1;
+                }
+                if (r != null && r.kind() == JsonValue.ARRAY) {
+                    JsonArray ra = r.asArray();
+                    z = 0;
+                    while (z < ra.count()) {
+                        dst.add(TplEval.copy(ra.get(z)));
+                        z = z + 1;
+                    }
+                }
+                JsonValue v = heap JsonValue();
+                v.setArray(#dst);
+                return #v;
+            }
+            return #TplEval.num(TplEval.asNum(l3) + TplEval.asNum(r));
+        }
+        if (op.equals("-")) {
+            return #TplEval.num(TplEval.asNum(l3) - TplEval.asNum(r));
+        }
+        if (op.equals("*")) {
+            return #TplEval.num(TplEval.asNum(l3) * TplEval.asNum(r));
+        }
+        if (op.equals("//") || op.equals("/")) {
+            int64 d = TplEval.asNum(r);
+            if (d == 0) {
+                throw heap LlamaException("chat template '" + this.t.name
+                    + "': division by zero at line " + this.t.line(i));
+            }
+            return #TplEval.num(TplEval.asNum(l3) / d);
+        }
+        if (op.equals("%")) {
+            int64 d2 = TplEval.asNum(r);
+            if (d2 == 0) {
+                throw heap LlamaException("chat template '" + this.t.name
+                    + "': modulo by zero at line " + this.t.line(i));
+            }
+            return #TplEval.num(TplEval.asNum(l3) % d2);
+        }
+        int64 a = TplEval.asNum(l3);
+        int64 b = TplEval.asNum(r);
+        if (op.equals("<")) {
+            return #TplEval.bool(a < b);
+        }
+        if (op.equals(">")) {
+            return #TplEval.bool(a > b);
+        }
+        if (op.equals("<=")) {
+            return #TplEval.bool(a <= b);
+        }
+        if (op.equals(">=")) {
+            return #TplEval.bool(a >= b);
+        }
+        throw heap LlamaException("chat template '" + this.t.name
+            + "': unsupported operator '" + op + "' at line "
+            + this.t.line(i));
+    }
+
+    static boolean eq(JsonValue a, JsonValue b) {
+        if (a == null || b == null) {
+            return a == null && b == null;
+        }
+        int32 ka = a.kind();
+        int32 kb = b.kind();
+        if (ka == JsonValue.STRING || kb == JsonValue.STRING) {
+            if (ka != kb) {
+                return false;
+            }
+            return a.asString().equals(b.asString());
+        }
+        if (ka == JsonValue.NULL || kb == JsonValue.NULL) {
+            return ka == kb;
+        }
+        if (ka == JsonValue.BOOLEAN || kb == JsonValue.BOOLEAN) {
+            if (ka != kb) {
+                return false;
+            }
+            return a.asBoolean() == b.asBoolean();
+        }
+        return TplEval.asNum(a) == TplEval.asNum(b);
+    }
+
+    static boolean contains(JsonValue haystack, JsonValue needle) {
+        if (haystack == null) {
+            return false;
+        }
+        if (haystack.kind() == JsonValue.ARRAY) {
+            JsonArray a = haystack.asArray();
+            int32 i = 0;
+            while (i < a.count()) {
+                if (TplEval.eq(a.get(i), needle)) {
+                    return true;
+                }
+                i = i + 1;
+            }
+            return false;
+        }
+        if (haystack.kind() == JsonValue.OBJECT) {
+            return haystack.asObject().containsKey(TplEval.text(needle));
+        }
+        if (haystack.kind() == JsonValue.STRING) {
+            return haystack.asString().contains(TplEval.text(needle));
+        }
+        return false;
+    }
+
+    #JsonValue evalTest(int32 i) {
+        String name = this.t.strOf(i);
+        JsonValue v = this.eval(this.t.a(i));
+        boolean r = false;
+        if (name.equals("defined")) {
+            r = v != null;
+        } else if (name.equals("undefined")) {
+            r = v == null;
+        } else if (name.equals("none")) {
+            r = v != null && v.kind() == JsonValue.NULL;
+        } else if (name.equals("string")) {
+            r = v != null && v.kind() == JsonValue.STRING;
+        } else if (name.equals("number")) {
+            r = v != null && v.kind() == JsonValue.NUMBER;
+        } else if (name.equals("boolean")) {
+            r = v != null && v.kind() == JsonValue.BOOLEAN;
+        } else if (name.equals("mapping")) {
+            r = v != null && v.kind() == JsonValue.OBJECT;
+        } else if (name.equals("sequence")) {
+            r = v != null && (v.kind() == JsonValue.ARRAY
+                || v.kind() == JsonValue.STRING
+                || v.kind() == JsonValue.OBJECT);
+        } else if (name.equals("iterable")) {
+            r = v != null && (v.kind() == JsonValue.ARRAY
+                || v.kind() == JsonValue.STRING
+                || v.kind() == JsonValue.OBJECT);
+        } else if (name.equals("true")) {
+            r = v != null && v.kind() == JsonValue.BOOLEAN
+                && v.asBoolean();
+        } else if (name.equals("false")) {
+            r = v != null && v.kind() == JsonValue.BOOLEAN
+                && v.asBoolean() == false;
+        } else {
+            throw heap LlamaException("chat template '" + this.t.name
+                + "': unsupported test 'is " + name + "' at line "
+                + this.t.line(i));
+        }
+        if (this.t.d(i) == 1) {
+            r = r == false;
+        }
+        return #TplEval.bool(r);
+    }
+
+    #JsonValue evalFilter(int32 i) {
+        String name = this.t.strOf(i);
+        JsonValue v = this.eval(this.t.a(i));
+        int32 args = this.t.b(i);
+        if (name.equals("safe") || name.equals("e")
+                || name.equals("escape")) {
+            return #v;                       // no autoescape in this dialect
+        }
+        if (name.equals("tojson")) {
+            boolean indent = false;
+            int32 arg = args;
+            while (arg >= 0) {
+                if (this.t.k(arg) == Tpl.E_KWARG
+                        && this.t.strOf(arg).equals("indent")) {
+                    indent = true;
+                }
+                arg = this.t.nx(arg);
+            }
+            return #TplEval.str(TplEval.jsonText(v, indent, 0));
+        }
+        if (name.equals("trim")) {
+            return #TplEval.str(TplEval.text(v).trim());
+        }
+        if (name.equals("string")) {
+            return #TplEval.str(TplEval.text(v));
+        }
+        if (name.equals("int")) {
+            return #TplEval.num(TplEval.asNum(v));
+        }
+        if (name.equals("length") || name.equals("count")) {
+            return #TplEval.num((int64) TplEval.lengthOf(v));
+        }
+        if (name.equals("lower")) {
+            return #TplEval.str(TplEval.text(v).toLowerCase());
+        }
+        if (name.equals("upper")) {
+            return #TplEval.str(TplEval.text(v).toUpperCase());
+        }
+        if (name.equals("first")) {
+            if (v != null && v.kind() == JsonValue.ARRAY
+                    && v.asArray().count() > 0) {
+                return #TplEval.copy(v.asArray().get(0));
+            }
+            return null;
+        }
+        if (name.equals("last")) {
+            if (v != null && v.kind() == JsonValue.ARRAY
+                    && v.asArray().count() > 0) {
+                return #TplEval.copy(
+                    v.asArray().get(v.asArray().count() - 1));
+            }
+            return null;
+        }
+        if (name.equals("list")) {
+            return #v;
+        }
+        if (name.equals("items")) {
+            // Jinja's `items` FILTER (2.11+), the pipe spelling of
+            // `.items()` — qwen3coder's tool template uses it.
+            return #this.callMethod(v, "items", 0 - 1, i);
+        }
+        if (name.equals("default") || name.equals("d")) {
+            boolean useDefault = v == null;
+            int32 a0 = args;
+            if (a0 >= 0 && this.t.nx(a0) >= 0) {
+                // default(value, boolean) — second arg makes it falsy-aware
+                if (TplEval.truthy(this.eval(this.t.nx(a0)))) {
+                    useDefault = TplEval.truthy(v) == false;
+                }
+            }
+            if (useDefault && a0 >= 0) {
+                return #this.eval(a0);
+            }
+            if (useDefault) {
+                return #TplEval.str("");
+            }
+            return #v;
+        }
+        if (name.equals("join")) {
+            String sep = "";
+            if (args >= 0) {
+                sep = TplEval.text(this.eval(args));
+            }
+            TplBuf b = heap TplBuf();
+            if (v != null && v.kind() == JsonValue.ARRAY) {
+                JsonArray a = v.asArray();
+                int32 z = 0;
+                while (z < a.count()) {
+                    if (z > 0) {
+                        b.addStr(sep);
+                    }
+                    b.addStr(TplEval.text(a.get(z)));
+                    z = z + 1;
+                }
+            }
+            return #TplEval.str(b.take());
+        }
+        if (name.equals("replace")) {
+            if (args < 0 || this.t.nx(args) < 0) {
+                throw heap LlamaException("chat template '" + this.t.name
+                    + "': replace expects two arguments at line "
+                    + this.t.line(i));
+            }
+            String from = TplEval.text(this.eval(args));
+            String to = TplEval.text(this.eval(this.t.nx(args)));
+            return #TplEval.str(TplEval.replaceAll(TplEval.text(v), from,
+                to));
+        }
+        throw heap LlamaException("chat template '" + this.t.name
+            + "': unsupported filter '" + name + "' at line "
+            + this.t.line(i));
+    }
+
+    static int32 lengthOf(JsonValue v) {
+        if (v == null) {
+            return 0;
+        }
+        if (v.kind() == JsonValue.ARRAY) {
+            return v.asArray().count();
+        }
+        if (v.kind() == JsonValue.OBJECT) {
+            return v.asObject().count();
+        }
+        if (v.kind() == JsonValue.STRING) {
+            return v.asString().byteLength();
+        }
+        return 0;
+    }
+
+    static #String replaceAll(String s, String from, String to) {
+        TplBuf b = heap TplBuf();
+        int32 n = s.byteLength();
+        int32 m = from.byteLength();
+        int32 i = 0;
+        while (i < n) {
+            boolean hit = false;
+            if (m > 0 && i + m <= n) {
+                hit = true;
+                int32 j = 0;
+                while (j < m) {
+                    if (s.byteAt(i + j) != from.byteAt(j)) {
+                        hit = false;
+                        j = m;
+                    } else {
+                        j = j + 1;
+                    }
+                }
+            }
+            if (hit) {
+                b.addStr(to);
+                i = i + m;
+            } else {
+                b.addByte(s.byteAt(i));
+                i = i + 1;
+            }
+        }
+        return #b.take();
+    }
+
+    #JsonValue evalCall(int32 i) {
+        int32 callee = this.t.a(i);
+        int32 args = this.t.b(i);
+        int32 ck = this.t.k(callee);
+        if (ck == Tpl.E_NAME) {
+            String fn = this.t.strOf(callee);
+            if (fn.equals("raise_exception")) {
+                String msg = "";
+                if (args >= 0) {
+                    msg = TplEval.text(this.eval(args));
+                }
+                throw heap LlamaException("chat template '" + this.t.name
+                    + "': " + msg);
+            }
+            if (fn.equals("strftime_now")) {
+                return #TplEval.str(this.nowText);
+            }
+            if (fn.equals("range")) {
+                return #this.evalRange(args);
+            }
+            int32 mac = this.macroOf(fn);
+            if (mac >= 0) {
+                return #this.callMacro(mac, args);
+            }
+            throw heap LlamaException("chat template '" + this.t.name
+                + "': unknown function '" + fn + "()' at line "
+                + this.t.line(i));
+        }
+        if (ck == Tpl.E_ATTR) {
+            JsonValue obj = this.eval(this.t.a(callee));
+            String m = this.t.strOf(callee);
+            return #this.callMethod(obj, m, args, i);
+        }
+        throw heap LlamaException("chat template '" + this.t.name
+            + "': unsupported call form at line " + this.t.line(i));
+    }
+
+    #JsonValue evalRange(int32 args) {
+        int64 start = 0;
+        int64 stop = 0;
+        int64 step = 1;
+        if (args >= 0) {
+            stop = TplEval.asNum(this.eval(args));
+            int32 a2 = this.t.nx(args);
+            if (a2 >= 0) {
+                start = stop;
+                stop = TplEval.asNum(this.eval(a2));
+                int32 a3 = this.t.nx(a2);
+                if (a3 >= 0) {
+                    step = TplEval.asNum(this.eval(a3));
+                }
+            }
+        }
+        JsonArray arr = heap JsonArray();
+        if (step == 0) {
+            step = 1;
+        }
+        int64 x = start;
+        while ((step > 0 && x < stop) || (step < 0 && x > stop)) {
+            arr.add(TplEval.num(x));
+            x = x + step;
+        }
+        JsonValue v = heap JsonValue();
+        v.setArray(#arr);
+        return #v;
+    }
+
+    #JsonValue callMethod(JsonValue obj, String m, int32 args,
+            int32 site) {
+        if (m.equals("items")) {
+            JsonArray pairsOut = heap JsonArray();
+            if (obj != null && obj.kind() == JsonValue.OBJECT) {
+                JsonObject o = obj.asObject();
+                int32 j = 0;
+                while (j < o.count()) {
+                    String key = TplEval.keyOf(o, j);
+                    JsonArray pair = heap JsonArray();
+                    pair.add(TplEval.str(key));
+                    pair.add(TplEval.copy(o.valueAt(j)));
+                    JsonValue pv = heap JsonValue();
+                    pv.setArray(#pair);
+                    pairsOut.add(#pv);
+                    j = j + 1;
+                }
+            }
+            JsonValue v = heap JsonValue();
+            v.setArray(#pairsOut);
+            return #v;
+        }
+        if (m.equals("keys") || m.equals("values")) {
+            boolean wantKeys = m.equals("keys");
+            JsonArray out2 = heap JsonArray();
+            if (obj != null && obj.kind() == JsonValue.OBJECT) {
+                JsonObject o2 = obj.asObject();
+                int32 j2 = 0;
+                while (j2 < o2.count()) {
+                    if (wantKeys) {
+                        String key2 = TplEval.keyOf(o2, j2);
+                        out2.add(TplEval.str(key2));
+                    } else {
+                        out2.add(TplEval.copy(o2.valueAt(j2)));
+                    }
+                    j2 = j2 + 1;
+                }
+            }
+            JsonValue v2 = heap JsonValue();
+            v2.setArray(#out2);
+            return #v2;
+        }
+        if (m.equals("get")) {
+            if (args < 0) {
+                return null;
+            }
+            JsonValue key3 = this.eval(args);
+            JsonValue got = TplEval.member(obj, TplEval.text(key3));
+            if (got == null && this.t.nx(args) >= 0) {
+                return #this.eval(this.t.nx(args));
+            }
+            return #got;
+        }
+        if (m.equals("strip") || m.equals("trim")) {
+            return #TplEval.str(TplEval.text(obj).trim());
+        }
+        if (m.equals("lower")) {
+            return #TplEval.str(TplEval.text(obj).toLowerCase());
+        }
+        if (m.equals("upper")) {
+            return #TplEval.str(TplEval.text(obj).toUpperCase());
+        }
+        if (m.equals("startswith")) {
+            String p = "";
+            if (args >= 0) {
+                p = TplEval.text(this.eval(args));
+            }
+            return #TplEval.bool(TplEval.text(obj).startsWith(p));
+        }
+        if (m.equals("endswith")) {
+            String q = "";
+            if (args >= 0) {
+                q = TplEval.text(this.eval(args));
+            }
+            return #TplEval.bool(TplEval.text(obj).endsWith(q));
+        }
+        if (m.equals("split")) {
+            String sep = " ";
+            if (args >= 0) {
+                sep = TplEval.text(this.eval(args));
+            }
+            JsonArray parts = heap JsonArray();
+            String s = TplEval.text(obj);
+            int32 n = s.byteLength();
+            int32 m2 = sep.byteLength();
+            int32 start = 0;
+            int32 i2 = 0;
+            while (i2 <= n - m2 && m2 > 0) {
+                boolean hit = true;
+                int32 j3 = 0;
+                while (j3 < m2) {
+                    if (s.byteAt(i2 + j3) != sep.byteAt(j3)) {
+                        hit = false;
+                        j3 = m2;
+                    } else {
+                        j3 = j3 + 1;
+                    }
+                }
+                if (hit) {
+                    parts.add(TplEval.str(s.substring(start, i2)));
+                    i2 = i2 + m2;
+                    start = i2;
+                } else {
+                    i2 = i2 + 1;
+                }
+            }
+            parts.add(TplEval.str(s.substring(start, n)));
+            JsonValue v3 = heap JsonValue();
+            v3.setArray(#parts);
+            return #v3;
+        }
+        throw heap LlamaException("chat template '" + this.t.name
+            + "': unsupported method '." + m + "()' at line "
+            + this.t.line(site));
+    }
+
+    #JsonValue callMacro(int32 mac, int32 args) {
+        int32 params = this.t.a(mac);
+        int32 mark = this.depth;
+        // Positional first, then keyword arguments by name.
+        int32 p = params;
+        int32 a = args;
+        while (p >= 0) {
+            JsonValue bound = null;
+            boolean haveArg = false;
+            if (a >= 0 && this.t.k(a) != Tpl.E_KWARG) {
+                bound = this.eval(a);
+                haveArg = true;
+                a = this.t.nx(a);
+            }
+            if (haveArg == false) {
+                int32 kw = args;
+                while (kw >= 0) {
+                    if (this.t.k(kw) == Tpl.E_KWARG
+                            && this.t.strOf(kw).equals(this.t.strOf(p))) {
+                        bound = this.eval(this.t.a(kw));
+                        haveArg = true;
+                        kw = 0 - 1;
+                    } else {
+                        kw = this.t.nx(kw);
+                    }
+                }
+            }
+            if (haveArg == false && this.t.a(p) >= 0) {
+                bound = this.eval(this.t.a(p));
+            }
+            this.push(this.t.strOf(p), #bound);
+            p = this.t.nx(p);
+        }
+        int32 outMark = this.out.n;
+        this.run(this.t.b(mac));
+        int32 produced = this.out.n;
+        int32 m = produced - outMark;
+        int8[] b = heap int8[m];
+        int32 i = 0;
+        while (i < m) {
+            b[i] = this.out.b[outMark + i];
+            i = i + 1;
+        }
+        this.out.n = outMark;                 // macro output is a VALUE
+        this.depth = mark;
+        String s = heap String(#b, m);
+        return #TplEval.str(s);
+    }
+}

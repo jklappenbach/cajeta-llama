@@ -1,0 +1,43 @@
+{
+ "frozen_time": "2026-08-14T12:00:00",
+ "cases": {
+  "llama3": {
+   "simple": "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 14 Aug 2026\n\n<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nWhat is the capital of France?<|eot_id|>",
+   "multi": "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 14 Aug 2026\n\nYou are a terse assistant.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nHello!<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\nHi.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nName two colors.<|eot_id|>",
+   "nosys": "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 14 Aug 2026\n\n<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nFirst question?<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\nFirst answer.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nSecond question?<|eot_id|>",
+   "simple_gen": "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 14 Aug 2026\n\n<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nWhat is the capital of France?<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
+   "multi_gen": "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 14 Aug 2026\n\nYou are a terse assistant.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nHello!<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\nHi.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nName two colors.<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
+   "tools": "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nEnvironment: ipython\nCutting Knowledge Date: December 2023\nToday Date: 14 Aug 2026\n\nYou may call tools.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nGiven the following functions, please respond with a JSON for a function call with its proper arguments that best answers the given prompt.\n\nRespond in the format {\"name\": function name, \"parameters\": dictionary of argument name and its value}.Do not use variables.\n\n{\n    \"type\": \"function\",\n    \"function\": {\n        \"name\": \"get_weather\",\n        \"description\": \"Get the current weather in a location.\",\n        \"parameters\": {\n            \"type\": \"object\",\n            \"properties\": {\n                \"location\": {\n                    \"type\": \"string\",\n                    \"description\": \"City name, e.g. Paris\"\n                },\n                \"unit\": {\n                    \"type\": \"string\",\n                    \"enum\": [\n                        \"celsius\",\n                        \"fahrenheit\"\n                    ]\n                }\n            },\n            \"required\": [\n                \"location\"\n            ]\n        }\n    }\n}\n\nWeather in Paris?<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+  },
+  "qwen25": {
+   "simple": "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\nWhat is the capital of France?<|im_end|>\n",
+   "multi": "<|im_start|>system\nYou are a terse assistant.<|im_end|>\n<|im_start|>user\nHello!<|im_end|>\n<|im_start|>assistant\nHi.<|im_end|>\n<|im_start|>user\nName two colors.<|im_end|>\n",
+   "nosys": "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\nFirst question?<|im_end|>\n<|im_start|>assistant\nFirst answer.<|im_end|>\n<|im_start|>user\nSecond question?<|im_end|>\n",
+   "simple_gen": "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n",
+   "multi_gen": "<|im_start|>system\nYou are a terse assistant.<|im_end|>\n<|im_start|>user\nHello!<|im_end|>\n<|im_start|>assistant\nHi.<|im_end|>\n<|im_start|>user\nName two colors.<|im_end|>\n<|im_start|>assistant\n",
+   "tools": "<|im_start|>system\nYou may call tools.\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather in a location.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"location\": {\"type\": \"string\", \"description\": \"City name, e.g. Paris\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"location\"]}}}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n"
+  },
+  "tinyllama": {
+   "simple": "<|user|>\nWhat is the capital of France?</s>\n",
+   "multi": "<|system|>\nYou are a terse assistant.</s>\n<|user|>\nHello!</s>\n<|assistant|>\nHi.</s>\n<|user|>\nName two colors.</s>\n",
+   "nosys": "<|user|>\nFirst question?</s>\n<|assistant|>\nFirst answer.</s>\n<|user|>\nSecond question?</s>\n",
+   "simple_gen": "<|user|>\nWhat is the capital of France?</s>\n<|assistant|>\n",
+   "multi_gen": "<|system|>\nYou are a terse assistant.</s>\n<|user|>\nHello!</s>\n<|assistant|>\nHi.</s>\n<|user|>\nName two colors.</s>\n<|assistant|>\n"
+  },
+  "mistral": {
+   "simple": "<s> [INST] What is the capital of France? [/INST]",
+   "multi": "<s> [INST] You are a terse assistant.\n\nHello! [/INST] Hi.</s> [INST] Name two colors. [/INST]",
+   "nosys": "<s> [INST] First question? [/INST] First answer.</s> [INST] Second question? [/INST]",
+   "simple_gen": "<s> [INST] What is the capital of France? [/INST]",
+   "multi_gen": "<s> [INST] You are a terse assistant.\n\nHello! [/INST] Hi.</s> [INST] Name two colors. [/INST]"
+  },
+  "qwen3coder": {
+   "simple": "<|im_start|>user\nWhat is the capital of France?<|im_end|>\n",
+   "multi": "<|im_start|>system\nYou are a terse assistant.<|im_end|>\n<|im_start|>user\nHello!<|im_end|>\n<|im_start|>assistant\nHi.<|im_end|>\n<|im_start|>user\nName two colors.<|im_end|>\n",
+   "nosys": "<|im_start|>user\nFirst question?<|im_end|>\n<|im_start|>assistant\nFirst answer.<|im_end|>\n<|im_start|>user\nSecond question?<|im_end|>\n",
+   "simple_gen": "<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n",
+   "multi_gen": "<|im_start|>system\nYou are a terse assistant.<|im_end|>\n<|im_start|>user\nHello!<|im_end|>\n<|im_start|>assistant\nHi.<|im_end|>\n<|im_start|>user\nName two colors.<|im_end|>\n<|im_start|>assistant\n",
+   "tools": "<|im_start|>system\nYou may call tools.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n<function>\n<name>get_weather</name>\n<description>Get the current weather in a location.</description>\n<parameters>\n<parameter>\n<name>location</name>\n<type>string</type>\n<description>City name, e.g. Paris</description>\n</parameter>\n<parameter>\n<name>unit</name>\n<type>string</type>\n<enum>[\"celsius\", \"fahrenheit\"]</enum>\n</parameter>\n<required>[\"location\"]</required>\n</parameters>\n</function>\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n"
+  }
+ }
+}

@@ -1,0 +1,354 @@
+package dev.cajeta.llama.selftest;
+
+import cajeta.codec.json.Json;
+import cajeta.codec.json.JsonObject;
+import cajeta.codec.json.JsonValue;
+import cajeta.io.file.File;
+import cajeta.lang.String;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.llama.LlamaException;
+import dev.cajeta.llama.chat.ChatTemplate;
+
+/**
+ * cajeta-llama plan Unit 13 TDD — the chat-template interpreter (spec
+ * 7.11–7.14). The gate is byte-for-byte equality with
+ * `transformers.apply_chat_template` across the four target families
+ * and a tool-call template; the rest pin dialect behaviour.
+ */
+public class ChatTest {
+
+    public ChatTest() { return; }
+
+    static final String DIR = "src/test/fixtures/tpl/";
+    static final String FIX = "src/test/fixtures/tpl/expected-prompts.json";
+    // The instant frozen when the fixtures were generated (13.1.8).
+    static final String NOW = "14 Aug 2026";
+
+    static final String SIMPLE =
+        "[{\"role\": \"user\", \"content\": \"What is the capital of France?\"}]";
+    static final String MULTI =
+        "[{\"role\": \"system\", \"content\": \"You are a terse assistant.\"},"
+        + "{\"role\": \"user\", \"content\": \"Hello!\"},"
+        + "{\"role\": \"assistant\", \"content\": \"Hi.\"},"
+        + "{\"role\": \"user\", \"content\": \"Name two colors.\"}]";
+    static final String NOSYS =
+        "[{\"role\": \"user\", \"content\": \"First question?\"},"
+        + "{\"role\": \"assistant\", \"content\": \"First answer.\"},"
+        + "{\"role\": \"user\", \"content\": \"Second question?\"}]";
+    static final String TOOLCONV =
+        "[{\"role\": \"system\", \"content\": \"You may call tools.\"},"
+        + "{\"role\": \"user\", \"content\": \"Weather in Paris?\"}]";
+    static final String TOOLS =
+        "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\","
+        + "\"description\": \"Get the current weather in a location.\","
+        + "\"parameters\": {\"type\": \"object\", \"properties\": {"
+        + "\"location\": {\"type\": \"string\", \"description\":"
+        + " \"City name, e.g. Paris\"},"
+        + "\"unit\": {\"type\": \"string\", \"enum\": [\"celsius\","
+        + " \"fahrenheit\"]}}, \"required\": [\"location\"]}}}]";
+
+    static #ChatTemplate load(String tag) {
+        int8[] raw = File.readAllBytes(ChatTest.DIR + tag + ".jinja");
+        int32 n = (int32) raw.count();
+        if (n <= 0) {
+            throw heap LlamaException("missing fixture: " + tag);
+        }
+        String text = heap String(#raw, n);
+        // The fixtures were produced with these tokens in scope.
+        String bos = "<s>";
+        String eos = "</s>";
+        if (tag.equals("llama3")) {
+            bos = "<|begin_of_text|>";
+            eos = "<|eot_id|>";
+        } else if (tag.equals("qwen25") || tag.equals("qwen3coder")) {
+            bos = "";
+            eos = "<|im_end|>";
+        }
+        ChatTemplate t = ChatTemplate.fromString(text, tag, bos, eos);
+        t.setNow(ChatTest.NOW);
+        return #t;
+    }
+
+    /** The reference rendering for (family, case), or null. */
+    static #String expected(String tag, String caseName) {
+        int8[] raw = File.readAllBytes(ChatTest.FIX);
+        JsonValue v = Json.parse(raw, (int64) raw.count());
+        JsonValue cases = v.asObject().get("cases");
+        JsonValue fam = cases.asObject().get(tag);
+        if (fam == null) {
+            return null;
+        }
+        JsonValue row = fam.asObject().get(caseName);
+        if (row == null || row.kind() != JsonValue.STRING) {
+            return null;
+        }
+        return #row.asString();
+    }
+
+    static void assertCase(String tag, String caseName, String msgs,
+            String tools, boolean addGen) {
+        String want = ChatTest.expected(tag, caseName);
+        if (want == null) {
+            return;                       // family lacks this case
+        }
+        ChatTemplate t = ChatTest.load(tag);
+        String got = t.renderJson(msgs, tools, addGen);
+        Assert.equals(want, got);
+    }
+
+    static void assertFamily(String tag) {
+        ChatTest.assertCase(tag, "simple", ChatTest.SIMPLE, null, false);
+        ChatTest.assertCase(tag, "multi", ChatTest.MULTI, null, false);
+        ChatTest.assertCase(tag, "nosys", ChatTest.NOSYS, null, false);
+        ChatTest.assertCase(tag, "simple_gen", ChatTest.SIMPLE, null, true);
+        ChatTest.assertCase(tag, "multi_gen", ChatTest.MULTI, null, true);
+    }
+
+    // ── 13.1.9 / 7.14 — byte-exact across the target families ───────────
+
+    @Test
+    public void llama3MatchesTransformers() {
+        ChatTest.assertFamily("llama3");
+    }
+
+    @Test
+    public void qwenMatchesTransformers() {
+        ChatTest.assertFamily("qwen25");
+    }
+
+    @Test
+    public void llama2FamilyMatchesTransformers() {
+        ChatTest.assertFamily("tinyllama");
+        ChatTest.assertFamily("mistral");
+    }
+
+    // ── 13.1.10 — the tool-call template (the case that retired the
+    //             hand-written table, spec 13.18) ────────────────────────
+
+    @Test
+    public void toolCallTemplateMatchesIncludingTools() {
+        ChatTest.assertCase("qwen3coder", "tools", ChatTest.TOOLCONV,
+            ChatTest.TOOLS, true);
+        ChatTest.assertCase("llama3", "tools", ChatTest.TOOLCONV,
+            ChatTest.TOOLS, true);
+        ChatTest.assertCase("qwen25", "tools", ChatTest.TOOLCONV,
+            ChatTest.TOOLS, true);
+    }
+
+    // ── 13.1.13 — multi-turn with a system message ──────────────────────
+
+    @Test
+    public void multiTurnWithSystemMatchesReference() {
+        ChatTest.assertCase("qwen25", "multi", ChatTest.MULTI, null, false);
+        ChatTest.assertCase("llama3", "multi", ChatTest.MULTI, null, false);
+        ChatTest.assertCase("qwen3coder", "multi", ChatTest.MULTI, null,
+            false);
+    }
+
+    // ── 13.1.2 — control constructs and whitespace control ──────────────
+
+    static #String render(String tpl, String msgs) {
+        ChatTemplate t = ChatTemplate.fromString(tpl, "inline", "<s>",
+            "</s>");
+        t.setNow(ChatTest.NOW);
+        return #t.renderJson(msgs, null, false);
+    }
+
+    @Test
+    public void controlConstructsRender() {
+        // for + if/elif/else + set + {{ }}
+        String tpl = "{% set greeting = 'hi' %}"
+            + "{% for m in messages %}"
+            + "{% if m.role == 'user' %}U:{{ m.content }}"
+            + "{% elif m.role == 'system' %}S:{{ m.content }}"
+            + "{% else %}A:{{ m.content }}{% endif %}|"
+            + "{% endfor %}{{ greeting }}";
+        Assert.equals("S:sys|U:one|A:two|hi",
+            ChatTest.render(tpl, "[{\"role\":\"system\",\"content\":\"sys\"},"
+                + "{\"role\":\"user\",\"content\":\"one\"},"
+                + "{\"role\":\"assistant\",\"content\":\"two\"}]"));
+        // Whitespace control: `-%}` eats following whitespace, `{%-`
+        // eats preceding; trim_blocks eats ONE newline after a tag.
+        String ws = "A\n{% if true %}\nB\n{% endif %}\nC";
+        Assert.equals("A\nB\n\nC", ChatTest.render(ws, "[]"));
+        String ws2 = "A\n{%- if true -%}\n   B\n{%- endif %}\nC";
+        Assert.equals("AB\nC", ChatTest.render(ws2, "[]"));
+        // Comments vanish.
+        Assert.equals("XY", ChatTest.render("X{# a comment #}Y", "[]"));
+    }
+
+    // ── 13.1.3 — filters ────────────────────────────────────────────────
+
+    @Test
+    public void filtersMatchJinjaSemantics() {
+        Assert.equals("hi", ChatTest.render("{{ '  hi  ' | trim }}", "[]"));
+        Assert.equals("3", ChatTest.render("{{ [1,2,3] | length }}", "[]"));
+        Assert.equals("a-b", ChatTest.render(
+            "{{ ['a','b'] | join('-') }}", "[]"));
+        Assert.equals("HI", ChatTest.render("{{ 'hi' | upper }}", "[]"));
+        Assert.equals("hi", ChatTest.render("{{ 'HI' | lower }}", "[]"));
+        Assert.equals("xoxo", ChatTest.render(
+            "{{ 'xaxa' | replace('a','o') }}", "[]"));
+        Assert.equals("fallback", ChatTest.render(
+            "{{ missing | default('fallback') }}", "[]"));
+        Assert.equals("7", ChatTest.render("{{ '7' | int }}", "[]"));
+        Assert.equals("42", ChatTest.render("{{ 42 | string }}", "[]"));
+        // tojson: compact separators, escaped control bytes.
+        Assert.equals("{\"a\": 1, \"b\": [true, null]}", ChatTest.render(
+            "{{ {'a': 1, 'b': [true, none]} | tojson }}", "[]"));
+        Assert.equals("\"x\\ny\"", ChatTest.render(
+            "{{ 'x\\ny' | tojson }}", "[]"));
+    }
+
+    // ── 13.1.4 — tests ──────────────────────────────────────────────────
+
+    @Test
+    public void testsMatchJinjaSemantics() {
+        Assert.equals("yes", ChatTest.render(
+            "{% if messages is defined %}yes{% else %}no{% endif %}", "[]"));
+        Assert.equals("no", ChatTest.render(
+            "{% if nope is defined %}yes{% else %}no{% endif %}", "[]"));
+        Assert.equals("yes", ChatTest.render(
+            "{% if nope is not defined %}yes{% else %}no{% endif %}", "[]"));
+        Assert.equals("yes", ChatTest.render(
+            "{% if none is none %}yes{% else %}no{% endif %}", "[]"));
+        Assert.equals("yes", ChatTest.render(
+            "{% if 'x' is string %}yes{% else %}no{% endif %}", "[]"));
+        Assert.equals("yes", ChatTest.render(
+            "{% if {'a':1} is mapping %}yes{% else %}no{% endif %}", "[]"));
+        Assert.equals("no", ChatTest.render(
+            "{% if 'x' is mapping %}yes{% else %}no{% endif %}", "[]"));
+        Assert.equals("yes", ChatTest.render(
+            "{% if [1] is iterable %}yes{% else %}no{% endif %}", "[]"));
+    }
+
+    // ── 13.1.5 — .items(), .get(), indexing, slicing, `~` ───────────────
+
+    @Test
+    public void accessorsAndConcatMatchJinja() {
+        Assert.equals("a=1,b=2,", ChatTest.render(
+            "{% for k, v in {'a':1,'b':2}.items() %}{{ k }}={{ v }},"
+            + "{% endfor %}", "[]"));
+        Assert.equals("1", ChatTest.render(
+            "{{ {'a':1}.get('a') }}", "[]"));
+        Assert.equals("zz", ChatTest.render(
+            "{{ {'a':1}.get('b', 'zz') }}", "[]"));
+        Assert.equals("2", ChatTest.render("{{ [1,2,3][1] }}", "[]"));
+        Assert.equals("3", ChatTest.render("{{ [1,2,3][-1] }}", "[]"));
+        Assert.equals("bc", ChatTest.render("{{ 'abcd'[1:3] }}", "[]"));
+        Assert.equals("2", ChatTest.render(
+            "{{ [1,2,3][1:] | length }}", "[]"));
+        Assert.equals("ab", ChatTest.render("{{ 'a' ~ 'b' }}", "[]"));
+        Assert.equals("x1", ChatTest.render("{{ 'x' ~ 1 }}", "[]"));
+        // loop variables, including the previtem/nextitem the real
+        // templates branch on.
+        // idx0: first, not last, nextitem 'b'  -> "0:a>b|"
+        // idx1: not first, not last, next 'c'  -> "1:b>c|"
+        // idx2: not first, last, no nextitem   -> "2:b<|"
+        Assert.equals("0:a>b|1:b>c|2:b<|", ChatTest.render(
+            "{% for x in ['a','b','c'] %}{{ loop.index0 }}:"
+            + "{% if loop.first %}a{% else %}b{% endif %}"
+            + "{% if loop.last %}<{% else %}>{% endif %}"
+            + "{% if loop.nextitem is defined %}{{ loop.nextitem }}"
+            + "{% endif %}|{% endfor %}", "[]"));
+    }
+
+    // ── 13.1.6 — macros ─────────────────────────────────────────────────
+
+    @Test
+    public void macrosRender() {
+        Assert.equals("[a][b]", ChatTest.render(
+            "{% macro wrap(x) %}[{{ x }}]{% endmacro %}"
+            + "{{ wrap('a') }}{{ wrap('b') }}", "[]"));
+        Assert.equals("[a:1]", ChatTest.render(
+            "{% macro wrap(x, y=1) %}[{{ x }}:{{ y }}]{% endmacro %}"
+            + "{{ wrap('a') }}", "[]"));
+        Assert.equals("[a:9]", ChatTest.render(
+            "{% macro wrap(x, y=1) %}[{{ x }}:{{ y }}]{% endmacro %}"
+            + "{{ wrap('a', y=9) }}", "[]"));
+    }
+
+    // ── 13.1.7 / 13.1.11 — loud failures ────────────────────────────────
+
+    @Test
+    public void raiseExceptionAndUnsupportedConstructsError() {
+        boolean threw = false;
+        try {
+            String s = ChatTest.render(
+                "{% if true %}{{ raise_exception('boom town') }}{% endif %}",
+                "[]");
+            Assert.isTrue(s.byteLength() < 0);      // unreachable
+        } catch (LlamaException ex) {
+            threw = true;
+            Assert.isTrue(ex.getMessage().contains("boom town"));
+        }
+        Assert.isTrue(threw);
+        // An unsupported construct names the construct AND the line.
+        threw = false;
+        try {
+            String s2 = ChatTest.render("line1\n{% with x = 1 %}{% endwith %}",
+                "[]");
+            Assert.isTrue(s2.byteLength() < 0);     // unreachable
+        } catch (LlamaException ex2) {
+            threw = true;
+            Assert.isTrue(ex2.getMessage().contains("with"));
+            Assert.isTrue(ex2.getMessage().contains("line 2"));
+        }
+        Assert.isTrue(threw);
+        // An unsupported filter is named too.
+        threw = false;
+        try {
+            String s3 = ChatTest.render("{{ 'x' | frobnicate }}", "[]");
+            Assert.isTrue(s3.byteLength() < 0);     // unreachable
+        } catch (LlamaException ex3) {
+            threw = true;
+            Assert.isTrue(ex3.getMessage().contains("frobnicate"));
+        }
+        Assert.isTrue(threw);
+    }
+
+    // ── 13.1.8 — the clock is injectable ────────────────────────────────
+
+    @Test
+    public void strftimeNowUsesInjectedClock() {
+        ChatTemplate t = ChatTemplate.fromString(
+            "today={{ strftime_now('%d %b %Y') }}", "clock", "", "");
+        t.setNow("03 Mar 2031");
+        Assert.equals("today=03 Mar 2031", t.renderJson("[]", null, false));
+        t.setNow("04 Apr 2032");
+        Assert.equals("today=04 Apr 2032", t.renderJson("[]", null, false));
+    }
+
+    // ── 13.1.12 / 7.13 — pre-rendered prompts bypass the template ───────
+
+    @Test
+    public void preRenderedPromptBypassesTemplate() {
+        String raw = "<|custom|>already rendered<|end|>";
+        Assert.equals(raw, ChatTemplate.renderPre(raw));
+    }
+
+    // ── 13.1.1 — the template comes from the model's own config ─────────
+
+    @Test
+    public void templateReadFromTokenizerConfigAndGgufAgree() {
+        // The SAME template reached two ways — parsed out of the model's
+        // real `tokenizer_config.json` (HF), and handed over as raw text
+        // (the GGUF `tokenizer.chat_template` shape) — must render
+        // identically and match the reference (7.11).
+        ChatTemplate fromCfg = ChatTemplate.fromTokenizerConfig(
+            ChatTest.DIR + "qwen25-tokenizer_config.json");
+        fromCfg.setNow(ChatTest.NOW);
+        Assert.equals("<|im_end|>", fromCfg.eos());
+
+        int8[] tplRaw = File.readAllBytes(ChatTest.DIR + "qwen25.jinja");
+        String tplText = heap String(#tplRaw, (int32) tplRaw.count());
+        ChatTemplate fromGguf = ChatTemplate.fromString(tplText, "gguf",
+            "", "<|im_end|>");
+        fromGguf.setNow(ChatTest.NOW);
+
+        String a = fromCfg.renderJson(ChatTest.MULTI, null, true);
+        String b = fromGguf.renderJson(ChatTest.MULTI, null, true);
+        Assert.equals(a, b);
+        Assert.equals(ChatTest.expected("qwen25", "multi_gen"), a);
+    }
+}

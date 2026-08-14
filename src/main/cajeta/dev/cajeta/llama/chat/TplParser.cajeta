@@ -1,0 +1,993 @@
+package dev.cajeta.llama.chat;
+
+import cajeta.lang.String;
+import dev.cajeta.llama.LlamaException;
+
+/**
+ * Hand-written recursive-descent parser for `grammar/ChatTemplate.g4`.
+ * (ANTLR4 has no cajeta target and there is no cajeta-side ANTLR
+ * runtime; the grammar file is the normative contract and this is its
+ * implementation. See the header of the .g4.)
+ *
+ * Whitespace is `transformers`' environment exactly — `trim_blocks` and
+ * `lstrip_blocks` both ON, plus explicit `-` controls that override
+ * them. Getting these wrong shows up as a byte diff, not a crash, so
+ * they are implemented here rather than papered over downstream.
+ */
+final class TplParser {
+
+    String src;
+    int32 len;
+    int32 pos;
+    int32 line;
+    Tpl t;
+    TplBuf text;
+    boolean stripNextWs;   // `-%}` / `-}}`: eat ALL following whitespace
+
+    // Tag terminator state, set when a block-ender is consumed.
+    String endTag;
+    int32 endExpr;
+
+    // Expression cursor.
+    int32 ep;
+    int32 eend;
+
+    TplParser(String source, String name) {
+        this.src = "" + source;
+        this.len = this.src.byteLength();
+        this.pos = 0;
+        this.line = 1;
+        this.t = heap Tpl(this.len / 8 + 32, name);
+        this.text = heap TplBuf();
+        this.stripNextWs = false;
+        this.endTag = null;
+        this.endExpr = 0 - 1;
+        this.ep = 0;
+        this.eend = 0;
+    }
+
+    static #Tpl parse(String source, String name) {
+        TplParser p = heap TplParser(source, name);
+        int32 head = p.parseBlock();
+        if (p.endTag != null) {
+            throw heap LlamaException("chat template '" + name
+                + "': unexpected {% " + p.endTag + " %} at line "
+                + p.line);
+        }
+        p.t.root = head;
+        return #p.t;
+    }
+
+    int32 at(int32 i) {
+        if (i < 0 || i >= this.len) {
+            return 0 - 1;
+        }
+        return this.src.byteAt(i);
+    }
+
+    boolean isWs(int32 c) {
+        return c == 32 || c == 9 || c == 10 || c == 13;
+    }
+
+    /**
+     * Parse statements until EOF or a block-ender (`else`, `elif`,
+     * `endif`, `endfor`, `endmacro`). Returns the chain head; the
+     * terminator name lands in `endTag`.
+     */
+    int32 parseBlock() {
+        this.endTag = null;
+        this.endExpr = 0 - 1;
+        int32 head = 0 - 1;
+        int32 tail = 0 - 1;
+        this.text.n = 0;
+        while (true) {
+            if (this.pos >= this.len) {
+                int32 tx = this.flushText();
+                if (tx >= 0) {
+                    if (tail < 0) {
+                        head = tx;
+                    } else {
+                        this.t.setNx(tail, tx);
+                    }
+                    tail = tx;
+                }
+                return head;
+            }
+            int32 c0 = this.at(this.pos);
+            int32 c1 = this.at(this.pos + 1);
+            boolean isTag = false;
+            int32 tagKind = 0;      // 1 = {{, 2 = {%, 3 = {#
+            if (c0 == 123 && c1 == 123) {
+                isTag = true;
+                tagKind = 1;
+            } else if (c0 == 123 && c1 == 37) {
+                isTag = true;
+                tagKind = 2;
+            } else if (c0 == 123 && c1 == 35) {
+                isTag = true;
+                tagKind = 3;
+            }
+            if (isTag == false) {
+                if (this.stripNextWs) {
+                    if (this.isWs(c0)) {
+                        if (c0 == 10) {
+                            this.line = this.line + 1;
+                        }
+                        this.pos = this.pos + 1;
+                        continue;
+                    }
+                    this.stripNextWs = false;
+                }
+                if (c0 == 10) {
+                    this.line = this.line + 1;
+                }
+                this.text.addByte(c0);
+                this.pos = this.pos + 1;
+                continue;
+            }
+            this.stripNextWs = false;
+            // Whitespace control BEFORE the tag.
+            boolean explicitTrim = this.at(this.pos + 2) == 45;   // '-'
+            if (explicitTrim) {
+                this.text.rstripAll();
+            } else if (tagKind != 1) {
+                this.text.lstripToLine();        // lstrip_blocks
+            }
+            int32 bodyStart = this.pos + 2;
+            if (explicitTrim) {
+                bodyStart = bodyStart + 1;
+            }
+            // Locate the closing delimiter.
+            int32 closeLen = 2;
+            int32 close = this.findClose(bodyStart, tagKind);
+            int32 bodyEnd = close;
+            boolean trimAfter = false;
+            if (close > bodyStart && this.at(close - 1) == 45) {
+                trimAfter = true;
+                bodyEnd = close - 1;
+            }
+            int32 startLine = this.line;
+            int32 k = bodyStart;
+            while (k < close) {
+                if (this.at(k) == 10) {
+                    this.line = this.line + 1;
+                }
+                k = k + 1;
+            }
+            this.pos = close + closeLen;
+            if (trimAfter) {
+                this.stripNextWs = true;
+            } else if (tagKind != 1) {
+                // trim_blocks: swallow ONE newline right after the tag.
+                if (this.at(this.pos) == 13 && this.at(this.pos + 1) == 10) {
+                    this.pos = this.pos + 2;
+                    this.line = this.line + 1;
+                } else if (this.at(this.pos) == 10) {
+                    this.pos = this.pos + 1;
+                    this.line = this.line + 1;
+                }
+            }
+            if (tagKind == 3) {
+                continue;                        // comment: nothing emitted
+            }
+            // Emit any pending text before this tag's node.
+            int32 tx2 = this.flushText();
+            if (tx2 >= 0) {
+                if (tail < 0) {
+                    head = tx2;
+                } else {
+                    this.t.setNx(tail, tx2);
+                }
+                tail = tx2;
+            }
+            if (tagKind == 1) {
+                int32 e = this.parseExprIn(bodyStart, bodyEnd);
+                int32 node = this.t.add(Tpl.N_OUT, startLine);
+                this.t.setA(node, e);
+                if (tail < 0) {
+                    head = node;
+                } else {
+                    this.t.setNx(tail, node);
+                }
+                tail = node;
+                continue;
+            }
+            // Statement tag: dispatch on the leading keyword.
+            this.ep = bodyStart;
+            this.eend = bodyEnd;
+            this.eSkipWs();
+            String kw = this.eReadName();
+            if (kw.equals("endif") || kw.equals("endfor")
+                    || kw.equals("endmacro") || kw.equals("else")) {
+                this.endTag = "" + kw;
+                return head;
+            }
+            if (kw.equals("elif")) {
+                this.endTag = "" + kw;
+                this.endExpr = this.parseExpr();
+                return head;
+            }
+            int32 stmt = 0 - 1;
+            if (kw.equals("if")) {
+                stmt = this.parseIf(startLine);
+            } else if (kw.equals("for")) {
+                stmt = this.parseFor(startLine);
+            } else if (kw.equals("set")) {
+                stmt = this.parseSet(startLine);
+            } else if (kw.equals("macro")) {
+                stmt = this.parseMacro(startLine);
+            } else {
+                throw heap LlamaException("chat template '" + this.t.name
+                    + "': unsupported construct '{% " + kw
+                    + " %}' at line " + startLine
+                    + " (supported: if/elif/else, for, set, macro)");
+            }
+            // The nested construct consumed its OWN terminator. Clearing
+            // it matters: otherwise this block returns still carrying the
+            // inner `endif`/`endfor`, and the caller reports it as a
+            // stray end tag.
+            this.endTag = null;
+            this.endExpr = 0 - 1;
+            if (tail < 0) {
+                head = stmt;
+            } else {
+                this.t.setNx(tail, stmt);
+            }
+            tail = stmt;
+        }
+    }
+
+    int32 findClose(int32 from, int32 tagKind) {
+        int32 i = from;
+        int32 want = 37;                 // '%'
+        if (tagKind == 1) {
+            want = 125;                  // '}'
+        } else if (tagKind == 3) {
+            want = 35;                   // '#'
+        }
+        boolean inStr = false;
+        int32 quote = 0;
+        while (i < this.len) {
+            int32 c = this.at(i);
+            if (inStr) {
+                if (c == 92) {
+                    i = i + 2;
+                    continue;
+                }
+                if (c == quote) {
+                    inStr = false;
+                }
+                i = i + 1;
+                continue;
+            }
+            if (tagKind != 3 && (c == 34 || c == 39)) {
+                inStr = true;
+                quote = c;
+                i = i + 1;
+                continue;
+            }
+            if (c == want && this.at(i + 1) == 125) {
+                return i;
+            }
+            i = i + 1;
+        }
+        throw heap LlamaException("chat template '" + this.t.name
+            + "': unterminated tag opened near line " + this.line);
+    }
+
+    int32 flushText() {
+        if (this.text.n == 0) {
+            return 0 - 1;
+        }
+        String s = this.text.take();
+        int32 node = this.t.add(Tpl.N_TEXT, this.line);
+        this.t.setStr(node, #s);
+        this.text.n = 0;
+        return node;
+    }
+
+    // ── statements ─────────────────────────────────────────────────────
+
+    int32 parseIf(int32 startLine) {
+        int32 cond = this.parseExpr();
+        int32 node = this.t.add(Tpl.N_IF, startLine);
+        this.t.setA(node, cond);
+        int32 then = this.parseBlock();
+        this.t.setB(node, then);
+        String term = this.endTag;
+        if (term == null) {
+            throw heap LlamaException("chat template '" + this.t.name
+                + "': {% if %} at line " + startLine + " is unterminated");
+        }
+        if (term.equals("elif")) {
+            int32 sub = this.t.add(Tpl.N_IF, this.line);
+            this.t.setA(sub, this.endExpr);
+            this.t.setC(node, sub);
+            this.finishIf(sub);
+            return node;
+        }
+        if (term.equals("else")) {
+            int32 els = this.parseBlock();
+            this.t.setC(node, els);
+            this.expectEnd("endif", startLine);
+            return node;
+        }
+        return node;              // endif
+    }
+
+    /** Continue an elif chain: `sub` already has its condition set. */
+    void finishIf(int32 sub) {
+        int32 then = this.parseBlock();
+        this.t.setB(sub, then);
+        String term = this.endTag;
+        if (term == null) {
+            throw heap LlamaException("chat template '" + this.t.name
+                + "': {% elif %} chain is unterminated");
+        }
+        if (term.equals("elif")) {
+            int32 nxt = this.t.add(Tpl.N_IF, this.line);
+            this.t.setA(nxt, this.endExpr);
+            this.t.setC(sub, nxt);
+            this.finishIf(nxt);
+            return;
+        }
+        if (term.equals("else")) {
+            int32 els = this.parseBlock();
+            this.t.setC(sub, els);
+            this.expectEnd("endif", this.line);
+        }
+    }
+
+    void expectEnd(String want, int32 startLine) {
+        if (this.endTag == null || this.endTag.equals(want) == false) {
+            throw heap LlamaException("chat template '" + this.t.name
+                + "': expected {% " + want + " %} for the block at line "
+                + startLine);
+        }
+    }
+
+    int32 parseFor(int32 startLine) {
+        // nameList 'in' expr
+        this.eSkipWs();
+        String n1 = this.eReadName();
+        String names = "" + n1;
+        int32 count = 1;
+        this.eSkipWs();
+        while (this.epAt() == 44) {          // ','
+            this.ep = this.ep + 1;
+            this.eSkipWs();
+            String n2 = this.eReadName();
+            names = names + "," + n2;
+            count = count + 1;
+            this.eSkipWs();
+        }
+        if (this.eAtWord("in") == false) {
+            throw heap LlamaException("chat template '" + this.t.name
+                + "': {% for %} at line " + startLine + " expects 'in'");
+        }
+        int32 iter = this.parseExpr();
+        int32 node = this.t.add(Tpl.N_FOR, startLine);
+        this.t.setA(node, iter);
+        this.t.setStr(node, #names);
+        this.t.setD(node, count);
+        int32 body = this.parseBlock();
+        this.t.setB(node, body);
+        if (this.endTag != null && this.endTag.equals("else")) {
+            int32 els = this.parseBlock();
+            this.t.setC(node, els);
+            this.expectEnd("endfor", startLine);
+        } else {
+            this.expectEnd("endfor", startLine);
+        }
+        return node;
+    }
+
+    int32 parseSet(int32 startLine) {
+        this.eSkipWs();
+        String name = this.eReadName();
+        this.eSkipWs();
+        if (this.epAt() != 61) {             // '='
+            throw heap LlamaException("chat template '" + this.t.name
+                + "': {% set %} at line " + startLine
+                + " expects '=' (block-set is outside the dialect)");
+        }
+        this.ep = this.ep + 1;
+        int32 e = this.parseExpr();
+        int32 node = this.t.add(Tpl.N_SET, startLine);
+        this.t.setStr(node, #name);
+        this.t.setA(node, e);
+        return node;
+    }
+
+    int32 parseMacro(int32 startLine) {
+        this.eSkipWs();
+        String name = this.eReadName();
+        this.eSkipWs();
+        int32 node = this.t.add(Tpl.N_MACRO, startLine);
+        this.t.setStr(node, #name);
+        int32 phead = 0 - 1;
+        int32 ptail = 0 - 1;
+        if (this.epAt() == 40) {             // '('
+            this.ep = this.ep + 1;
+            this.eSkipWs();
+            while (this.epAt() != 41 && this.ep < this.eend) {
+                this.eSkipWs();
+                String pn = this.eReadName();
+                int32 pnode = this.t.add(Tpl.E_KWARG, startLine);
+                this.t.setStr(pnode, #pn);
+                this.eSkipWs();
+                if (this.epAt() == 61) {
+                    this.ep = this.ep + 1;
+                    this.t.setA(pnode, this.parseExpr());
+                }
+                if (ptail < 0) {
+                    phead = pnode;
+                } else {
+                    this.t.setNx(ptail, pnode);
+                }
+                ptail = pnode;
+                this.eSkipWs();
+                if (this.epAt() == 44) {
+                    this.ep = this.ep + 1;
+                    this.eSkipWs();
+                }
+            }
+            if (this.epAt() == 41) {
+                this.ep = this.ep + 1;
+            }
+        }
+        this.t.setA(node, phead);
+        int32 body = this.parseBlock();
+        this.t.setB(node, body);
+        this.expectEnd("endmacro", startLine);
+        return node;
+    }
+
+    // ── expression tokenizer ───────────────────────────────────────────
+
+    int32 epAt() {
+        if (this.ep >= this.eend) {
+            return 0 - 1;
+        }
+        return this.src.byteAt(this.ep);
+    }
+
+    int32 epAtOff(int32 off) {
+        if (this.ep + off >= this.eend) {
+            return 0 - 1;
+        }
+        return this.src.byteAt(this.ep + off);
+    }
+
+    void eSkipWs() {
+        while (this.ep < this.eend && this.isWs(this.src.byteAt(this.ep))) {
+            this.ep = this.ep + 1;
+        }
+    }
+
+    static boolean isNameStart(int32 c) {
+        return (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c == 95;
+    }
+
+    static boolean isNameChar(int32 c) {
+        return TplParser.isNameStart(c) || (c >= 48 && c <= 57);
+    }
+
+    #String eReadName() {
+        this.eSkipWs();
+        int32 s = this.ep;
+        if (this.ep < this.eend
+                && TplParser.isNameStart(this.src.byteAt(this.ep))) {
+            this.ep = this.ep + 1;
+            while (this.ep < this.eend
+                    && TplParser.isNameChar(this.src.byteAt(this.ep))) {
+                this.ep = this.ep + 1;
+            }
+        }
+        return #this.slice(s, this.ep);
+    }
+
+    #String slice(int32 from, int32 to) {
+        int32 m = to - from;
+        if (m < 0) {
+            m = 0;
+        }
+        int8[] b = heap int8[m];
+        int32 i = 0;
+        while (i < m) {
+            b[i] = (int8) this.src.byteAt(from + i);
+            i = i + 1;
+        }
+        return heap String(#b, m);
+    }
+
+    /** Match a bare keyword with a word boundary; consumes on success. */
+    boolean eAtWord(String w) {
+        this.eSkipWs();
+        int32 m = w.byteLength();
+        if (this.ep + m > this.eend) {
+            return false;
+        }
+        int32 i = 0;
+        while (i < m) {
+            if (this.src.byteAt(this.ep + i) != w.byteAt(i)) {
+                return false;
+            }
+            i = i + 1;
+        }
+        if (this.ep + m < this.eend
+                && TplParser.isNameChar(this.src.byteAt(this.ep + m))) {
+            return false;
+        }
+        this.ep = this.ep + m;
+        return true;
+    }
+
+    /** Look ahead for a keyword WITHOUT consuming it. */
+    boolean ePeekWord(String w) {
+        int32 save = this.ep;
+        boolean got = this.eAtWord(w);
+        this.ep = save;
+        return got;
+    }
+
+    boolean eAtOp(String op) {
+        this.eSkipWs();
+        int32 m = op.byteLength();
+        if (this.ep + m > this.eend) {
+            return false;
+        }
+        int32 i = 0;
+        while (i < m) {
+            if (this.src.byteAt(this.ep + i) != op.byteAt(i)) {
+                return false;
+            }
+            i = i + 1;
+        }
+        this.ep = this.ep + m;
+        return true;
+    }
+
+    // ── expression grammar ─────────────────────────────────────────────
+
+    int32 parseExprIn(int32 from, int32 to) {
+        this.ep = from;
+        this.eend = to;
+        return this.parseExpr();
+    }
+
+    int32 parseExpr() {
+        return this.parseCond();
+    }
+
+    /** `a if cond else b` — Jinja's inline conditional. */
+    int32 parseCond() {
+        int32 v = this.parseOr();
+        this.eSkipWs();
+        if (this.ePeekWord("if")) {
+            this.eAtWord("if");
+            int32 cond = this.parseOr();
+            int32 els = 0 - 1;
+            if (this.eAtWord("else")) {
+                els = this.parseCond();
+            }
+            int32 node = this.t.add(Tpl.E_COND, this.line);
+            this.t.setA(node, cond);
+            this.t.setB(node, v);
+            this.t.setC(node, els);
+            return node;
+        }
+        return v;
+    }
+
+    int32 parseOr() {
+        int32 l = this.parseAnd();
+        while (this.eAtWord("or")) {
+            int32 r = this.parseAnd();
+            l = this.bin("or", l, r);
+        }
+        return l;
+    }
+
+    int32 parseAnd() {
+        int32 l = this.parseNot();
+        while (this.eAtWord("and")) {
+            int32 r = this.parseNot();
+            l = this.bin("and", l, r);
+        }
+        return l;
+    }
+
+    int32 parseNot() {
+        if (this.eAtWord("not")) {
+            int32 v = this.parseNot();
+            int32 node = this.t.add(Tpl.E_NOT, this.line);
+            this.t.setA(node, v);
+            return node;
+        }
+        return this.parseCmp();
+    }
+
+    int32 parseCmp() {
+        int32 l = this.parseConcat();
+        while (true) {
+            this.eSkipWs();
+            if (this.eAtOp("==")) {
+                l = this.bin("==", l, this.parseConcat());
+            } else if (this.eAtOp("!=")) {
+                l = this.bin("!=", l, this.parseConcat());
+            } else if (this.eAtOp("<=")) {
+                l = this.bin("<=", l, this.parseConcat());
+            } else if (this.eAtOp(">=")) {
+                l = this.bin(">=", l, this.parseConcat());
+            } else if (this.eAtOp("<")) {
+                l = this.bin("<", l, this.parseConcat());
+            } else if (this.eAtOp(">")) {
+                l = this.bin(">", l, this.parseConcat());
+            } else if (this.ePeekWord("is")) {
+                this.eAtWord("is");
+                boolean neg = this.eAtWord("not");
+                String tn = this.eReadName();
+                int32 node = this.t.add(Tpl.E_TEST, this.line);
+                this.t.setA(node, l);
+                this.t.setStr(node, #tn);
+                if (neg) {
+                    this.t.setD(node, 1);
+                }
+                l = node;
+            } else if (this.ePeekWord("in")) {
+                this.eAtWord("in");
+                l = this.bin("in", l, this.parseConcat());
+            } else if (this.ePeekWord("not")) {
+                int32 save = this.ep;
+                this.eAtWord("not");
+                if (this.eAtWord("in")) {
+                    l = this.bin("notin", l, this.parseConcat());
+                } else {
+                    this.ep = save;
+                    return l;
+                }
+            } else {
+                return l;
+            }
+        }
+    }
+
+    int32 parseConcat() {
+        int32 l = this.parseAdd();
+        while (true) {
+            this.eSkipWs();
+            if (this.epAt() == 126) {          // '~'
+                this.ep = this.ep + 1;
+                l = this.bin("~", l, this.parseAdd());
+            } else {
+                return l;
+            }
+        }
+    }
+
+    int32 parseAdd() {
+        int32 l = this.parseMul();
+        while (true) {
+            this.eSkipWs();
+            int32 c = this.epAt();
+            if (c == 43) {                     // '+'
+                this.ep = this.ep + 1;
+                l = this.bin("+", l, this.parseMul());
+            } else if (c == 45 && this.epAtOff(1) != 37) {   // '-' not '-%'
+                this.ep = this.ep + 1;
+                l = this.bin("-", l, this.parseMul());
+            } else {
+                return l;
+            }
+        }
+    }
+
+    int32 parseMul() {
+        int32 l = this.parseUnary();
+        while (true) {
+            this.eSkipWs();
+            int32 c = this.epAt();
+            if (c == 42) {
+                this.ep = this.ep + 1;
+                l = this.bin("*", l, this.parseUnary());
+            } else if (c == 47 && this.epAtOff(1) == 47) {
+                this.ep = this.ep + 2;
+                l = this.bin("//", l, this.parseUnary());
+            } else if (c == 47) {
+                this.ep = this.ep + 1;
+                l = this.bin("/", l, this.parseUnary());
+            } else if (c == 37 && this.epAtOff(1) != 125) {  // '%' not '%}'
+                this.ep = this.ep + 1;
+                l = this.bin("%", l, this.parseUnary());
+            } else {
+                return l;
+            }
+        }
+    }
+
+    int32 parseUnary() {
+        this.eSkipWs();
+        if (this.epAt() == 45) {
+            this.ep = this.ep + 1;
+            int32 v = this.parseUnary();
+            int32 node = this.t.add(Tpl.E_NEG, this.line);
+            this.t.setA(node, v);
+            return node;
+        }
+        return this.parsePostfix();
+    }
+
+    int32 parsePostfix() {
+        int32 v = this.parsePrimary();
+        while (true) {
+            this.eSkipWs();
+            int32 c = this.epAt();
+            if (c == 46) {                     // '.'
+                this.ep = this.ep + 1;
+                String attr = this.eReadName();
+                int32 node = this.t.add(Tpl.E_ATTR, this.line);
+                this.t.setA(node, v);
+                this.t.setStr(node, #attr);
+                v = node;
+            } else if (c == 91) {              // '['
+                this.ep = this.ep + 1;
+                v = this.parseSubscript(v);
+            } else if (c == 40) {              // '('
+                this.ep = this.ep + 1;
+                int32 args = this.parseArgs();
+                int32 node = this.t.add(Tpl.E_CALL, this.line);
+                this.t.setA(node, v);
+                this.t.setB(node, args);
+                v = node;
+            } else if (c == 124) {             // '|'
+                this.ep = this.ep + 1;
+                String fname = this.eReadName();
+                int32 node = this.t.add(Tpl.E_FILTER, this.line);
+                this.t.setA(node, v);
+                this.t.setStr(node, #fname);
+                this.eSkipWs();
+                if (this.epAt() == 40) {
+                    this.ep = this.ep + 1;
+                    this.t.setB(node, this.parseArgs());
+                }
+                v = node;
+            } else {
+                return v;
+            }
+        }
+    }
+
+    int32 parseSubscript(int32 obj) {
+        this.eSkipWs();
+        int32 start = 0 - 1;
+        if (this.epAt() != 58) {               // not ':'
+            start = this.parseExpr();
+            this.eSkipWs();
+        }
+        if (this.epAt() == 58) {               // slice
+            this.ep = this.ep + 1;
+            this.eSkipWs();
+            int32 stop = 0 - 1;
+            if (this.epAt() != 93) {
+                stop = this.parseExpr();
+                this.eSkipWs();
+            }
+            if (this.epAt() == 93) {
+                this.ep = this.ep + 1;
+            }
+            int32 node = this.t.add(Tpl.E_SLICE, this.line);
+            this.t.setA(node, obj);
+            this.t.setB(node, start);
+            this.t.setC(node, stop);
+            return node;
+        }
+        if (this.epAt() == 93) {
+            this.ep = this.ep + 1;
+        }
+        int32 idx = this.t.add(Tpl.E_INDEX, this.line);
+        this.t.setA(idx, obj);
+        this.t.setB(idx, start);
+        return idx;
+    }
+
+    int32 parseArgs() {
+        int32 head = 0 - 1;
+        int32 tail = 0 - 1;
+        this.eSkipWs();
+        while (this.epAt() != 41 && this.ep < this.eend) {
+            int32 node = 0 - 1;
+            // keyword argument?
+            int32 save = this.ep;
+            this.eSkipWs();
+            boolean kw = false;
+            if (this.ep < this.eend
+                    && TplParser.isNameStart(this.src.byteAt(this.ep))) {
+                String nm = this.eReadName();
+                this.eSkipWs();
+                if (this.epAt() == 61 && this.epAtOff(1) != 61) {
+                    this.ep = this.ep + 1;
+                    node = this.t.add(Tpl.E_KWARG, this.line);
+                    this.t.setStr(node, #nm);
+                    this.t.setA(node, this.parseExpr());
+                    kw = true;
+                }
+            }
+            if (kw == false) {
+                this.ep = save;
+                node = this.parseExpr();
+            }
+            if (tail < 0) {
+                head = node;
+            } else {
+                this.t.setNx(tail, node);
+            }
+            tail = node;
+            this.eSkipWs();
+            if (this.epAt() == 44) {
+                this.ep = this.ep + 1;
+                this.eSkipWs();
+            }
+        }
+        if (this.epAt() == 41) {
+            this.ep = this.ep + 1;
+        }
+        return head;
+    }
+
+    int32 parsePrimary() {
+        this.eSkipWs();
+        int32 c = this.epAt();
+        if (c < 0) {
+            throw heap LlamaException("chat template '" + this.t.name
+                + "': expression ended unexpectedly near line "
+                + this.line);
+        }
+        if (c == 34 || c == 39) {              // string literal
+            return this.parseString(c);
+        }
+        if (c >= 48 && c <= 57) {              // number
+            int32 s = this.ep;
+            while (this.ep < this.eend) {
+                int32 d = this.src.byteAt(this.ep);
+                if ((d >= 48 && d <= 57) || d == 46) {
+                    this.ep = this.ep + 1;
+                } else {
+                    break;
+                }
+            }
+            String num = this.slice(s, this.ep);
+            int32 node = this.t.add(Tpl.E_NUM, this.line);
+            this.t.setStr(node, #num);
+            return node;
+        }
+        if (c == 40) {                         // ( expr )
+            this.ep = this.ep + 1;
+            int32 v = this.parseExpr();
+            this.eSkipWs();
+            if (this.epAt() == 41) {
+                this.ep = this.ep + 1;
+            }
+            return v;
+        }
+        if (c == 91) {                         // list literal
+            this.ep = this.ep + 1;
+            int32 node = this.t.add(Tpl.E_LIST, this.line);
+            int32 head = 0 - 1;
+            int32 tail = 0 - 1;
+            this.eSkipWs();
+            while (this.epAt() != 93 && this.ep < this.eend) {
+                int32 item = this.parseExpr();
+                if (tail < 0) {
+                    head = item;
+                } else {
+                    this.t.setNx(tail, item);
+                }
+                tail = item;
+                this.eSkipWs();
+                if (this.epAt() == 44) {
+                    this.ep = this.ep + 1;
+                    this.eSkipWs();
+                }
+            }
+            if (this.epAt() == 93) {
+                this.ep = this.ep + 1;
+            }
+            this.t.setA(node, head);
+            return node;
+        }
+        if (c == 123) {                        // dict literal
+            this.ep = this.ep + 1;
+            int32 node = this.t.add(Tpl.E_DICT, this.line);
+            int32 head = 0 - 1;
+            int32 tail = 0 - 1;
+            this.eSkipWs();
+            while (this.epAt() != 125 && this.ep < this.eend) {
+                int32 key = this.parseExpr();
+                this.eSkipWs();
+                if (this.epAt() == 58) {
+                    this.ep = this.ep + 1;
+                }
+                int32 val = this.parseExpr();
+                int32 pair = this.t.add(Tpl.E_PAIR, this.line);
+                this.t.setA(pair, key);
+                this.t.setB(pair, val);
+                if (tail < 0) {
+                    head = pair;
+                } else {
+                    this.t.setNx(tail, pair);
+                }
+                tail = pair;
+                this.eSkipWs();
+                if (this.epAt() == 44) {
+                    this.ep = this.ep + 1;
+                    this.eSkipWs();
+                }
+            }
+            if (this.epAt() == 125) {
+                this.ep = this.ep + 1;
+            }
+            this.t.setA(node, head);
+            return node;
+        }
+        if (TplParser.isNameStart(c)) {
+            String nm = this.eReadName();
+            if (nm.equals("true") || nm.equals("True")) {
+                return this.t.add(Tpl.E_TRUE, this.line);
+            }
+            if (nm.equals("false") || nm.equals("False")) {
+                return this.t.add(Tpl.E_FALSE, this.line);
+            }
+            if (nm.equals("none") || nm.equals("None")) {
+                return this.t.add(Tpl.E_NONE, this.line);
+            }
+            int32 node = this.t.add(Tpl.E_NAME, this.line);
+            this.t.setStr(node, #nm);
+            return node;
+        }
+        throw heap LlamaException("chat template '" + this.t.name
+            + "': unexpected character '" + this.slice(this.ep, this.ep + 1)
+            + "' in an expression at line " + this.line);
+    }
+
+    int32 parseString(int32 quote) {
+        this.ep = this.ep + 1;
+        TplBuf buf = heap TplBuf();
+        while (this.ep < this.eend) {
+            int32 c = this.src.byteAt(this.ep);
+            if (c == 92 && this.ep + 1 < this.eend) {
+                int32 e = this.src.byteAt(this.ep + 1);
+                if (e == 110) {
+                    buf.addByte(10);
+                } else if (e == 116) {
+                    buf.addByte(9);
+                } else if (e == 114) {
+                    buf.addByte(13);
+                } else {
+                    buf.addByte(e);
+                }
+                this.ep = this.ep + 2;
+                continue;
+            }
+            if (c == quote) {
+                this.ep = this.ep + 1;
+                break;
+            }
+            buf.addByte(c);
+            this.ep = this.ep + 1;
+        }
+        String s = buf.take();
+        int32 node = this.t.add(Tpl.E_STR, this.line);
+        this.t.setStr(node, #s);
+        return node;
+    }
+
+    int32 bin(String op, int32 l, int32 r) {
+        int32 node = this.t.add(Tpl.E_BIN, this.line);
+        this.t.setA(node, l);
+        this.t.setB(node, r);
+        String o = "" + op;
+        this.t.setStr(node, #o);
+        return node;
+    }
+}
