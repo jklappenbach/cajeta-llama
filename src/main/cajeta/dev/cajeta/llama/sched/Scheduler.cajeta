@@ -1,9 +1,12 @@
 package dev.cajeta.llama.sched;
 
 import cajeta.collection.ArrayList;
+import cajeta.lang.String;
 import dev.cajeta.llama.LlamaException;
 import dev.cajeta.llama.model.LlamaForCausalLM;
 import dev.cajeta.llama.model.PagedKvCache;
+import dev.cajeta.llama.store.BlockKeys;
+import dev.cajeta.llama.store.BlockStore;
 
 /**
  * The continuous-batching scheduler (plan Unit 9; spec 6.19–6.25,
@@ -40,6 +43,14 @@ public final class Scheduler {
     int32 resumedN;
     int32 stamp;
     int32 steps;
+    // Optional prefix block store (Unit 11; null = disabled, 6.32).
+    BlockStore store;         // borrow; the caller keeps it alive
+    String modelId;
+    String modelDtype;
+    String modelQuant;
+    int8[] blockBuf;          // one payload scratch, allocated at attach
+    int32 adoptedBlocksN;
+    int32 prefillRowsN;       // rows actually computed (11.3.1)
 
     public Scheduler(LlamaForCausalLM model, int32 chunk) {
         this.model = model;
@@ -57,6 +68,40 @@ public final class Scheduler {
         this.resumedN = 0;
         this.stamp = 0;
         this.steps = 0;
+        this.store = null;
+        this.modelId = null;
+        this.modelDtype = null;
+        this.modelQuant = null;
+        this.blockBuf = null;
+        this.adoptedBlocksN = 0;
+        this.prefillRowsN = 0;
+    }
+
+    /**
+     * Attach the prefix block store (spec 6.16–6.18): preempted AND
+     * completed sequences write their full blocks; admission adopts the
+     * longest stored prefix before computing the rest. The identity
+     * strings fold into every key (6.27). Without a store, preemption
+     * falls back to recompute-on-resume with identical output (6.32).
+     * v1 restriction: adoption engages only when every layer is
+     * unwindowed (rings are cheap to recompute and are not stored).
+     */
+    public void attachStore(BlockStore store, String modelId, String dtype,
+            String quant) {
+        this.store = store;
+        this.modelId = "" + modelId;
+        this.modelDtype = "" + dtype;
+        this.modelQuant = "" + quant;
+        this.blockBuf = heap int8[this.model.kvCache().blockPayloadBytes()];
+    }
+
+    public int32 adoptedBlocks() {
+        return this.adoptedBlocksN;
+    }
+
+    /** Prompt/decode rows actually computed by the model (11.3.1). */
+    public int32 prefillRowsExecuted() {
+        return this.prefillRowsN;
     }
 
     /** Enqueue a request; returns its id. */
@@ -154,6 +199,7 @@ public final class Scheduler {
                 }
                 int32 ret = this.model.stepSeq(r.slot, r.all, r.cachedLen, n);
                 r.cachedLen = r.cachedLen + n;
+                this.prefillRowsN = this.prefillRowsN + n;
                 if (r.cachedLen == r.totalLen) {
                     // The newest position was consumed: `ret` is the next
                     // token (interior chunks discard it).
@@ -161,6 +207,10 @@ public final class Scheduler {
                     r.totalLen = r.totalLen + 1;
                     r.genCount = r.genCount + 1;
                     if (r.genCount >= r.maxNew) {
+                        // A completed sequence's blocks feed the prompt
+                        // cache before they free (6.16's write, and what
+                        // makes 11.3.1's repeated-prefix win real).
+                        this.saveBlocks(r);
                         cache.release(r.slot);
                         this.slotReq[r.slot] = -1;
                         r.slot = -1;
@@ -251,6 +301,113 @@ public final class Scheduler {
             } else {
                 this.admittedN = this.admittedN + 1;
             }
+            this.adoptPrefix(r);
+        }
+    }
+
+    /**
+     * Longest-prefix adoption (6.17, 6.18, 6.28): walk the request's
+     * block-aligned chain keys until the first miss on ANY layer, then
+     * import that run into the cache — the request's prefill starts at
+     * the uncached suffix. A verification failure during import rolls the
+     * sequence back to empty (corrupt bytes are never adopted, 6.31).
+     */
+    void adoptPrefix(Request r) {
+        if (this.store == null) {
+            return;
+        }
+        PagedKvCache cache = this.model.kvCache();
+        if (cache.fullLayers() != this.model.layerCount()) {
+            return;   // v1: rings are recomputed, not stored
+        }
+        int32 bt = cache.blockTokensN();
+        int32 candidates = r.totalLen / bt;
+        int32 layers = this.model.layerCount();
+        // Probe: the longest run where EVERY layer's key is present.
+        int32 run = 0;
+        boolean stop = false;
+        int32 bi = 0;
+        while (bi < candidates && stop == false) {
+            int32 l = 0;
+            while (l < layers && stop == false) {
+                if (this.store.contains(this.keyFor(r, l, bi)) == false) {
+                    stop = true;
+                }
+                l = l + 1;
+            }
+            if (stop == false) {
+                run = bi + 1;
+            }
+            bi = bi + 1;
+        }
+        // The newest position's LOGITS must be computed, not adopted:
+        // always leave at least one token for the step loop to consume.
+        while (run > 0 && run * bt >= r.totalLen) {
+            run = run - 1;
+        }
+        if (run == 0) {
+            return;
+        }
+        // Import: per block, all layers; any verified-read failure rolls
+        // the whole adoption back (6.31).
+        bi = 0;
+        while (bi < run) {
+            int32 l = 0;
+            while (l < layers) {
+                boolean ok = this.store.get(this.keyFor(r, l, bi),
+                    this.blockBuf);
+                if (ok) {
+                    ok = cache.importBlock(r.slot, l, bi, this.blockBuf);
+                }
+                if (ok == false) {
+                    cache.release(r.slot);
+                    return;
+                }
+                l = l + 1;
+            }
+            this.adoptedBlocksN = this.adoptedBlocksN + 1;
+            bi = bi + 1;
+        }
+        r.cachedLen = run * bt;
+    }
+
+    /** Chain key of block `bi` of layer `l` for request `r` (6.26). */
+    int64 keyFor(Request r, int32 l, int32 bi) {
+        int32 bt = this.model.kvCache().blockTokensN();
+        int64 key = BlockKeys.seed(this.modelId, this.modelDtype,
+            this.modelQuant, l);
+        int32 b = 0;
+        while (b <= bi) {
+            key = BlockKeys.chain(key, r.all, b * bt, bt);
+            b = b + 1;
+        }
+        return key;
+    }
+
+    /** Write `r`'s FULL cached blocks to the store (6.16). */
+    void saveBlocks(Request r) {
+        if (this.store == null) {
+            return;
+        }
+        PagedKvCache cache = this.model.kvCache();
+        if (cache.fullLayers() != this.model.layerCount()) {
+            return;
+        }
+        int32 bt = cache.blockTokensN();
+        int32 nb = r.cachedLen / bt;
+        int32 layers = this.model.layerCount();
+        int32 l = 0;
+        while (l < layers) {
+            int64 key = BlockKeys.seed(this.modelId, this.modelDtype,
+                this.modelQuant, l);
+            int32 bi = 0;
+            while (bi < nb) {
+                key = BlockKeys.chain(key, r.all, bi * bt, bt);
+                cache.exportBlock(r.slot, l, bi, this.blockBuf);
+                this.store.put(key, this.blockBuf);
+                bi = bi + 1;
+            }
+            l = l + 1;
         }
     }
 
@@ -271,6 +428,9 @@ public final class Scheduler {
 
     void preempt(int32 id) {
         Request r = this.reqs.get(id);
+        // With a store attached, eviction is a WRITE, not a discard
+        // (spec 13.16); without one, resume recomputes (6.32).
+        this.saveBlocks(r);
         this.model.kvCache().release(r.slot);
         this.slotReq[r.slot] = -1;
         r.slot = -1;

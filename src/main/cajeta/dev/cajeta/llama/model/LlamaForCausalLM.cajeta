@@ -85,6 +85,10 @@ public final class LlamaForCausalLM extends InfModule {
         return this.maxSeqsN;
     }
 
+    public int32 layerCount() {
+        return this.cfg.numLayers;
+    }
+
     /** The cache — observable occupancy for tests and the scheduler. */
     public PagedKvCache kvCache() {
         return this.cache;

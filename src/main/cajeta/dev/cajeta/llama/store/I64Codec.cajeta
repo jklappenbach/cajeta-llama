@@ -1,0 +1,29 @@
+package dev.cajeta.llama.store;
+
+import cajeta.wire.Encoder;
+
+/** Little-endian `Encoder<int64>` for the store's LTM indexes. */
+public final class I64Codec implements Encoder<int64> {
+
+    public I64Codec() { return; }
+
+    public #int8[] encode(int64 value) {
+        int8[] b = heap int8[8];
+        int32 i = 0;
+        while (i < 8) {
+            b[i] = (int8) ((value >>> (i * 8)) & 255);
+            i = i + 1;
+        }
+        return #b;
+    }
+
+    public #int64 decode(int8[] bytes) {
+        int64 r = 0;
+        int32 i = 0;
+        while (i < 8) {
+            r = r | ((((int64) bytes[i]) & 255) << (i * 8));
+            i = i + 1;
+        }
+        return #r;
+    }
+}

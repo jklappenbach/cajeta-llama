@@ -1,0 +1,280 @@
+package dev.cajeta.llama.selftest;
+
+import dev.cajeta.unit.Assert;
+import dev.cajeta.llama.io.Checkpoint;
+import dev.cajeta.llama.model.LlamaForCausalLM;
+import dev.cajeta.llama.model.ModelConfig;
+import dev.cajeta.llama.sched.Request;
+import dev.cajeta.llama.sched.Scheduler;
+import dev.cajeta.llama.store.BlockKeys;
+import dev.cajeta.llama.store.BlockStore;
+import dev.cajeta.llama.store.I64Codec;
+import cajeta.io.file.File;
+import cajeta.io.file.OpenMode;
+import cajeta.lang.String;
+import cajeta.wire.Encoder;
+
+/**
+ * cajeta-llama plan Unit 11 TDD — the prefix block store (spec
+ * 6.26–6.32, 12.12–12.14). Restart survival is exercised by close +
+ * cold reopen; torn writes by flipping bytes in the data file directly.
+ */
+public class StoreTest {
+
+    public StoreTest() { return; }
+
+    static void truncate(String path) {
+        File f = File.open(path, OpenMode.WRITE);
+        f.close();
+        return;
+    }
+
+    static void wipe(String base) {
+        StoreTest.truncate(base + ".data");
+        StoreTest.truncate(base + ".idx");
+        StoreTest.truncate(base + ".rec");
+        StoreTest.truncate(base + ".stamp");
+        return;
+    }
+
+    static #int8[] payload(int32 n, int32 seed) {
+        int8[] b = heap int8[n];
+        int32 i = 0;
+        while (i < n) {
+            b[i] = (int8) ((i * 31 + seed * 7) % 251);
+            i = i + 1;
+        }
+        return #b;
+    }
+
+    // ── 6.26 + 6.27 — chained keys carry prefix and identity ────────────
+
+    @Test
+    public void chainedKeysCarryPrefixAndIdentity() {
+        int32[] a = heap int32[8];
+        int32[] b = heap int32[8];
+        int32 i = 0;
+        while (i < 8) {
+            a[i] = i * 3 + 1;
+            b[i] = i * 3 + 1;
+            i = i + 1;
+        }
+        int64 s = BlockKeys.seed("m", "F32", "none", 0);
+        // Equal prefixes → equal keys, block by block.
+        int64 ka0 = BlockKeys.chain(s, a, 0, 4);
+        int64 kb0 = BlockKeys.chain(s, b, 0, 4);
+        Assert.isTrue(ka0 == kb0);
+        int64 ka1 = BlockKeys.chain(ka0, a, 4, 4);
+        int64 kb1 = BlockKeys.chain(kb0, b, 4, 4);
+        Assert.isTrue(ka1 == kb1);
+        // A differing token in block 0 changes BOTH keys (the chain).
+        b[2] = 999;
+        int64 kb0x = BlockKeys.chain(s, b, 0, 4);
+        Assert.isTrue(ka0 != kb0x);
+        Assert.isTrue(ka1 != BlockKeys.chain(kb0x, b, 4, 4));
+        // A differing token in block 1 changes only block 1's key.
+        b[2] = a[2];
+        b[6] = 777;
+        Assert.isTrue(ka0 == BlockKeys.chain(s, b, 0, 4));
+        Assert.isTrue(ka1 != BlockKeys.chain(ka0, b, 4, 4));
+        // Identity: model, dtype, quant and layer each change the seed
+        // (serving one model's blocks to another must be impossible).
+        Assert.isTrue(BlockKeys.seed("m2", "F32", "none", 0) != s);
+        Assert.isTrue(BlockKeys.seed("m", "F16", "none", 0) != s);
+        Assert.isTrue(BlockKeys.seed("m", "F32", "Q4_K", 0) != s);
+        Assert.isTrue(BlockKeys.seed("m", "F32", "none", 1) != s);
+    }
+
+    // ── 6.28–6.31 — store round-trip, restart, corruption, eviction ─────
+
+    @Test
+    public void storeRoundTripsSurvivesReopenAndRejectsCorruption() {
+        String base = "/tmp/cajeta_llama_store_rt";
+        StoreTest.wipe(base);
+        Encoder<int64> enc = heap I64Codec();
+        BlockStore s = heap BlockStore(base, 64, 0, enc);
+        int32 k = 0;
+        while (k < 20) {
+            int8[] p = StoreTest.payload(64, k);
+            s.put((int64) (1000 + k), p);
+            k = k + 1;
+        }
+        Assert.equals((int64) 20, s.entryCount());
+        Assert.equals((int64) 20, s.writes());
+        int8[] buf = heap int8[64];
+        Assert.isTrue(s.get(1007, buf));
+        int8[] want = StoreTest.payload(64, 7);
+        int32 i = 0;
+        while (i < 64) {
+            Assert.isTrue(buf[i] == want[i]);
+            i = i + 1;
+        }
+        Assert.isTrue(s.get(555, buf) == false);   // miss
+        Assert.isTrue(s.hits() >= 1);
+        Assert.isTrue(s.misses() >= 1);
+        s.flush();
+        s.close();
+
+        // Restart survival (6.29): cold reopen serves the same blocks.
+        Encoder<int64> enc2 = heap I64Codec();
+        BlockStore s2 = heap BlockStore(base, 64, 0, enc2);
+        Assert.equals((int64) 20, s2.entryCount());
+        Assert.isTrue(s2.get(1013, buf));
+        int8[] want13 = StoreTest.payload(64, 13);
+        i = 0;
+        while (i < 64) {
+            Assert.isTrue(buf[i] == want13[i]);
+            i = i + 1;
+        }
+
+        // Corruption (6.31): flip one payload byte of key 1013's extent
+        // directly in the data file → verified read becomes a MISS.
+        int64 hitsBefore = s2.hits();
+        s2.close();
+        File df = File.open(base + ".data", OpenMode.READ_WRITE);
+        // key 1013 was the 14th put → extent 13; header 16B + payload.
+        df.seek(13 * (16 + 64) + 16 + 5);
+        int8[] one = heap int8[1];
+        one[0] = (int8) 77;
+        df.write(one, 0, 1);
+        df.close();
+        Encoder<int64> enc3 = heap I64Codec();
+        BlockStore s3 = heap BlockStore(base, 64, 0, enc3);
+        Assert.isTrue(s3.get(1013, buf) == false);
+        // Other entries still serve.
+        Assert.isTrue(s3.get(1007, buf));
+        s3.close();
+    }
+
+    @Test
+    public void sizeBoundEvictsColdestFirst() {
+        String base = "/tmp/cajeta_llama_store_ev";
+        StoreTest.wipe(base);
+        Encoder<int64> enc = heap I64Codec();
+        // Cap at 8 extents.
+        BlockStore s = heap BlockStore(base, 32, 8, enc);
+        int32 k = 0;
+        while (k < 8) {
+            int8[] p = StoreTest.payload(32, k);
+            s.put((int64) (100 + k), p);
+            k = k + 1;
+        }
+        // Touch 100 and 101 (make them HOT).
+        int8[] buf = heap int8[32];
+        Assert.isTrue(s.get(100, buf));
+        Assert.isTrue(s.get(101, buf));
+        // Two more puts → two evictions, coldest first: 102 then 103.
+        int8[] p8 = StoreTest.payload(32, 8);
+        s.put(200, p8);
+        int8[] p9 = StoreTest.payload(32, 9);
+        s.put(201, p9);
+        Assert.equals((int64) 2, s.evictions());
+        Assert.equals((int64) 8, s.entryCount());
+        Assert.isTrue(s.contains(102) == false);
+        Assert.isTrue(s.contains(103) == false);
+        Assert.isTrue(s.contains(100));
+        Assert.isTrue(s.contains(101));
+        Assert.isTrue(s.contains(200));
+        // Bytes written per eviction are derivable (11.3.3).
+        Assert.isTrue(s.bytesWritten() == (int64) (10 * (32 + 16)));
+        s.close();
+    }
+
+    // ── 12.12 + 12.14 + 6.32 — scheduler integration ────────────────────
+
+    static #LlamaForCausalLM mk(String tag, int32 maxSeqs, int32 numBlocks) {
+        String cfgPath = "/tmp/cajeta_llama_store_" + tag + "_cfg.json";
+        String stPath = "/tmp/cajeta_llama_store_" + tag + ".safetensors";
+        ForwardTest.writeA(cfgPath, stPath, 2);
+        ModelConfig cfg = ModelConfig.parse(cfgPath);
+        cfg.blockTokens = 4;
+        LlamaForCausalLM m = heap LlamaForCausalLM(#cfg, 64, maxSeqs,
+            numBlocks);
+        Checkpoint ck = Checkpoint.open(stPath);
+        m.bind(ck, false);
+        ck.close();
+        return #m;
+    }
+
+    @Test
+    public void repeatedPrefixServesFromStoreWithMatchingLogits() {
+        String base = "/tmp/cajeta_llama_store_pfx";
+        StoreTest.wipe(base);
+        LlamaForCausalLM m = StoreTest.mk("pfx", 2, 0);
+        Encoder<int64> enc = heap I64Codec();
+        BlockStore s = heap BlockStore(base,
+            m.kvCache().blockPayloadBytes(), 0, enc);
+        Scheduler sch = heap Scheduler(m, 4);
+        sch.attachStore(s, "toyA", "F32", "none");
+        int32[] p = SchedulerTest.promptOf(16, 3);
+        int32 a = sch.submit(p, 16, 6);
+        sch.runAll(200);
+        Assert.isTrue(s.writes() > 0);
+        int32 rowsFirst = sch.prefillRowsExecuted();
+
+        // The SAME prompt again: its 4 prompt blocks adopt from the
+        // store; prefill computes only the uncached suffix (11.3.1).
+        int32 rows0 = sch.prefillRowsExecuted();
+        int32 b = sch.submit(p, 16, 6);
+        sch.runAll(200);
+        Assert.isTrue(sch.adoptedBlocks() >= 3);
+        int32 rowsSecond = sch.prefillRowsExecuted() - rows0;
+        // First run: 16 prompt rows + 6 decode rows = 22. Second: the
+        // prompt's 16 blocks... adopted; suffix + decode only.
+        Assert.isTrue(rowsSecond < 22);
+        Assert.isTrue(rowsSecond <= 6 + 4);
+        // And the output is IDENTICAL to the cold run (12.12 at f32).
+        Request ra = sch.request(a);
+        Request rb = sch.request(b);
+        int32 i = 0;
+        while (i < 6) {
+            Assert.equals((int64) ra.generatedAt(i),
+                (int64) rb.generatedAt(i));
+            i = i + 1;
+        }
+        s.close();
+    }
+
+    @Test
+    public void preemptToStoreResumeMatchesUninterrupted() {
+        String base = "/tmp/cajeta_llama_store_pre";
+        StoreTest.wipe(base);
+        LlamaForCausalLM m = StoreTest.mk("pre", 2, 20);
+        Encoder<int64> enc = heap I64Codec();
+        BlockStore s = heap BlockStore(base,
+            m.kvCache().blockPayloadBytes(), 0, enc);
+        Scheduler sch = heap Scheduler(m, 4);
+        sch.attachStore(s, "toyA", "F32", "none");
+        int32[] pa = SchedulerTest.promptOf(2, 9);
+        int32[] pb = SchedulerTest.promptOf(8, 4);
+        int32 a = sch.submit(pa, 2, 30);
+        int32 b = sch.submit(pb, 8, 24);
+        sch.runAll(600);
+        Assert.isTrue(sch.preemptedCount() >= 1);
+        Assert.isTrue(sch.resumedCount() >= 1);
+        // The preempted request ADOPTED its own stored blocks on resume.
+        Assert.isTrue(sch.adoptedBlocks() > 0);
+        Assert.isTrue(s.writes() > 0);
+        // 12.14: outputs identical to uninterrupted solo runs.
+        SchedulerTest.assertMatchesSolo(sch, a, pa, 2, 30);
+        SchedulerTest.assertMatchesSolo(sch, b, pb, 8, 24);
+        s.close();
+    }
+
+    @Test
+    public void disabledStoreFallsBackToRecomputeUnchanged() {
+        // No store attached: the Unit 9 recompute path, same output —
+        // and the baseline for 6.32 "every other behaviour unchanged".
+        LlamaForCausalLM m = StoreTest.mk("off", 2, 20);
+        Scheduler sch = heap Scheduler(m, 4);
+        int32[] pa = SchedulerTest.promptOf(2, 9);
+        int32[] pb = SchedulerTest.promptOf(8, 4);
+        int32 a = sch.submit(pa, 2, 30);
+        int32 b = sch.submit(pb, 8, 24);
+        sch.runAll(600);
+        Assert.isTrue(sch.preemptedCount() >= 1);
+        Assert.equals((int64) 0, (int64) sch.adoptedBlocks());
+        SchedulerTest.assertMatchesSolo(sch, a, pa, 2, 30);
+        SchedulerTest.assertMatchesSolo(sch, b, pb, 8, 24);
+    }
+}

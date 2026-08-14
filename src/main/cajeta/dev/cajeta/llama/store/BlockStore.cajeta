@@ -1,0 +1,283 @@
+package dev.cajeta.llama.store;
+
+import cajeta.collection.ltm.LtmBPlusTree;
+import cajeta.collection.ltm.LtmCursor;
+import cajeta.io.file.File;
+import cajeta.io.file.OpenMode;
+import cajeta.lang.Cajeta;
+import cajeta.lang.String;
+import cajeta.wire.Encoder;
+import dev.cajeta.llama.LlamaException;
+
+/**
+ * The file-backed, prefix-keyed KV block store (plan Unit 11; spec
+ * 6.26–6.32, 13.16, 13.17): evicted cache blocks are WRITTEN here rather
+ * than discarded, keyed by chained prefix hash — so the store serves any
+ * later request sharing the prefix and survives process restart (a
+ * prompt cache, not just an eviction spill).
+ *
+ * Layout: a DATA file of fixed-size extents (`[len i64][checksum i64]
+ * [payload]`, checksum = XXH3-64 over the payload, verified on every
+ * read — a torn or partial write is a MISS, never served, 6.31), and two
+ * `LtmBPlusTree` indexes opened at disk fanout: PRIMARY `key → extent`,
+ * and RECENCY `stamp → key` whose ordered scan (the Unit 10 capability)
+ * is the coldest-first eviction walk (6.30). Free extents recycle
+ * through an in-memory list rebuilt at open from index gaps... v1 keeps
+ * it simpler: extents freed by eviction are pushed to a free list that
+ * persists implicitly — an extent not referenced by the primary index is
+ * re-discovered lazily on demand (see {@link #open}).
+ *
+ * The OS page cache is the RAM tier (13.16): reads and writes go
+ * straight through `File`, no user-space block cache.
+ */
+public final class BlockStore {
+    File data;
+    LtmBPlusTree<int64, int64> index;    // chain key → extent id
+    LtmBPlusTree<int64, int64> recency;  // access stamp → chain key
+    LtmBPlusTree<int64, int64> stampOf;  // chain key → its current stamp
+    int32 payloadBytes;                  // fixed block payload size
+    int64 extentBytes;                   // 16 + payload
+    int64 nextExtent;
+    int64[] freeList;
+    int32 freeCount;
+    int64 maxExtents;                    // size bound (6.30); 0 = unbounded
+    int64 stampClock;
+    // Counters (6.25 / 12.16 / 11.3.3).
+    int64 readsN;
+    int64 writesN;
+    int64 hitsN;
+    int64 missesN;
+    int64 evictionsN;
+    int64 bytesWrittenN;
+
+    /**
+     * Open (or create) the store: `base` names the file family
+     * (`base.data`, `base.idx`, `base.rec`, `base.stamp`). `payloadBytes`
+     * is the fixed block payload size — one cache block's bytes;
+     * `maxExtents` bounds the data file (0 = unbounded); `enc` encodes
+     * int64 for the indexes.
+     */
+    public BlockStore(String base, int32 payloadBytes, int64 maxExtents,
+            Encoder<int64> enc) {
+        this.data = File.open(base + ".data", OpenMode.READ_WRITE);
+        this.index = heap LtmBPlusTree<int64, int64>(base + ".idx",
+            enc, enc, 64, 32);
+        this.recency = heap LtmBPlusTree<int64, int64>(base + ".rec",
+            enc, enc, 64, 32);
+        this.stampOf = heap LtmBPlusTree<int64, int64>(base + ".stamp",
+            enc, enc, 64, 32);
+        this.payloadBytes = payloadBytes;
+        this.extentBytes = 16 + (int64) payloadBytes;
+        this.nextExtent = this.data.size() / this.extentBytes;
+        this.freeList = heap int64[4096];
+        this.freeCount = 0;
+        this.maxExtents = maxExtents;
+        // The stamp clock resumes past every persisted stamp.
+        this.stampClock = 0;
+        LtmCursor<int64, int64> c = this.recency.scan();
+        while (c.valid()) {
+            if (c.key() > this.stampClock) {
+                this.stampClock = c.key();
+            }
+            c.next();
+        }
+        this.readsN = 0;
+        this.writesN = 0;
+        this.hitsN = 0;
+        this.missesN = 0;
+        this.evictionsN = 0;
+        this.bytesWrittenN = 0;
+    }
+
+    public void close() {
+        this.index.close();
+        this.recency.close();
+        this.stampOf.close();
+        this.data.close();
+    }
+
+    // ── counters (11.1.10, 11.3.3) ──────────────────────────────────────
+
+    public int64 reads() {
+        return this.readsN;
+    }
+
+    public int64 writes() {
+        return this.writesN;
+    }
+
+    public int64 hits() {
+        return this.hitsN;
+    }
+
+    public int64 misses() {
+        return this.missesN;
+    }
+
+    public int64 evictions() {
+        return this.evictionsN;
+    }
+
+    public int64 bytesWritten() {
+        return this.bytesWrittenN;
+    }
+
+    public int64 entryCount() {
+        return this.index.count();
+    }
+
+    // ── write path (6.16) ───────────────────────────────────────────────
+
+    static int64 checksum(int8[] b, int32 n) {
+        // XXH3-64 via the hashBytes intrinsic — in-language multiplicative
+        // hashing traps on int64 overflow (see BlockKeys).
+        return Cajeta.hashBytes(b, (int64) n);
+    }
+
+    /**
+     * Store `payload` under `key`. Overwrites an existing entry for the
+     * key (same prefix → same bytes, so this is idempotent in practice);
+     * evicts coldest-first when the size bound is hit (6.30).
+     */
+    public void put(int64 key, int8[] payload) {
+        if ((int32) payload.count() < this.payloadBytes) {
+            throw heap LlamaException("block store: payload is "
+                + (int32) payload.count() + " bytes; expected "
+                + this.payloadBytes);
+        }
+        if (this.index.containsKey(key)) {
+            this.touch(key);
+            return;
+        }
+        while (this.maxExtents > 0
+                && this.index.count() >= this.maxExtents) {
+            this.evictColdest();
+        }
+        int64 ext = 0;
+        if (this.freeCount > 0) {
+            this.freeCount = this.freeCount - 1;
+            ext = this.freeList[this.freeCount];
+        } else {
+            ext = this.nextExtent;
+            this.nextExtent = this.nextExtent + 1;
+        }
+        int8[] head = heap int8[16];
+        BlockStore.putI64(head, 0, (int64) this.payloadBytes);
+        BlockStore.putI64(head, 8,
+            BlockStore.checksum(payload, this.payloadBytes));
+        this.data.seek(ext * this.extentBytes);
+        this.data.write(head, 0, 16);
+        this.data.write(payload, 0, (int64) this.payloadBytes);
+        this.index.put(key, ext);
+        this.touch(key);
+        this.writesN = this.writesN + 1;
+        this.bytesWrittenN = this.bytesWrittenN + 16
+            + (int64) this.payloadBytes;
+    }
+
+    // ── read path (6.28, 6.31) ──────────────────────────────────────────
+
+    /**
+     * Read the block for `key` into `dst` (≥ payloadBytes). Returns true
+     * on a VERIFIED hit; a missing key, short extent, or checksum
+     * mismatch is a miss — corrupt bytes are never served (6.31).
+     */
+    public boolean get(int64 key, int8[] dst) {
+        this.readsN = this.readsN + 1;
+        if (this.index.containsKey(key) == false) {
+            this.missesN = this.missesN + 1;
+            return false;
+        }
+        int64 ext = this.index.get(key);
+        int8[] head = heap int8[16];
+        this.data.seek(ext * this.extentBytes);
+        int64 hn = this.data.read(head, 0, 16);
+        if (hn != 16) {
+            this.missesN = this.missesN + 1;
+            return false;
+        }
+        int64 len = BlockStore.getI64(head, 0);
+        int64 want = BlockStore.getI64(head, 8);
+        if (len != (int64) this.payloadBytes) {
+            this.missesN = this.missesN + 1;
+            return false;
+        }
+        int64 n = this.data.read(dst, 0, (int64) this.payloadBytes);
+        if (n != (int64) this.payloadBytes) {
+            this.missesN = this.missesN + 1;
+            return false;
+        }
+        if (BlockStore.checksum(dst, this.payloadBytes) != want) {
+            this.missesN = this.missesN + 1;
+            return false;
+        }
+        this.touch(key);
+        this.hitsN = this.hitsN + 1;
+        return true;
+    }
+
+    /** Presence without payload IO (longest-prefix probing, 6.28). */
+    public boolean contains(int64 key) {
+        return this.index.containsKey(key);
+    }
+
+    // ── recency + eviction (6.30) ───────────────────────────────────────
+
+    void touch(int64 key) {
+        if (this.stampOf.containsKey(key)) {
+            this.recency.remove(this.stampOf.get(key));
+        }
+        this.stampClock = this.stampClock + 1;
+        this.recency.put(this.stampClock, key);
+        this.stampOf.put(key, this.stampClock);
+    }
+
+    void evictColdest() {
+        // The ordered scan over the recency index IS the coldness walk.
+        LtmCursor<int64, int64> c = this.recency.scan();
+        if (c.valid() == false) {
+            throw heap LlamaException("block store: size bound with an "
+                + "empty recency index");
+        }
+        int64 stamp = c.key();
+        int64 key = c.value();
+        int64 ext = this.index.get(key);
+        this.recency.remove(stamp);
+        this.stampOf.remove(key);
+        this.index.remove(key);
+        if (this.freeCount < 4096) {
+            this.freeList[this.freeCount] = ext;
+            this.freeCount = this.freeCount + 1;
+        }
+        this.evictionsN = this.evictionsN + 1;
+    }
+
+    /** Flush indexes and data durably (restart survival, 6.29). */
+    public void flush() {
+        this.index.flush();
+        this.recency.flush();
+        this.stampOf.flush();
+        this.data.sync();
+    }
+
+    // ── little-endian helpers ───────────────────────────────────────────
+
+    static void putI64(int8[] b, int32 off, int64 v) {
+        int32 i = 0;
+        while (i < 8) {
+            b[off + i] = (int8) ((v >>> (i * 8)) & 255);
+            i = i + 1;
+        }
+        return;
+    }
+
+    static int64 getI64(int8[] b, int32 off) {
+        int64 r = 0;
+        int32 i = 0;
+        while (i < 8) {
+            r = r | ((((int64) b[off + i]) & 255) << (i * 8));
+            i = i + 1;
+        }
+        return r;
+    }
+}

@@ -1,0 +1,95 @@
+package dev.cajeta.llama.store;
+
+import cajeta.lang.Cajeta;
+import cajeta.lang.String;
+
+/**
+ * Chained prefix keys for stored KV blocks (spec 6.26, 6.27).
+ *
+ * A block's key is a 64-bit hash chained from the PREVIOUS block's key,
+ * folding in the block's tokens, the layer, and the model identity
+ * (name, dtype, quantization). Chaining means a key identifies the whole
+ * prefix ending at that block, so equal prefixes collide exactly and a
+ * lookup walks block-aligned keys until the first miss (6.28). The
+ * identity fold makes one model's blocks invisible to another — serving
+ * them across models would be silent and catastrophic (6.27).
+ *
+ * Hashing is XXH3-64 via `Cajeta.hashBytes` (the primitive behind
+ * `String.hash()`): the key material is serialized into a scratch buffer
+ * and hashed natively. In-language multiplicative hashing (FNV et al.)
+ * is not an option — int64 `*` compiles with a signed-overflow trap, and
+ * multiplicative hashes overflow by design.
+ */
+public final class BlockKeys {
+
+    static void putI64(int8[] b, int32 off, int64 v) {
+        int32 i = 0;
+        while (i < 8) {
+            b[off + i] = (int8) ((v >>> (i * 8)) & 255);
+            i = i + 1;
+        }
+        return;
+    }
+
+    static void putI32(int8[] b, int32 off, int32 v) {
+        int32 i = 0;
+        while (i < 4) {
+            b[off + i] = (int8) ((v >>> (i * 8)) & 255);
+            i = i + 1;
+        }
+        return;
+    }
+
+    /** The chain seed for a (model, dtype, quant, layer) stream. */
+    public static int64 seed(String modelId, String dtype, String quant,
+            int32 layer) {
+        int32 nm = modelId.byteLength();
+        int32 nd = dtype.byteLength();
+        int32 nq = quant.byteLength();
+        // NUL separators keep ("ab","c") distinct from ("a","bc").
+        int32 total = nm + 1 + nd + 1 + nq + 1 + 4;
+        int8[] buf = heap int8[total];
+        int32 p = 0;
+        int32 i = 0;
+        while (i < nm) {
+            buf[p] = (int8) modelId.byteAt(i);
+            p = p + 1;
+            i = i + 1;
+        }
+        p = p + 1;
+        i = 0;
+        while (i < nd) {
+            buf[p] = (int8) dtype.byteAt(i);
+            p = p + 1;
+            i = i + 1;
+        }
+        p = p + 1;
+        i = 0;
+        while (i < nq) {
+            buf[p] = (int8) quant.byteAt(i);
+            p = p + 1;
+            i = i + 1;
+        }
+        p = p + 1;
+        BlockKeys.putI32(buf, p, layer);
+        return Cajeta.hashBytes(buf, (int64) total);
+    }
+
+    /**
+     * The key of the block holding `tokens[off, off+n)`, chained from
+     * `prevKey` (the previous block's key, or the {@link #seed} for the
+     * first block).
+     */
+    public static int64 chain(int64 prevKey, int32[] tokens, int32 off,
+            int32 n) {
+        int32 total = 8 + n * 4;
+        int8[] buf = heap int8[total];
+        BlockKeys.putI64(buf, 0, prevKey);
+        int32 i = 0;
+        while (i < n) {
+            BlockKeys.putI32(buf, 8 + i * 4, tokens[off + i]);
+            i = i + 1;
+        }
+        return Cajeta.hashBytes(buf, (int64) total);
+    }
+}
