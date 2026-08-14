@@ -1,0 +1,24 @@
+package dev.cajeta.llama.model;
+
+import cajeta.collection.ArrayList;
+
+/**
+ * The decoder layers as an index-named container: assigned to a field
+ * named `layers`, the reflective walk yields `…layers.0.…`, torch's
+ * `ModuleList` convention (plan 6.2.2).
+ */
+public final class LayerList extends InfModule {
+    ArrayList<InfModule> items;
+
+    LayerList() {
+        this.items = heap ArrayList<InfModule>();
+    }
+
+    public ArrayList<InfModule> children() {
+        return this.items;
+    }
+
+    void add(#InfModule m) {
+        this.items.add(#m);
+    }
+}

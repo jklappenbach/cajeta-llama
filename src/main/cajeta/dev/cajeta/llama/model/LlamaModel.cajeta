@@ -1,0 +1,50 @@
+package dev.cajeta.llama.model;
+
+import cajeta.lang.String;
+import dev.cajeta.llama.io.Checkpoint;
+
+/**
+ * The decoder trunk: embedding, the layer stack, the final norm. Field
+ * names are the torch key segments; assigned to a field named `model` in
+ * {@link LlamaForCausalLM}, the walk yields `model.embed_tokens.weight`,
+ * `model.layers.N.…`, `model.norm.weight` — HF keys verbatim.
+ *
+ * `layerArr` is a typed BORROW array over the owned `layers` container —
+ * the forward path indexes layers without downcasting per step. Borrow
+ * element stores leave the slot bits clear, so dropping this array frees
+ * nothing (the Unit 3 slice discipline).
+ */
+public final class LlamaModel extends InfModule {
+    Embedding embed_tokens;
+    LayerList layers;
+    RMSNorm norm;
+    DecoderLayer[] layerArr;
+    int32 numLayers;
+
+    LlamaModel(ModelConfig cfg) {
+        this.embed_tokens = heap Embedding(cfg.vocabSize, cfg.hiddenSize);
+        this.layers = heap LayerList();
+        this.layerArr = heap DecoderLayer[cfg.numLayers];
+        this.numLayers = cfg.numLayers;
+        int32 l = 0;
+        while (l < cfg.numLayers) {
+            DecoderLayer d = heap DecoderLayer(cfg.hiddenSize,
+                cfg.intermediateSize, cfg.numHeads, cfg.numKvHeads,
+                cfg.headDim, cfg.rmsNormEps);
+            this.layerArr[l] = d;
+            this.layers.add(#d);
+            l = l + 1;
+        }
+        this.norm = heap RMSNorm(cfg.hiddenSize, cfg.rmsNormEps);
+    }
+
+    void bind(Checkpoint ckpt, boolean toDevice) {
+        this.embed_tokens.bind(ckpt, "model.embed_tokens.weight", toDevice);
+        int32 l = 0;
+        while (l < this.numLayers) {
+            this.layerArr[l].bind(ckpt, "model.layers." + l + ".", toDevice);
+            l = l + 1;
+        }
+        this.norm.bind(ckpt, "model.norm.weight", toDevice);
+    }
+}

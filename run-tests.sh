@@ -78,3 +78,15 @@ echo ">> building + running the test binary"
     dev.cajeta.llama.selftest.TestMain.run "$here/src/test/cajeta" "$out" >/dev/null
 
 "$out/llamatests"
+
+echo ">> building + running the test binary under --release --live-set=bounded"
+# Second pass, plan 6.1.7: the zero-allocation decode invariant (and the
+# rest of the suite) must hold under the SHIPPING configuration — release
+# codegen with the bounded live-set discipline — not only the test profile.
+"$CAJETA" --emit=exe --profile=test --release --live-set=bounded \
+    --xpu-backend=cpu \
+    --classpath="$out/llama.cja,$unit_cja" \
+    -o "$out/llamatests-release" \
+    dev.cajeta.llama.selftest.TestMain.run "$here/src/test/cajeta" "$out" >/dev/null
+
+"$out/llamatests-release"

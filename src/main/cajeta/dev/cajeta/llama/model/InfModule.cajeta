@@ -1,0 +1,126 @@
+package dev.cajeta.llama.model;
+
+import cajeta.collection.ArrayList;
+import cajeta.lang.String;
+import cajeta.math.Tensor;
+
+/**
+ * Minimal reflective module base for INFERENCE (plan 6.2.1/6.2.2): the
+ * dotted `state_dict` naming contract of `dev.cajeta.ml`'s `nn.Module` —
+ * the same field-walk natives, depth-first in declared order, and the
+ * same index-named-children hook — with none of the tape machinery.
+ *
+ * `dev.cajeta.llama` deliberately does not depend on cajeta-ml: spec 4.2
+ * requires that no forward pass allocate an autograd tape, and the
+ * cheapest guarantee is for the tape type not to exist in the dependency
+ * graph at all (acceptance 6.3.1). Only the naming CONVENTION is reused,
+ * so a torch `state_dict()` key list transfers unchanged: parameter
+ * fields yield `prefix.field`, children in a container yield
+ * `prefix.N.field` (torch `ModuleList`).
+ */
+public class InfModule {
+
+    // The self-walk natives: THIS module's field count / reference-kind
+    // test / name / borrow-read, rtti derived from the receiver.
+    @Native("__cajeta_object_field_count")
+    int32 fieldCount();
+    @Native("__cajeta_object_field_is_ref")
+    int32 fieldIsRef(int32 index);
+    @Native("__cajeta_object_field_name_len")
+    int32 fieldNameLen(int32 index);
+    @Native("__cajeta_object_field_name_into")
+    void fieldNameInto(int32 index, int8[] out);
+    @Native("__cajeta_object_field_ref")
+    Object fieldRef(int32 index);
+
+    public InfModule() {
+        return;
+    }
+
+    #String fieldName(int32 index) {
+        int32 len = this.fieldNameLen(index);
+        int8[] out = heap int8[len];
+        this.fieldNameInto(index, out);
+        return heap String(#out, len);
+    }
+
+    /**
+     * Child modules held in a CONTAINER rather than named fields — named
+     * by index (`layers.0.…`), matching torch's `ModuleList`. Overridden
+     * by `LayerList`; every other module returns null.
+     */
+    public ArrayList<InfModule> children() {
+        return null;
+    }
+
+    /**
+     * The stable dotted path of every parameter tensor in the tree, in
+     * declared order, parent-first — torch's `state_dict()` key list.
+     * Owning list of owned strings.
+     */
+    public #ArrayList<String> parameterNames() {
+        ArrayList<String> acc #= heap ArrayList<String>();
+        this.collectNames("", acc);
+        return acc;
+    }
+
+    /**
+     * Every parameter tensor in the tree, SAME order as
+     * {@link #parameterNames}. Elements are borrows — the modules keep
+     * ownership.
+     */
+    public #ArrayList<Tensor<float32>> parameterTensors() {
+        ArrayList<Tensor<float32>> acc #= heap ArrayList<Tensor<float32>>();
+        this.collectTensors(acc);
+        return acc;
+    }
+
+    void collectNames(String prefix, ArrayList<String> acc) {
+        int32 n = this.fieldCount();
+        int32 i = 0;
+        while (i < n) {
+            if (this.fieldIsRef(i) != 0) {
+                Object o = this.fieldRef(i);
+                if (o instanceof Tensor<float32> t) {
+                    String path #= prefix + this.fieldName(i);
+                    acc.add(#path);
+                } else if (o instanceof InfModule m) {
+                    m.collectNames(prefix + this.fieldName(i) + ".", acc);
+                }
+            }
+            i = i + 1;
+        }
+        ArrayList<InfModule> kids = this.children();
+        if (kids != null) {
+            int32 k = 0;
+            while (k < kids.count()) {
+                kids.get(k).collectNames(prefix + k + ".", acc);
+                k = k + 1;
+            }
+        }
+    }
+
+    void collectTensors(ArrayList<Tensor<float32>> acc) {
+        int32 n = this.fieldCount();
+        int32 i = 0;
+        while (i < n) {
+            if (this.fieldIsRef(i) != 0) {
+                Object o = this.fieldRef(i);
+                if (o instanceof Tensor<float32> t) {
+                    acc.add(t);
+                } else if (o instanceof InfModule m) {
+                    m.collectTensors(acc);
+                }
+            }
+            i = i + 1;
+        }
+        ArrayList<InfModule> kids = this.children();
+        if (kids != null) {
+            int32 k = 0;
+            while (k < kids.count()) {
+                kids.get(k).collectTensors(acc);
+                k = k + 1;
+            }
+        }
+    }
+}

@@ -1,0 +1,31 @@
+package dev.cajeta.llama.model;
+
+import cajeta.math.Tensor;
+
+/**
+ * v1 KV cache: per layer, one contiguous `[maxSeq, kvDim]` K and V pair,
+ * preallocated at load and appended in place — no per-step allocation
+ * and no per-step copy. Unit 8 replaces this with the paged block pool;
+ * the append/read seams (`HostOps.appendKvRow`, `HostOps.attendRow`) are
+ * the surfaces it swaps behind.
+ */
+public final class KvCache {
+    Tensor<float32>[] kL;
+    Tensor<float32>[] vL;
+    int32 layers;
+
+    KvCache(ModelConfig cfg, int32 maxSeq) {
+        this.layers = cfg.numLayers;
+        this.kL = heap Tensor<float32>[cfg.numLayers];
+        this.vL = heap Tensor<float32>[cfg.numLayers];
+        int64[] s = heap int64[2];
+        s[0] = (int64) maxSeq;
+        s[1] = (int64) cfg.kvDim();
+        int32 l = 0;
+        while (l < cfg.numLayers) {
+            this.kL[l] #= Tensor.zeros<float32>(s);
+            this.vL[l] #= Tensor.zeros<float32>(s);
+            l = l + 1;
+        }
+    }
+}

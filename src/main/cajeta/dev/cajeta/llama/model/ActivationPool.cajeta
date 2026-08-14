@@ -1,0 +1,50 @@
+package dev.cajeta.llama.model;
+
+import cajeta.math.Tensor;
+
+/**
+ * The decode-step activation pool (plan 6.2.4; spec 4.3): every buffer a
+ * single-token step needs, at fixed shape, allocated ONCE at load. The
+ * decode path writes into these and only these — that is what makes
+ * 6.1.6's zero-allocation invariant hold, and with it keeps the global
+ * live-set mutex (spec §1.4) off the hot path.
+ *
+ * Deliberately NOT an InfModule: the reflective parameter walk must not
+ * see scratch as parameters.
+ */
+public final class ActivationPool {
+    Tensor<float32> x;        // residual stream, [hidden]
+    Tensor<float32> xn;       // normed input, [hidden]
+    Tensor<float32> q;        // [heads·head_dim]
+    Tensor<float32> k;        // [kv_heads·head_dim]
+    Tensor<float32> v;        // [kv_heads·head_dim]
+    Tensor<float32> attnOut;  // [heads·head_dim]
+    Tensor<float32> attnProj; // [hidden]
+    Tensor<float32> gate;     // [intermediate]
+    Tensor<float32> up;       // [intermediate]
+    Tensor<float32> mlpOut;   // [hidden]
+    Tensor<float32> scores;   // [maxSeq] attention scratch, shared with prefill
+    Tensor<float32> logits;   // [vocab]
+
+    ActivationPool(ModelConfig cfg, int32 maxSeq) {
+        int64[] s = heap int64[1];
+        s[0] = (int64) cfg.hiddenSize;
+        this.x = Tensor.zeros<float32>(s);
+        this.xn = Tensor.zeros<float32>(s);
+        this.attnProj = Tensor.zeros<float32>(s);
+        this.mlpOut = Tensor.zeros<float32>(s);
+        s[0] = (int64) cfg.qDim();
+        this.q = Tensor.zeros<float32>(s);
+        this.attnOut = Tensor.zeros<float32>(s);
+        s[0] = (int64) cfg.kvDim();
+        this.k = Tensor.zeros<float32>(s);
+        this.v = Tensor.zeros<float32>(s);
+        s[0] = (int64) cfg.intermediateSize;
+        this.gate = Tensor.zeros<float32>(s);
+        this.up = Tensor.zeros<float32>(s);
+        s[0] = (int64) maxSeq;
+        this.scores = Tensor.zeros<float32>(s);
+        s[0] = (int64) cfg.vocabSize;
+        this.logits = Tensor.zeros<float32>(s);
+    }
+}

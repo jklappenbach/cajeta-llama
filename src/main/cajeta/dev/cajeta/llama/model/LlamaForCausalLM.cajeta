@@ -1,0 +1,239 @@
+package dev.cajeta.llama.model;
+
+import cajeta.collection.ArrayList;
+import cajeta.lang.String;
+import cajeta.math.Tensor;
+import dev.cajeta.llama.LlamaException;
+import dev.cajeta.llama.io.Checkpoint;
+
+/**
+ * The tape-free inference model (plan Unit 6; spec §4). Construction
+ * builds the decoder stack from a HF `config.json`; binding loads HF
+ * safetensors by torch `state_dict` name with no rename table; the
+ * forward path is decode-first:
+ *
+ * - {@link #decodeStep} runs one token through pooled activations and
+ *   the in-place KV cache — ZERO heap allocations per step (6.1.6), so
+ *   the global live-set mutex never enters the hot path.
+ * - {@link #prefill} runs the prompt through ONE arena block sized to the
+ *   actual sequence length, carved into borrowed slices (spec 4.9/4.10);
+ *   nothing survives the call, so peak activation memory is O(one layer)
+ *   regardless of depth (6.1.1).
+ *
+ * Under `tie_word_embeddings` the `lm_head` field stays null and logits
+ * are produced against the embedding matrix (spec 4.7).
+ *
+ * v1 computes on the HOST at f32; a model loaded `toDevice` is fully
+ * device-resident after binding (6.1.4), and Unit 7's kernels take the
+ * forward path to the device behind the same HostOps seams.
+ */
+public final class LlamaForCausalLM extends InfModule {
+    // Walked fields first: these two produce the state_dict key space.
+    LlamaModel model;
+    Linear lm_head;          // null when tie_word_embeddings (spec 4.7)
+
+    // Non-parameter state (skipped by the reflective walk).
+    ModelConfig cfg;
+    ActivationPool pool;
+    KvCache cache;
+    int32 maxSeq;
+    int32 pos;
+
+    public LlamaForCausalLM(#ModelConfig cfg, int32 maxSeq) {
+        this.cfg #= cfg;
+        this.model = heap LlamaModel(this.cfg);
+        if (this.cfg.tieWordEmbeddings) {
+            this.lm_head = null;
+        } else {
+            this.lm_head = heap Linear(this.cfg.hiddenSize,
+                this.cfg.vocabSize);
+        }
+        this.pool = heap ActivationPool(this.cfg, maxSeq);
+        this.cache = heap KvCache(this.cfg, maxSeq);
+        this.maxSeq = maxSeq;
+        this.pos = 0;
+    }
+
+    /** Parse config, build the stack, bind the checkpoint. */
+    public static #LlamaForCausalLM load(String configPath, String ckptPath,
+            int32 maxSeq, boolean toDevice) {
+        LlamaForCausalLM m = heap LlamaForCausalLM(
+            ModelConfig.parse(configPath), maxSeq);
+        Checkpoint ckpt = Checkpoint.open(ckptPath);
+        m.bind(ckpt, toDevice);
+        ckpt.close();
+        return #m;
+    }
+
+    /** Bind every parameter from `ckpt` by its torch state_dict key. */
+    public void bind(Checkpoint ckpt, boolean toDevice) {
+        this.model.bind(ckpt, toDevice);
+        if (this.lm_head != null) {
+            this.lm_head.bind(ckpt, "lm_head.weight", toDevice);
+        }
+    }
+
+    public int32 position() {
+        return this.pos;
+    }
+
+    public int32 vocabSize() {
+        return this.cfg.vocabSize;
+    }
+
+    /** The logits of the most recent step — a borrow of pooled storage. */
+    public Tensor<float32> logits() {
+        return this.pool.logits;
+    }
+
+    /**
+     * Run the prompt `tokens[0, n)` from the current position: fills the
+     * KV cache, computes logits for the last position, returns its
+     * argmax. One arena block is the only buffer allocation (spec 4.9).
+     */
+    public int32 prefill(int32[] tokens, int32 n) {
+        if (n <= 0) {
+            throw heap LlamaException("prefill: token count must be positive");
+        }
+        if (this.pos + n > this.maxSeq) {
+            throw heap LlamaException("prefill: " + n
+                + " tokens at position " + this.pos
+                + " exceeds maxSeq " + this.maxSeq);
+        }
+        int64 rows = (int64) n;
+        int64 h = (int64) this.cfg.hiddenSize;
+        int64 qd = (int64) this.cfg.qDim();
+        int64 kvd = (int64) this.cfg.kvDim();
+        int64 inter = (int64) this.cfg.intermediateSize;
+
+        // One block sized to the ACTUAL sequence length (spec 4.9).
+        int64 total = rows * (h * 4 + qd * 2 + kvd * 2 + inter * 2);
+        PrefillArena arena = heap PrefillArena(total);
+        Tensor<float32> hs = arena.take(rows, h);
+        Tensor<float32> xn = arena.take(rows, h);
+        Tensor<float32> proj = arena.take(rows, h);
+        Tensor<float32> mlpOut = arena.take(rows, h);
+        Tensor<float32> q = arena.take(rows, qd);
+        Tensor<float32> ao = arena.take(rows, qd);
+        Tensor<float32> k = arena.take(rows, kvd);
+        Tensor<float32> v = arena.take(rows, kvd);
+        Tensor<float32> gate = arena.take(rows, inter);
+        Tensor<float32> up = arena.take(rows, inter);
+
+        Tensor<float32> emb = this.model.embed_tokens.weight;
+        int32 r = 0;
+        while (r < n) {
+            HostOps.embedRow(emb, tokens[r], hs, (int64) r * h,
+                this.cfg.hiddenSize);
+            r = r + 1;
+        }
+        this.forwardRows(hs, xn, q, k, v, ao, proj, gate, up, mlpOut,
+            n, this.pos);
+        this.pos = this.pos + n;
+        return HostOps.argmaxRow(this.pool.logits, this.cfg.vocabSize);
+    }
+
+    /**
+     * One decode step for `token` at the current position, entirely in
+     * pooled buffers: zero heap allocations (6.1.6). Returns the argmax
+     * of the resulting logits.
+     */
+    public int32 decodeStep(int32 token) {
+        if (this.pos >= this.maxSeq) {
+            throw heap LlamaException("decode: context is full (maxSeq "
+                + this.maxSeq + ")");
+        }
+        ActivationPool p = this.pool;
+        HostOps.embedRow(this.model.embed_tokens.weight, token, p.x, 0,
+            this.cfg.hiddenSize);
+        this.forwardRows(p.x, p.xn, p.q, p.k, p.v, p.attnOut, p.attnProj,
+            p.gate, p.up, p.mlpOut, 1, this.pos);
+        this.pos = this.pos + 1;
+        return HostOps.argmaxRow(p.logits, this.cfg.vocabSize);
+    }
+
+    /**
+     * The shared step function over `rows` consecutive positions starting
+     * at absolute `startPos`: the layer stack (norm → GQA attention with
+     * causal-by-construction cache reads → norm → SwiGLU, residuals in
+     * place on `hs`), then the final norm and the output projection of
+     * the LAST row into `pool.logits`. Buffers are caller-owned; row `r`
+     * of a buffer is its flat range `[r·dim, (r+1)·dim)`.
+     */
+    void forwardRows(Tensor<float32> hs, Tensor<float32> xn,
+            Tensor<float32> q, Tensor<float32> k, Tensor<float32> v,
+            Tensor<float32> ao, Tensor<float32> proj,
+            Tensor<float32> gate, Tensor<float32> up,
+            Tensor<float32> mlpOut, int32 rows, int32 startPos) {
+        int32 h = this.cfg.hiddenSize;
+        int32 qd = this.cfg.qDim();
+        int32 kvd = this.cfg.kvDim();
+        int32 inter = this.cfg.intermediateSize;
+        int32 nH = this.cfg.numHeads;
+        int32 nKv = this.cfg.numKvHeads;
+        int32 hd = this.cfg.headDim;
+        float32 theta = this.cfg.ropeTheta;
+        Tensor<float32> scores = this.pool.scores;
+
+        int32 l = 0;
+        while (l < this.model.numLayers) {
+            DecoderLayer d = this.model.layerArr[l];
+            Tensor<float32> kC = this.cache.kL[l];
+            Tensor<float32> vC = this.cache.vL[l];
+            int32 r = 0;
+            while (r < rows) {
+                int64 rh = (int64) r * (int64) h;
+                int64 rq = (int64) r * (int64) qd;
+                int64 rkv = (int64) r * (int64) kvd;
+                int64 ri = (int64) r * (int64) inter;
+                int32 p = startPos + r;
+
+                // Attention block.
+                HostOps.rmsnormRow(hs, rh, d.input_layernorm.weight,
+                    d.input_layernorm.eps, xn, rh, h);
+                HostOps.matvecRow(xn, rh, d.self_attn.q_proj.weight,
+                    q, rq, h, qd);
+                HostOps.matvecRow(xn, rh, d.self_attn.k_proj.weight,
+                    k, rkv, h, kvd);
+                HostOps.matvecRow(xn, rh, d.self_attn.v_proj.weight,
+                    v, rkv, h, kvd);
+                HostOps.ropeRow(q, rq, nH, hd, p, theta);
+                HostOps.ropeRow(k, rkv, nKv, hd, p, theta);
+                HostOps.appendKvRow(kC, vC, k, rkv, v, rkv, p, kvd);
+                // Causal by construction: row r sees cache [0, p].
+                HostOps.attendRow(q, rq, kC, vC, p + 1, scores, ao, rq,
+                    nH, nKv, hd);
+                HostOps.matvecRow(ao, rq, d.self_attn.o_proj.weight,
+                    proj, rh, qd, h);
+                HostOps.addRow(hs, rh, proj, rh, h);
+
+                // MLP block.
+                HostOps.rmsnormRow(hs, rh, d.post_attention_layernorm.weight,
+                    d.post_attention_layernorm.eps, xn, rh, h);
+                HostOps.matvecRow(xn, rh, d.mlp.gate_proj.weight,
+                    gate, ri, h, inter);
+                HostOps.matvecRow(xn, rh, d.mlp.up_proj.weight,
+                    up, ri, h, inter);
+                HostOps.siluMulRow(gate, ri, up, ri, inter);
+                HostOps.matvecRow(gate, ri, d.mlp.down_proj.weight,
+                    mlpOut, rh, inter, h);
+                HostOps.addRow(hs, rh, mlpOut, rh, h);
+                r = r + 1;
+            }
+            l = l + 1;
+        }
+
+        // Final norm of the last row, then the output projection.
+        int64 lastH = (int64) (rows - 1) * (int64) h;
+        HostOps.rmsnormRow(hs, lastH, this.model.norm.weight,
+            this.model.norm.eps, xn, lastH, h);
+        if (this.lm_head != null) {
+            HostOps.matvecRow(xn, lastH, this.lm_head.weight,
+                this.pool.logits, 0, h, this.cfg.vocabSize);
+        } else {
+            // Tied output projection: logits against the embedding matrix.
+            HostOps.rowsDotRow(this.model.embed_tokens.weight, xn, lastH,
+                this.pool.logits, this.cfg.vocabSize, h);
+        }
+    }
+}

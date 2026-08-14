@@ -1,0 +1,40 @@
+package dev.cajeta.llama.model;
+
+import cajeta.lang.String;
+import dev.cajeta.llama.io.Checkpoint;
+
+/**
+ * The GQA attention projections for one decoder layer. Field names are
+ * the torch key segments (`q_proj` …), so the reflective walk yields HF
+ * keys verbatim. Projection shapes come from the EFFECTIVE head_dim
+ * (spec 4.8): q is `[hidden, heads·head_dim]`, k/v are
+ * `[hidden, kv_heads·head_dim]`, o is `[heads·head_dim, hidden]`.
+ */
+public final class Attention extends InfModule {
+    Linear q_proj;
+    Linear k_proj;
+    Linear v_proj;
+    Linear o_proj;
+    int32 nHeads;
+    int32 nKvHeads;
+    int32 headDim;
+
+    Attention(int32 hidden, int32 nHeads, int32 nKvHeads, int32 headDim) {
+        int32 qd = nHeads * headDim;
+        int32 kvd = nKvHeads * headDim;
+        this.q_proj = heap Linear(hidden, qd);
+        this.k_proj = heap Linear(hidden, kvd);
+        this.v_proj = heap Linear(hidden, kvd);
+        this.o_proj = heap Linear(qd, hidden);
+        this.nHeads = nHeads;
+        this.nKvHeads = nKvHeads;
+        this.headDim = headDim;
+    }
+
+    void bind(Checkpoint ckpt, String prefix, boolean toDevice) {
+        this.q_proj.bind(ckpt, prefix + "q_proj.weight", toDevice);
+        this.k_proj.bind(ckpt, prefix + "k_proj.weight", toDevice);
+        this.v_proj.bind(ckpt, prefix + "v_proj.weight", toDevice);
+        this.o_proj.bind(ckpt, prefix + "o_proj.weight", toDevice);
+    }
+}

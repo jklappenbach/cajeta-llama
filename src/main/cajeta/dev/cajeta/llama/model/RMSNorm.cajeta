@@ -1,0 +1,35 @@
+package dev.cajeta.llama.model;
+
+import cajeta.lang.String;
+import cajeta.math.Tensor;
+import dev.cajeta.llama.LlamaException;
+import dev.cajeta.llama.io.Checkpoint;
+
+/**
+ * RMSNorm weights, `[dim]`. Llama form: `y = x/rms(x) · w`. (The Gemma
+ * zero-centered `(1 + w)` form and the QK-norm placement are Unit 7's
+ * concern — this class only owns the parameter and its binding.)
+ */
+public final class RMSNorm extends InfModule {
+    Tensor<float32> weight;
+    int32 dim;
+    float32 eps;
+
+    RMSNorm(int32 dim, float32 eps) {
+        this.weight = null;
+        this.dim = dim;
+        this.eps = eps;
+    }
+
+    void bind(Checkpoint ckpt, String name, boolean toDevice) {
+        Tensor<float32> t = ckpt.loadF32(name);
+        if (t.ndim() != 1 || t.shapeAt(0) != (int64) this.dim) {
+            throw heap LlamaException("weight binding: '" + name
+                + "' does not match norm shape [" + this.dim + "]");
+        }
+        if (toDevice) {
+            t.gpu();
+        }
+        this.weight #= t;
+    }
+}

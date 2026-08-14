@@ -1,0 +1,173 @@
+package dev.cajeta.llama.selftest;
+
+import cajeta.collection.ArrayList;
+import cajeta.io.file.File;
+import cajeta.lang.String;
+import cajeta.lang.StringBuilder;
+
+/**
+ * Synthesizes a toy Llama-family checkpoint for the Unit 6 forward-path
+ * tests: a HF-style `config.json` plus a single-file safetensors whose
+ * tensor names are torch's dotted `state_dict` keys in canonical order.
+ *
+ * Every tensor is F32 and every element is `valAt(k, j)` where `k` is the
+ * tensor's position in the canonical name order and `j` its flat index in
+ * TORCH layout (`[out, in]` for Linear weights) — so a test can recompute
+ * any stored element without the fixture shipping data. Values live in
+ * [-0.1875, 0.1875] on a 1/32 grid: exactly representable, and small
+ * enough that a toy forward pass stays finite.
+ */
+public final class ToyModel {
+
+    /** Canonical tensor names, torch key convention. */
+    public ArrayList<String> names;
+    /** Torch-layout dims: d0 = rows (out), d1 = cols (in); d1 == 0 → rank 1. */
+    public int64[] d0;
+    public int64[] d1;
+    public int32 n;
+
+    ToyModel(int32 cap) {
+        this.names = heap ArrayList<String>();
+        this.d0 = heap int64[cap];
+        this.d1 = heap int64[cap];
+        this.n = 0;
+    }
+
+    void add(#String name, int64 rows, int64 cols) {
+        this.names.add(#name);
+        this.d0[this.n] = rows;
+        this.d1[this.n] = cols;
+        this.n = this.n + 1;
+        return;
+    }
+
+    public int64 elemsOf(int32 k) {
+        if (this.d1[k] == 0) {
+            return this.d0[k];
+        }
+        return this.d0[k] * this.d1[k];
+    }
+
+    public int32 kOf(String name) {
+        int32 i = 0;
+        while (i < this.n) {
+            if (this.names.get(i).equals(name)) {
+                return i;
+            }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    /**
+     * The canonical key list for an L-layer Llama decoder. `headDim` is the
+     * EFFECTIVE head dim (explicit config value, or hidden/heads).
+     */
+    public static #ToyModel spec(int32 layers, int32 hidden, int32 inter,
+            int32 nHeads, int32 nKv, int32 headDim, int32 vocab, boolean tie) {
+        int32 cap = 2 + layers * 9 + 1;
+        ToyModel s = heap ToyModel(cap);
+        int64 h = (int64) hidden;
+        int64 qd = (int64) (nHeads * headDim);
+        int64 kvd = (int64) (nKv * headDim);
+        s.add("model.embed_tokens.weight", (int64) vocab, h);
+        int32 l = 0;
+        while (l < layers) {
+            String p = "model.layers." + l + ".";
+            s.add(p + "input_layernorm.weight", h, 0);
+            s.add(p + "self_attn.q_proj.weight", qd, h);
+            s.add(p + "self_attn.k_proj.weight", kvd, h);
+            s.add(p + "self_attn.v_proj.weight", kvd, h);
+            s.add(p + "self_attn.o_proj.weight", h, qd);
+            s.add(p + "post_attention_layernorm.weight", h, 0);
+            s.add(p + "mlp.gate_proj.weight", (int64) inter, h);
+            s.add(p + "mlp.up_proj.weight", (int64) inter, h);
+            s.add(p + "mlp.down_proj.weight", h, (int64) inter);
+            l = l + 1;
+        }
+        s.add("model.norm.weight", h, 0);
+        if (!tie) {
+            s.add("lm_head.weight", (int64) vocab, h);
+        }
+        return #s;
+    }
+
+    /** Deterministic element value: tensor `k`, torch-layout flat index `j`. */
+    public static float32 valAt(int32 k, int64 j) {
+        int32 m = (k * 7 + (int32) (j % 9973)) % 13 - 6;
+        return (float32) m * 0.03125f;
+    }
+
+    /**
+     * Write the HF `config.json`. `headDimExplicit` of 0 omits the key
+     * (derived as hidden/heads); nonzero writes it (spec 4.8).
+     */
+    public static void writeConfig(String path, String arch, int32 hidden,
+            int32 inter, int32 layers, int32 nHeads, int32 nKv,
+            int32 headDimExplicit, int32 vocab, int32 maxPos, boolean tie) {
+        StringBuilder sb = heap StringBuilder();
+        sb.append("{\"architectures\":[\"" + arch + "\"],");
+        sb.append("\"model_type\":\"llama\",");
+        sb.append("\"hidden_size\":" + hidden + ",");
+        sb.append("\"intermediate_size\":" + inter + ",");
+        sb.append("\"num_hidden_layers\":" + layers + ",");
+        sb.append("\"num_attention_heads\":" + nHeads + ",");
+        sb.append("\"num_key_value_heads\":" + nKv + ",");
+        if (headDimExplicit != 0) {
+            sb.append("\"head_dim\":" + headDimExplicit + ",");
+        }
+        sb.append("\"vocab_size\":" + vocab + ",");
+        sb.append("\"max_position_embeddings\":" + maxPos + ",");
+        sb.append("\"rms_norm_eps\":1e-06,");
+        sb.append("\"rope_theta\":10000.0,");
+        if (tie) {
+            sb.append("\"tie_word_embeddings\":true}");
+        } else {
+            sb.append("\"tie_word_embeddings\":false}");
+        }
+        String s = sb.toString();
+        int8[] b = s.toBytes();
+        File.writeAllBytes(path, b, (int64) b.count());
+        return;
+    }
+
+    /** Write the safetensors file for `spec` with `valAt` contents. */
+    public static void writeWeights(String path, ToyModel spec) {
+        // Header JSON.
+        StringBuilder hb = heap StringBuilder();
+        hb.append("{");
+        int64 off = 0;
+        int32 k = 0;
+        while (k < spec.n) {
+            if (k > 0) {
+                hb.append(",");
+            }
+            int64 bytes = spec.elemsOf(k) * 4;
+            hb.append("\"" + spec.names.get(k) + "\":{\"dtype\":\"F32\",\"shape\":[");
+            hb.append("" + spec.d0[k]);
+            if (spec.d1[k] != 0) {
+                hb.append("," + spec.d1[k]);
+            }
+            hb.append("],\"data_offsets\":[" + off + "," + (off + bytes) + "]}");
+            off = off + bytes;
+            k = k + 1;
+        }
+        hb.append("}");
+        // Payload.
+        int8[] pay = heap int8[off];
+        int64 at = 0;
+        k = 0;
+        while (k < spec.n) {
+            int64 elems = spec.elemsOf(k);
+            int64 j = 0;
+            while (j < elems) {
+                SafetensorsTest.putF32(pay, at, ToyModel.valAt(k, j));
+                at = at + 4;
+                j = j + 1;
+            }
+            k = k + 1;
+        }
+        SafetensorsTest.writeSt(path, hb.toString(), pay, off);
+        return;
+    }
+}

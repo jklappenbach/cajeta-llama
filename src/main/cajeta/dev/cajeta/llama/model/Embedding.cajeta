@@ -1,0 +1,41 @@
+package dev.cajeta.llama.model;
+
+import cajeta.lang.String;
+import cajeta.math.Tensor;
+import dev.cajeta.llama.LlamaException;
+import dev.cajeta.llama.io.Checkpoint;
+
+/**
+ * The token-embedding lookup table, `[vocab, hidden]`. A lookup table is
+ * NOT a Linear: torch stores `nn.Embedding` in exactly this orientation,
+ * so binding does not transpose (the rank-2 restriction in
+ * `transposeLinearWeights` exists for the same reason).
+ *
+ * Under `tie_word_embeddings` (spec 4.7) this matrix is also the output
+ * projection, applied as `logits[v] = Σ_d W[v,d]·x[d]`.
+ */
+public final class Embedding extends InfModule {
+    Tensor<float32> weight;
+    int32 vocab;
+    int32 dim;
+
+    Embedding(int32 vocab, int32 dim) {
+        this.weight = null;
+        this.vocab = vocab;
+        this.dim = dim;
+    }
+
+    void bind(Checkpoint ckpt, String name, boolean toDevice) {
+        Tensor<float32> t = ckpt.loadF32(name);
+        if (t.ndim() != 2 || t.shapeAt(0) != (int64) this.vocab
+                || t.shapeAt(1) != (int64) this.dim) {
+            throw heap LlamaException("weight binding: '" + name
+                + "' does not match embedding shape [" + this.vocab + ", "
+                + this.dim + "]");
+        }
+        if (toDevice) {
+            t.gpu();
+        }
+        this.weight #= t;
+    }
+}

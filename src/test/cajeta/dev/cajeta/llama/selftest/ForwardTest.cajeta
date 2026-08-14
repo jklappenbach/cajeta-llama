@@ -1,0 +1,270 @@
+package dev.cajeta.llama.selftest;
+
+import dev.cajeta.unit.Assert;
+import dev.cajeta.llama.LlamaException;
+import dev.cajeta.llama.model.LlamaForCausalLM;
+import dev.cajeta.llama.model.ModelConfig;
+import cajeta.collection.ArrayList;
+import cajeta.lang.Cajeta;
+import cajeta.lang.String;
+import cajeta.math.Tensor;
+
+/**
+ * cajeta-llama plan Unit 6 TDD (6.1.1–6.1.7; spec §4): the tape-free
+ * forward path and weight binding.
+ *
+ * The engine has no autograd type at all, so "no GradTape" is asserted
+ * the only way that cannot rot: by allocation accounting. 6.1.1 pins peak
+ * activation memory to O(one layer) by comparing the forward-pass
+ * allocation delta of a 2-layer and a 4-layer model — a design that
+ * retained per-layer intermediates would separate them by ≥ the per-layer
+ * working set (~53 KiB at these dims); the arena design keeps them equal.
+ * 6.1.6 pins the decode step to ZERO heap allocations, by exact
+ * before/after equality of `Cajeta.allocatedBytes()` (monotonic, counts
+ * every allocation entry point) and `Cajeta.liveCount()`. 6.1.7 is the
+ * same suite re-run under `--release --live-set=bounded` (run-tests.sh's
+ * second pass).
+ */
+public class ForwardTest {
+
+    public ForwardTest() { return; }
+
+    static #String pre() {
+        return "/tmp/cajeta_llama_fwd";
+    }
+
+    static int32 idxOf(ArrayList<String> names, String want) {
+        int32 i = 0;
+        while (i < names.count()) {
+            if (names.get(i).equals(want)) {
+                return i;
+            }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    /** cfgA: L layers, h=64, inter=256, 4 heads / 2 kv, vocab 96, untied. */
+    static void writeA(String cfgPath, String stPath, int32 layers) {
+        ToyModel.writeConfig(cfgPath, "LlamaForCausalLM", 64, 256, layers,
+            4, 2, 0, 96, 64, false);
+        ToyModel s = ToyModel.spec(layers, 64, 256, 4, 2, 16, 96, false);
+        ToyModel.writeWeights(stPath, s);
+        return;
+    }
+
+    // ── 6.1.2 — parameter names are torch's dotted state_dict keys ──────
+
+    @Test
+    public void parameterNamesMatchTorchStateDictKeys() {
+        String cfgPath = ForwardTest.pre() + "_names_cfg.json";
+        String stPath = ForwardTest.pre() + "_names.safetensors";
+        // The reflective walk names bound tensors, so the key space is
+        // asserted on a bound model (an unbound tree has null weights).
+        ForwardTest.writeA(cfgPath, stPath, 2);
+        LlamaForCausalLM m = LlamaForCausalLM.load(cfgPath, stPath, 64, false);
+        ArrayList<String> names = m.parameterNames();
+        ToyModel s = ToyModel.spec(2, 64, 256, 4, 2, 16, 96, false);
+        Assert.equals((int64) s.n, (int64) names.count());
+        int32 i = 0;
+        while (i < s.n) {
+            Assert.isTrue(names.get(i).equals(s.names.get(i)));
+            i = i + 1;
+        }
+    }
+
+    // ── 6.1.3 — Linear weights transpose on import; embeddings do not ───
+
+    @Test
+    public void linearWeightsTransposeOnImport() {
+        String cfgPath = ForwardTest.pre() + "_tr_cfg.json";
+        String stPath = ForwardTest.pre() + "_tr.safetensors";
+        ForwardTest.writeA(cfgPath, stPath, 2);
+        LlamaForCausalLM m = LlamaForCausalLM.load(cfgPath, stPath, 64, false);
+        ArrayList<String> names = m.parameterNames();
+        ArrayList<Tensor<float32>> ts = m.parameterTensors();
+        ToyModel s = ToyModel.spec(2, 64, 256, 4, 2, 16, 96, false);
+
+        // k_proj: torch stores [kvDim=32, h=64]; the engine computes x·W and
+        // must hold [64, 32] with W[i][o] == torch[o][i].
+        String kName = "model.layers.0.self_attn.k_proj.weight";
+        int32 ki = ForwardTest.idxOf(names, kName);
+        Assert.isTrue(ki >= 0);
+        int32 kk = s.kOf(kName);
+        Tensor<float32> kw = ts.get(ki);
+        Assert.equals((int64) 64, kw.shapeAt(0));
+        Assert.equals((int64) 32, kw.shapeAt(1));
+        Assert.isTrue(kw.get2(0, 0) == ToyModel.valAt(kk, 0));
+        Assert.isTrue(kw.get2(5, 0) == ToyModel.valAt(kk, 5));
+        Assert.isTrue(kw.get2(0, 1) == ToyModel.valAt(kk, 64));
+        Assert.isTrue(kw.get2(17, 3) == ToyModel.valAt(kk, 3 * 64 + 17));
+        Assert.isTrue(kw.get2(63, 31) == ToyModel.valAt(kk, 31 * 64 + 63));
+
+        // The embedding is a lookup table, not a Linear: NOT transposed.
+        int32 ei = ForwardTest.idxOf(names, "model.embed_tokens.weight");
+        Tensor<float32> ew = ts.get(ei);
+        Assert.equals((int64) 96, ew.shapeAt(0));
+        Assert.equals((int64) 64, ew.shapeAt(1));
+        Assert.isTrue(ew.get2(0, 0) == ToyModel.valAt(0, 0));
+        Assert.isTrue(ew.get2(3, 7) == ToyModel.valAt(0, 3 * 64 + 7));
+        Assert.isTrue(ew.get2(95, 63) == ToyModel.valAt(0, 95 * 64 + 63));
+    }
+
+    // ── spec 4.7 + 4.8 — tie_word_embeddings and explicit head_dim ──────
+
+    @Test
+    public void tiedEmbeddingAndExplicitHeadDim() {
+        String cfgPath = ForwardTest.pre() + "_tie_cfg.json";
+        String stPath = ForwardTest.pre() + "_tie.safetensors";
+        // head_dim explicitly 8, though hidden/heads would derive 16.
+        ToyModel.writeConfig(cfgPath, "LlamaForCausalLM", 64, 128, 1,
+            4, 2, 8, 48, 32, true);
+        ToyModel s = ToyModel.spec(1, 64, 128, 4, 2, 8, 48, true);
+        ToyModel.writeWeights(stPath, s);
+        LlamaForCausalLM m = LlamaForCausalLM.load(cfgPath, stPath, 32, false);
+
+        ArrayList<String> names = m.parameterNames();
+        // Tied: no lm_head parameter exists anywhere in the tree.
+        Assert.equals((int64) s.n, (int64) names.count());
+        Assert.isTrue(ForwardTest.idxOf(names, "lm_head.weight") < 0);
+
+        // Explicit head_dim drives the projection shapes: q is
+        // [h=64, heads*head_dim=32], not [64, 64].
+        ArrayList<Tensor<float32>> ts = m.parameterTensors();
+        int32 qi = ForwardTest.idxOf(names, "model.layers.0.self_attn.q_proj.weight");
+        Tensor<float32> qw = ts.get(qi);
+        Assert.equals((int64) 64, qw.shapeAt(0));
+        Assert.equals((int64) 32, qw.shapeAt(1));
+
+        // The tied output projection produces logits over the vocab.
+        int32[] toks = heap int32[3];
+        toks[0] = 1;
+        toks[1] = 7;
+        toks[2] = 2;
+        int32 next = m.prefill(toks, 3);
+        Assert.isTrue(next >= 0);
+        Assert.isTrue(next < 48);
+        int32 next2 = m.decodeStep(next);
+        Assert.isTrue(next2 >= 0);
+        Assert.isTrue(next2 < 48);
+    }
+
+    // ── 6.1.5 — unsupported architecture errors listing supported ───────
+
+    @Test
+    public void unsupportedArchitectureErrorsListingSupported() {
+        String cfgPath = ForwardTest.pre() + "_gpt2_cfg.json";
+        ToyModel.writeConfig(cfgPath, "GPT2LMHeadModel", 64, 256, 2,
+            4, 2, 0, 96, 32, false);
+        boolean threw = false;
+        String msg = "";
+        try {
+            ModelConfig cfg = ModelConfig.parse(cfgPath);
+            Assert.isTrue(cfg == null);
+        } catch (LlamaException ex) {
+            threw = true;
+            msg = ex.message;
+        }
+        Assert.isTrue(threw);
+        Assert.isTrue(msg.contains("GPT2LMHeadModel"));
+        Assert.isTrue(msg.contains("LlamaForCausalLM"));
+    }
+
+    // ── 6.1.4 — device load is fully resident before the first forward ──
+
+    @Test
+    public void deviceLoadIsResidentBeforeFirstForward() {
+        String cfgPath = ForwardTest.pre() + "_dev_cfg.json";
+        String stPath = ForwardTest.pre() + "_dev.safetensors";
+        ForwardTest.writeA(cfgPath, stPath, 2);
+        LlamaForCausalLM m = LlamaForCausalLM.load(cfgPath, stPath, 64, true);
+        ArrayList<Tensor<float32>> ts = m.parameterTensors();
+        Assert.isTrue(ts.count() > 0);
+        int32 i = 0;
+        while (i < ts.count()) {
+            Assert.isTrue(ts.get(i).isOnGpu());
+            i = i + 1;
+        }
+    }
+
+    // ── 6.1.1 — nothing retained; peak activation memory is O(one layer) ─
+
+    @Test
+    public void forwardRetainsNothingAndPeakIsOneLayer() {
+        String cfgA = ForwardTest.pre() + "_l2_cfg.json";
+        String stA = ForwardTest.pre() + "_l2.safetensors";
+        String cfgD = ForwardTest.pre() + "_l4_cfg.json";
+        String stD = ForwardTest.pre() + "_l4.safetensors";
+        ForwardTest.writeA(cfgA, stA, 2);
+        ForwardTest.writeA(cfgD, stD, 4);
+        LlamaForCausalLM mA = LlamaForCausalLM.load(cfgA, stA, 64, false);
+        LlamaForCausalLM mD = LlamaForCausalLM.load(cfgD, stD, 64, false);
+
+        int32[] toks = heap int32[16];
+        int32 i = 0;
+        while (i < 16) {
+            toks[i] = (i * 5 + 1) % 96;
+            i = i + 1;
+        }
+
+        // Warm both models (first-call one-time costs out of the measurement).
+        mA.prefill(toks, 16);
+        mD.prefill(toks, 16);
+
+        // No intermediate outlives the forward pass.
+        int64 live0 = Cajeta.liveCount();
+        int64 b0 = Cajeta.allocatedBytes();
+        mA.prefill(toks, 16);
+        int64 bytesA = Cajeta.allocatedBytes() - b0;
+        Assert.equals(live0, Cajeta.liveCount());
+
+        int64 live1 = Cajeta.liveCount();
+        int64 b1 = Cajeta.allocatedBytes();
+        mD.prefill(toks, 16);
+        int64 bytesD = Cajeta.allocatedBytes() - b1;
+        Assert.equals(live1, Cajeta.liveCount());
+
+        // The prefill arena is real (one block, not zero)...
+        Assert.isTrue(bytesA > 0);
+        // ...bounded by the one-layer working set (~62 KiB at these dims,
+        // with headroom for slice/tensor headers)...
+        Assert.isTrue(bytesA < 262144);
+        // ...and INDEPENDENT of layer count: a design that retained per-layer
+        // intermediates would separate L=2 from L=4 by ≥ 2 × ~53 KiB here.
+        int64 diff = bytesD - bytesA;
+        if (diff < 0) {
+            diff = 0 - diff;
+        }
+        Assert.isTrue(diff < 8192);
+    }
+
+    // ── 6.1.6 — a decode step performs ZERO heap allocations ────────────
+
+    @Test
+    public void decodeStepAllocatesZero() {
+        String cfgPath = ForwardTest.pre() + "_dec_cfg.json";
+        String stPath = ForwardTest.pre() + "_dec.safetensors";
+        ForwardTest.writeA(cfgPath, stPath, 2);
+        LlamaForCausalLM m = LlamaForCausalLM.load(cfgPath, stPath, 64, false);
+
+        int32[] toks = heap int32[4];
+        toks[0] = 3;
+        toks[1] = 11;
+        toks[2] = 4;
+        toks[3] = 27;
+        int32 next = m.prefill(toks, 4);
+        // Warm one step, then the invariant: exact zero across 8 steps.
+        next = m.decodeStep(next);
+        int64 b0 = Cajeta.allocatedBytes();
+        int64 l0 = Cajeta.liveCount();
+        int32 s = 0;
+        while (s < 8) {
+            next = m.decodeStep(next);
+            Assert.isTrue(next >= 0);
+            Assert.isTrue(next < 96);
+            s = s + 1;
+        }
+        Assert.equals(b0, Cajeta.allocatedBytes());
+        Assert.equals(l0, Cajeta.liveCount());
+    }
+}

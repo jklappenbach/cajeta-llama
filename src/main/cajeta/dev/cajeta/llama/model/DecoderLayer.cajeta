@@ -1,0 +1,33 @@
+package dev.cajeta.llama.model;
+
+import cajeta.lang.String;
+import dev.cajeta.llama.io.Checkpoint;
+
+/**
+ * One pre-norm decoder block: `x += attn(input_layernorm(x))`, then
+ * `x += mlp(post_attention_layernorm(x))`. Field names are the torch key
+ * segments, declared in execution order.
+ */
+public final class DecoderLayer extends InfModule {
+    RMSNorm input_layernorm;
+    Attention self_attn;
+    RMSNorm post_attention_layernorm;
+    Mlp mlp;
+
+    DecoderLayer(int32 hidden, int32 inter, int32 nHeads, int32 nKvHeads,
+            int32 headDim, float32 eps) {
+        this.input_layernorm = heap RMSNorm(hidden, eps);
+        this.self_attn = heap Attention(hidden, nHeads, nKvHeads, headDim);
+        this.post_attention_layernorm = heap RMSNorm(hidden, eps);
+        this.mlp = heap Mlp(hidden, inter);
+    }
+
+    void bind(Checkpoint ckpt, String prefix, boolean toDevice) {
+        this.input_layernorm.bind(ckpt, prefix + "input_layernorm.weight",
+            toDevice);
+        this.self_attn.bind(ckpt, prefix + "self_attn.", toDevice);
+        this.post_attention_layernorm.bind(ckpt,
+            prefix + "post_attention_layernorm.weight", toDevice);
+        this.mlp.bind(ckpt, prefix + "mlp.", toDevice);
+    }
+}

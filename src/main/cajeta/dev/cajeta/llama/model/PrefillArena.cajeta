@@ -1,0 +1,37 @@
+package dev.cajeta.llama.model;
+
+import cajeta.math.Storage;
+import cajeta.math.Tensor;
+
+/**
+ * The prefill scratch arena (plan 6.2.5; spec 4.9, 4.10): ONE block sized
+ * to the actual sequence length, carved into borrowed slices. Each
+ * {@link #take} wraps a borrowing `Storage` slice (Unit 3) in a tensor —
+ * no copy, and the slice never frees the parent; only small headers are
+ * allocated per take, the block itself once per prefill.
+ *
+ * The arena lives for one prefill call: constructed on entry, dropped at
+ * return, which is what lets 6.1.1 assert that nothing survives the pass.
+ */
+public final class PrefillArena {
+    Storage<float32> block;
+    int64 used;
+
+    PrefillArena(int64 totalElems) {
+        this.block = heap Storage<float32>(totalElems);
+        this.used = 0;
+    }
+
+    #Tensor<float32> take(int64 rows, int64 cols) {
+        int64 n = rows * cols;
+        Storage<float32> s = heap Storage<float32>(this.block, this.used, n);
+        this.used = this.used + n;
+        int64[] shape = heap int64[2];
+        shape[0] = rows;
+        shape[1] = cols;
+        int64[] strides = heap int64[2];
+        strides[0] = cols;
+        strides[1] = 1;
+        return heap Tensor<float32>(#s, 0, shape, strides);
+    }
+}

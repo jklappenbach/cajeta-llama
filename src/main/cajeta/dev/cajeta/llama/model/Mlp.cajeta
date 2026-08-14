@@ -1,0 +1,26 @@
+package dev.cajeta.llama.model;
+
+import cajeta.lang.String;
+import dev.cajeta.llama.io.Checkpoint;
+
+/**
+ * The SwiGLU MLP projections for one decoder layer:
+ * `down(silu(gate(x)) · up(x))`. Field names are the torch key segments.
+ */
+public final class Mlp extends InfModule {
+    Linear gate_proj;
+    Linear up_proj;
+    Linear down_proj;
+
+    Mlp(int32 hidden, int32 inter) {
+        this.gate_proj = heap Linear(hidden, inter);
+        this.up_proj = heap Linear(hidden, inter);
+        this.down_proj = heap Linear(inter, hidden);
+    }
+
+    void bind(Checkpoint ckpt, String prefix, boolean toDevice) {
+        this.gate_proj.bind(ckpt, prefix + "gate_proj.weight", toDevice);
+        this.up_proj.bind(ckpt, prefix + "up_proj.weight", toDevice);
+        this.down_proj.bind(ckpt, prefix + "down_proj.weight", toDevice);
+    }
+}
