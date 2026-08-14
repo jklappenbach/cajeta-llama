@@ -35,7 +35,7 @@ public final class LlamaForCausalLM extends InfModule {
     // Non-parameter state (skipped by the reflective walk).
     ModelConfig cfg;
     ActivationPool pool;
-    KvCache cache;
+    PagedKvCache cache;
     int32 maxSeq;
     int32 pos;
 
@@ -49,9 +49,30 @@ public final class LlamaForCausalLM extends InfModule {
                 this.cfg.vocabSize);
         }
         this.pool = heap ActivationPool(this.cfg, maxSeq);
-        this.cache = heap KvCache(this.cfg, maxSeq);
+        // Pool capacity: every unwindowed layer can hold a full-context
+        // sequence (windowed layers keep rings and draw no blocks).
+        int32 blocksPerSeq = (maxSeq + this.cfg.blockTokens - 1)
+            / this.cfg.blockTokens;
+        int32 fullLayers = 0;
+        int32 li = 0;
+        while (li < this.cfg.numLayers) {
+            if (this.cfg.windowForLayer(li) == 0) {
+                fullLayers = fullLayers + 1;
+            }
+            li = li + 1;
+        }
+        int32 nb = fullLayers * blocksPerSeq;
+        if (nb == 0) {
+            nb = 1;
+        }
+        this.cache = heap PagedKvCache(this.cfg, maxSeq, 1, nb);
         this.maxSeq = maxSeq;
         this.pos = 0;
+    }
+
+    /** The cache — observable occupancy for tests and the scheduler. */
+    public PagedKvCache kvCache() {
+        return this.cache;
     }
 
     /** Parse config, build the stack, bind the checkpoint. */
@@ -178,8 +199,6 @@ public final class LlamaForCausalLM extends InfModule {
         while (l < this.model.numLayers) {
             DecoderLayer d = this.model.layerArr[l];
             Attention a = d.self_attn;
-            Tensor<float32> kC = this.cache.kL[l];
-            Tensor<float32> vC = this.cache.vL[l];
             int32 r = 0;
             while (r < rows) {
                 int64 rh = (int64) r * (int64) h;
@@ -211,19 +230,20 @@ public final class LlamaForCausalLM extends InfModule {
                         hh = hh + 1;
                     }
                 }
-                // RoPE at the ABSOLUTE position, per-layer frequencies.
+                // RoPE at the ABSOLUTE position, per-layer frequencies —
+                // never the ring slot (spec 6.10).
                 Prim.ropeRowHost(q, rq, nH, hd, p, a.ropeInv);
                 Prim.ropeRowHost(k, rkv, nKv, hd, p, a.ropeInv);
-                HostOps.appendKvRow(kC, vC, k, rkv, v, rkv, p, kvd);
-                // Causal by construction: row r sees cache [from, p];
-                // a finite window clamps `from` in prefill AND decode
-                // through this same line (spec 5.9).
-                int32 from = 0;
-                if (a.window > 0 && p + 1 > a.window) {
-                    from = p + 1 - a.window;
+                if (!this.cache.appendRow(0, l, k, rkv, v, rkv, p)) {
+                    // Single-sequence path: exhaustion is a sizing bug
+                    // here; the Unit 9 scheduler owns it for real (6.4).
+                    throw heap LlamaException("kv pool exhausted at layer "
+                        + l + " position " + p);
                 }
-                Prim.attendRowHost(q, rq, kC, vC, 0, from, p, a.scale,
-                    scores, ao, rq, nH, nKv, hd);
+                // Causal by construction; the layer's window clamps in
+                // prefill AND decode inside the cache read (spec 5.9).
+                this.cache.attendRow(0, l, q, rq, a.scale, scores, ao, rq,
+                    nH, nKv, hd);
                 HostOps.matvecRow(ao, rq, a.o_proj.weight, proj, rh, qd, h);
                 if (d.fourNorm) {
                     // Gemma layout: post-norm on the sublayer OUTPUT.

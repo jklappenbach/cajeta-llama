@@ -31,7 +31,7 @@ public final class Attention extends InfModule {
      *  not a Tensor: InfModule's walk must not see it as a parameter. */
     float32[] ropeInv;
 
-    Attention(ModelConfig cfg) {
+    Attention(ModelConfig cfg, int32 layerIdx) {
         int32 hidden = cfg.hiddenSize;
         int32 qd = cfg.qDim();
         int32 kvd = cfg.kvDim();
@@ -49,7 +49,7 @@ public final class Attention extends InfModule {
         this.nHeads = cfg.numHeads;
         this.nKvHeads = cfg.numKvHeads;
         this.headDim = cfg.headDim;
-        this.window = cfg.slidingWindow;
+        this.window = cfg.windowForLayer(layerIdx);
         if (cfg.queryScale != 0.0f) {
             this.scale = cfg.queryScale;
         } else {

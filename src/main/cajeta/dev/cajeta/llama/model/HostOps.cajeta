@@ -62,20 +62,6 @@ public final class HostOps {
         return;
     }
 
-    /** Append one (already-RoPE'd) K/V row at absolute position `p`. */
-    static void appendKvRow(Tensor<float32> kCache, Tensor<float32> vCache,
-            Tensor<float32> k, int64 kOff, Tensor<float32> v, int64 vOff,
-            int32 p, int32 kvDim) {
-        int64 base = (int64) p * (int64) kvDim;
-        int64 j = 0;
-        while (j < (int64) kvDim) {
-            kCache.flatSet(base + j, k.flatGet(kOff + j));
-            vCache.flatSet(base + j, v.flatGet(vOff + j));
-            j = j + 1;
-        }
-        return;
-    }
-
     /** a row += b row. */
     static void addRow(Tensor<float32> a, int64 aOff,
             Tensor<float32> b, int64 bOff, int32 n) {

@@ -29,9 +29,9 @@ public final class DecoderLayer extends InfModule {
     int32 normForm;
     boolean fourNorm;
 
-    DecoderLayer(ModelConfig cfg) {
+    DecoderLayer(ModelConfig cfg, int32 layerIdx) {
         this.input_layernorm = heap RMSNorm(cfg.hiddenSize, cfg.rmsNormEps);
-        this.self_attn = heap Attention(cfg);
+        this.self_attn = heap Attention(cfg, layerIdx);
         this.post_attention_layernorm = heap RMSNorm(cfg.hiddenSize,
             cfg.rmsNormEps);
         if (cfg.fourNorm) {

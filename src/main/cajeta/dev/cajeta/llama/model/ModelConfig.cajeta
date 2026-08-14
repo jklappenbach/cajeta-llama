@@ -62,6 +62,14 @@ public final class ModelConfig {
     /** Four RMSNorms per block — pre/post around both sublayers
      *  (spec 5.11). */
     public boolean fourNorm;
+    /** Per-layer windows from HF `layer_types` ("sliding_attention" /
+     *  "full_attention", the Gemma 3 local/global pattern); null = every
+     *  layer at `slidingWindow` (spec §5 preamble: layers inherit the
+     *  model default). */
+    public int32[] layerWindows;
+    /** KV-cache block size in tokens (spec 6.3). Engine tuning knob, not
+     *  an HF key; the CLI exposes it in Unit 19. */
+    public int32 blockTokens;
 
     ModelConfig() {
         this.architecture = null;
@@ -87,6 +95,17 @@ public final class ModelConfig {
         this.normForm = 0;
         this.qkNorm = false;
         this.fourNorm = false;
+        this.layerWindows = null;
+        this.blockTokens = 16;
+    }
+
+    /** The attention window of layer `l`: the per-layer declaration when
+     *  present, else the model default. 0 = infinite. */
+    public int32 windowForLayer(int32 l) {
+        if (this.layerWindows != null) {
+            return this.layerWindows[l];
+        }
+        return this.slidingWindow;
     }
 
     public int32 qDim() {
@@ -192,6 +211,30 @@ public final class ModelConfig {
         JsonValue qkn = root.get("qk_norm");
         if (qkn != null) {
             c.qkNorm = qkn.asBoolean();
+        }
+        JsonValue lt = root.get("layer_types");
+        if (lt != null && !lt.isNull()) {
+            int32 n = lt.asArray().count();
+            if (n != c.numLayers) {
+                throw heap LlamaException("model config: layer_types has "
+                    + n + " entries for " + c.numLayers + " layers");
+            }
+            int32[] lw = heap int32[n];
+            int32 li = 0;
+            while (li < n) {
+                String tname = lt.asArray().get(li).asString();
+                if (tname.equals("sliding_attention")) {
+                    lw[li] = c.slidingWindow;
+                } else if (tname.equals("full_attention")) {
+                    lw[li] = 0;
+                } else {
+                    throw heap LlamaException("model config: layer type '"
+                        + tname + "' is not supported; supported: "
+                        + "sliding_attention, full_attention");
+                }
+                li = li + 1;
+            }
+            c.layerWindows #= lw;
         }
         return #c;
     }

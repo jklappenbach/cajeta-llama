@@ -1,0 +1,667 @@
+package dev.cajeta.llama.selftest;
+
+import dev.cajeta.unit.Assert;
+import dev.cajeta.llama.LlamaException;
+import dev.cajeta.llama.io.Checkpoint;
+import dev.cajeta.llama.model.LlamaForCausalLM;
+import dev.cajeta.llama.model.ModelConfig;
+import dev.cajeta.llama.model.PagedKvCache;
+import dev.cajeta.llama.model.Prim;
+import cajeta.collection.ArrayList;
+import cajeta.lang.Cajeta;
+import cajeta.lang.String;
+import cajeta.math.Tensor;
+import cajeta.time.Clock;
+
+/**
+ * cajeta-llama plan Unit 8 TDD — the paged KV cache (spec 6.1–6.18).
+ * Both sharing failure modes are silent and produce plausible wrong
+ * tokens, so the copy-on-write and refcount tests assert on exact
+ * values a corruption would visibly move.
+ */
+public class KvCacheTest {
+
+    public KvCacheTest() { return; }
+
+    static float64 fabs(float64 x) {
+        if (x < 0.0) {
+            return 0.0 - x;
+        }
+        return x;
+    }
+
+    /** A toy config: hidden 16, 2 heads / 1 kv head → head_dim 8,
+     *  kvDim 8; blockTokens 4. `window` 0 = unwindowed. */
+    static #ModelConfig cacheCfg(int32 layers, int32 window) {
+        String path = "/tmp/cajeta_llama_kvc_cfg.json";
+        String extra = "";
+        if (window > 0) {
+            extra = "\"sliding_window\":" + window + ",";
+        }
+        ToyModel.writeConfigX(path, "LlamaForCausalLM", 16, 32, layers,
+            2, 1, 0, 24, 64, true, extra);
+        ModelConfig cfg = ModelConfig.parse(path);
+        cfg.blockTokens = 4;
+        return #cfg;
+    }
+
+    /** A [kvDim] row whose element d is `base + d` (exact in f32). */
+    static #Tensor<float32> row(int32 kvDim, float32 base) {
+        int64[] s = heap int64[1];
+        s[0] = (int64) kvDim;
+        Tensor<float32> t = Tensor.zeros<float32>(s);
+        int64 d = 0;
+        while (d < (int64) kvDim) {
+            t.flatSet(d, base + (float32) d);
+            d = d + 1;
+        }
+        return #t;
+    }
+
+    // ── 8.1.1 — every position written once, read back exactly ──────────
+
+    @Test
+    public void appendedRowsReadBackExactly() {
+        ModelConfig cfg = KvCacheTest.cacheCfg(2, 0);
+        PagedKvCache c = heap PagedKvCache(cfg, 64, 1, 32);
+        int32 l = 0;
+        while (l < 2) {
+            int32 t = 0;
+            while (t < 10) {
+                Tensor<float32> k = KvCacheTest.row(8,
+                    1000.0f * (float32) l + 10.0f * (float32) t);
+                Tensor<float32> v = KvCacheTest.row(8,
+                    1000.0f * (float32) l + 10.0f * (float32) t + 5.0f);
+                Assert.isTrue(c.appendRow(0, l, k, 0, v, 0, t));
+                t = t + 1;
+            }
+            l = l + 1;
+        }
+        l = 0;
+        while (l < 2) {
+            Assert.equals((int64) 10, (int64) c.lengthOf(0, l));
+            int32 t = 0;
+            while (t < 10) {
+                int32 d = 0;
+                while (d < 8) {
+                    float32 wantK = 1000.0f * (float32) l
+                        + 10.0f * (float32) t + (float32) d;
+                    Assert.isTrue(c.kAt(0, l, t, d) == wantK);
+                    Assert.isTrue(c.vAt(0, l, t, d) == wantK + 5.0f);
+                    d = d + 1;
+                }
+                t = t + 1;
+            }
+            l = l + 1;
+        }
+    }
+
+    // ── 8.1.2 — a block is drawn ONLY at a block boundary ───────────────
+
+    @Test
+    public void blockDrawnOnlyAtBoundary() {
+        ModelConfig cfg = KvCacheTest.cacheCfg(1, 0);
+        PagedKvCache c = heap PagedKvCache(cfg, 64, 1, 8);
+        int32 t = 0;
+        while (t < 10) {
+            int32 before = c.freeBlocks();
+            Tensor<float32> k = KvCacheTest.row(8, (float32) t);
+            Assert.isTrue(c.appendRow(0, 0, k, 0, k, 0, t));
+            int32 spent = before - c.freeBlocks();
+            if (t % 4 == 0) {
+                Assert.equals((int64) 1, (int64) spent);
+            } else {
+                Assert.equals((int64) 0, (int64) spent);
+            }
+            t = t + 1;
+        }
+        Assert.equals((int64) 3, (int64) c.usedBlocks());
+    }
+
+    // ── 8.1.3 — prefill-then-decode agrees with a full recompute ────────
+
+    @Test
+    public void prefillThenDecodeMatchesFullRecompute() {
+        String cfgPath = "/tmp/cajeta_llama_kvc_pd_cfg.json";
+        String stPath = "/tmp/cajeta_llama_kvc_pd.safetensors";
+        ForwardTest.writeA(cfgPath, stPath, 2);
+
+        ModelConfig cfgA = ModelConfig.parse(cfgPath);
+        cfgA.blockTokens = 4;
+        LlamaForCausalLM mA = heap LlamaForCausalLM(#cfgA, 64);
+        Checkpoint ckA = Checkpoint.open(stPath);
+        mA.bind(ckA, false);
+        ckA.close();
+
+        int32[] toks = heap int32[8];
+        toks[0] = 3;
+        toks[1] = 11;
+        toks[2] = 4;
+        toks[3] = 27;
+        int32 cur = mA.prefill(toks, 4);
+        // The decode chain crosses a block boundary at p = 4 and 8
+        // (8.1.15's mid-generation crossing).
+        int32 i = 4;
+        while (i < 8) {
+            toks[i] = cur;
+            cur = mA.decodeStep(cur);
+            i = i + 1;
+        }
+        Tensor<float32> la = mA.logits();
+
+        ModelConfig cfgB = ModelConfig.parse(cfgPath);
+        cfgB.blockTokens = 4;
+        LlamaForCausalLM mB = heap LlamaForCausalLM(#cfgB, 64);
+        Checkpoint ckB = Checkpoint.open(stPath);
+        mB.bind(ckB, false);
+        ckB.close();
+        int32 nb = mB.prefill(toks, 8);
+        Tensor<float32> lb = mB.logits();
+
+        Assert.equals((int64) cur, (int64) nb);
+        int64 j = 0;
+        while (j < 96) {
+            Assert.isTrue(KvCacheTest.fabs((float64) la.flatGet(j)
+                - (float64) lb.flatGet(j)) < 0.00001);
+            j = j + 1;
+        }
+    }
+
+    // ── 8.1.4 — exhaustion surfaces; the context limit throws ───────────
+
+    @Test
+    public void exhaustionSurfacesAndContextLimitThrows() {
+        ModelConfig cfg = KvCacheTest.cacheCfg(1, 0);
+        PagedKvCache c = heap PagedKvCache(cfg, 16, 1, 2);
+        int32 t = 0;
+        while (t < 8) {
+            Tensor<float32> k = KvCacheTest.row(8, (float32) t);
+            Assert.isTrue(c.appendRow(0, 0, k, 0, k, 0, t));
+            t = t + 1;
+        }
+        // Pool empty; the next boundary append SURFACES, no throw (6.4).
+        Tensor<float32> k8 = KvCacheTest.row(8, 8.0f);
+        Assert.isFalse(c.appendRow(0, 0, k8, 0, k8, 0, 8));
+        Assert.equals((int64) 8, (int64) c.lengthOf(0, 0));
+        Assert.equals((int64) 0, (int64) c.freeBlocks());
+
+        // Exceeding the CONFIGURED maximum context is the caller's error.
+        ModelConfig cfg2 = KvCacheTest.cacheCfg(1, 0);
+        PagedKvCache c2 = heap PagedKvCache(cfg2, 4, 1, 8);
+        t = 0;
+        while (t < 4) {
+            Tensor<float32> k = KvCacheTest.row(8, (float32) t);
+            Assert.isTrue(c2.appendRow(0, 0, k, 0, k, 0, t));
+            t = t + 1;
+        }
+        boolean threw = false;
+        String msg = "";
+        try {
+            Tensor<float32> k4 = KvCacheTest.row(8, 4.0f);
+            c2.appendRow(0, 0, k4, 0, k4, 0, 4);
+        } catch (LlamaException ex) {
+            threw = true;
+            msg = ex.message;
+        }
+        Assert.isTrue(threw);
+        Assert.isTrue(msg.contains("maximum context"));
+    }
+
+    // ── 8.1.5 — decode: no per-step copy, no per-step allocation ────────
+
+    @Test
+    public void decodeStaysZeroAllocAcrossBlockBoundaries() {
+        String cfgPath = "/tmp/cajeta_llama_kvc_za_cfg.json";
+        String stPath = "/tmp/cajeta_llama_kvc_za.safetensors";
+        ForwardTest.writeA(cfgPath, stPath, 2);
+        ModelConfig cfg = ModelConfig.parse(cfgPath);
+        cfg.blockTokens = 4;
+        LlamaForCausalLM m = heap LlamaForCausalLM(#cfg, 64);
+        Checkpoint ck = Checkpoint.open(stPath);
+        m.bind(ck, false);
+        ck.close();
+        int32[] toks = heap int32[2];
+        toks[0] = 3;
+        toks[1] = 7;
+        int32 cur = m.prefill(toks, 2);
+        cur = m.decodeStep(cur);
+        int64 b0 = Cajeta.allocatedBytes();
+        int64 l0 = Cajeta.liveCount();
+        int32 s = 0;
+        while (s < 10) {
+            // Crosses block boundaries at p = 4, 8, 12: the boundary
+            // draw is free-list arithmetic, not an allocation.
+            cur = m.decodeStep(cur);
+            s = s + 1;
+        }
+        Assert.equals(b0, Cajeta.allocatedBytes());
+        Assert.equals(l0, Cajeta.liveCount());
+    }
+
+    // ── 8.1.6 + 8.1.16 + 8.3.2 — release/reuse without realloc; no leak ─
+
+    @Test
+    public void releaseReusesBlocksWithoutReallocationOrLeak() {
+        ModelConfig cfg = KvCacheTest.cacheCfg(1, 0);
+        PagedKvCache c = heap PagedKvCache(cfg, 64, 2, 8);
+        int32 initialFree = c.freeBlocks();
+        // Warm one full cycle so first-touch costs are out of the way.
+        int32 t = 0;
+        while (t < 8) {
+            Tensor<float32> k = KvCacheTest.row(8, (float32) t);
+            c.appendRow(0, 0, k, 0, k, 0, t);
+            t = t + 1;
+        }
+        c.release(0);
+        Assert.equals((int64) initialFree, (int64) c.freeBlocks());
+
+        Tensor<float32> kr = KvCacheTest.row(8, 1.0f);
+        int64 b0 = Cajeta.allocatedBytes();
+        int32 cycle = 0;
+        while (cycle < 50) {
+            t = 0;
+            while (t < 8) {
+                c.appendRow(0, 0, kr, 0, kr, 0, t);
+                t = t + 1;
+            }
+            c.forkPrefix(0, 1, 8);
+            c.release(0);
+            // seq1 still holds every block.
+            Assert.equals((int64) (initialFree - 2), (int64) c.freeBlocks());
+            c.release(1);
+            // Occupancy returns to baseline EVERY cycle — a leak fails
+            // here rather than degrading quietly (8.3.2).
+            Assert.equals((int64) initialFree, (int64) c.freeBlocks());
+            cycle = cycle + 1;
+        }
+        // The whole soak allocated nothing.
+        Assert.equals(b0, Cajeta.allocatedBytes());
+    }
+
+    // ── 8.1.7 + 8.1.11 — rings size to the window, draw no blocks ───────
+
+    @Test
+    public void ringSizedToWindowAndPrefillPastWindowBounded() {
+        ModelConfig cfg = KvCacheTest.cacheCfg(1, 8);
+        PagedKvCache c = heap PagedKvCache(cfg, 64, 1, 4);
+        // Mistral's shape in miniature: cap 64, window 8 → an eighth.
+        Assert.equals((int64) 8, (int64) c.ringRows(0));
+        // A prompt far longer than the window writes stay bounded and
+        // draw NOTHING from the pool.
+        int32 t = 0;
+        while (t < 20) {
+            Tensor<float32> k = KvCacheTest.row(8, 10.0f * (float32) t);
+            Assert.isTrue(c.appendRow(0, 0, k, 0, k, 0, t));
+            t = t + 1;
+        }
+        Assert.equals((int64) 0, (int64) c.usedBlocks());
+        Assert.equals((int64) 20, (int64) c.lengthOf(0, 0));
+    }
+
+    // ── 8.1.8 — ring slot p mod w; p − w is overwritten ─────────────────
+
+    @Test
+    public void ringSlotMappingOverwritesPMinusW() {
+        ModelConfig cfg = KvCacheTest.cacheCfg(1, 8);
+        PagedKvCache c = heap PagedKvCache(cfg, 64, 1, 4);
+        int32 t = 0;
+        while (t < 20) {
+            Tensor<float32> k = KvCacheTest.row(8, 10.0f * (float32) t);
+            c.appendRow(0, 0, k, 0, k, 0, t);
+            t = t + 1;
+        }
+        // Live range [12, 20): exact values survive.
+        t = 12;
+        while (t < 20) {
+            Assert.isTrue(c.kAt(0, 0, t, 0) == 10.0f * (float32) t);
+            Assert.isTrue(c.kAt(0, 0, t, 7) == 10.0f * (float32) t + 7.0f);
+            t = t + 1;
+        }
+        // Position 11 was overwritten by 19 (same slot, 11 = 19 − 8).
+        boolean threw = false;
+        try {
+            float32 x = c.kAt(0, 0, 11, 0);
+            Assert.isTrue(x == 3.4e38f);
+        } catch (LlamaException ex) {
+            threw = true;
+        }
+        Assert.isTrue(threw);
+    }
+
+    // ── 8.1.9 — a wrapped window matches a full-cache reference ─────────
+
+    @Test
+    public void wrappedWindowMatchesFullCacheReference() {
+        ModelConfig cfg = KvCacheTest.cacheCfg(1, 8);
+        PagedKvCache c = heap PagedKvCache(cfg, 64, 1, 4);
+        // Also keep a PACKED unwindowed copy of all rows as reference.
+        int64[] ps = heap int64[2];
+        ps[0] = 21;
+        ps[1] = 8;
+        Tensor<float32> pk = Tensor.zeros<float32>(ps);
+        Tensor<float32> pv = Tensor.zeros<float32>(ps);
+        int32 t = 0;
+        while (t < 21) {
+            Tensor<float32> k = KvCacheTest.row(8,
+                0.0625f * (float32) ((t * 7 + 1) % 11));
+            Tensor<float32> v = KvCacheTest.row(8,
+                0.0625f * (float32) ((t * 5 + 3) % 13));
+            c.appendRow(0, 0, k, 0, v, 0, t);
+            int32 d = 0;
+            while (d < 8) {
+                pk.flatSet((int64) (t * 8 + d), k.flatGet((int64) d));
+                pv.flatSet((int64) (t * 8 + d), v.flatGet((int64) d));
+                d = d + 1;
+            }
+            t = t + 1;
+        }
+        // p=20, w=8 → live [13, 20], wrapped in the ring (13%8=5 > 20%8=4:
+        // two segments). The cache read must equal the packed reference
+        // clamped to the same range.
+        int64[] qs = heap int64[1];
+        qs[0] = 16;
+        Tensor<float32> q = Tensor.zeros<float32>(qs);
+        int64 j = 0;
+        while (j < 16) {
+            q.flatSet(j, 0.125f * (float32) ((j * 3 + 2) % 7) - 0.25f);
+            j = j + 1;
+        }
+        int64[] ss = heap int64[1];
+        ss[0] = 32;
+        Tensor<float32> scores = Tensor.zeros<float32>(ss);
+        int64[] os = heap int64[1];
+        os[0] = 16;
+        Tensor<float32> outC = Tensor.zeros<float32>(os);
+        Tensor<float32> outR = Tensor.zeros<float32>(os);
+        c.attendRow(0, 0, q, 0, 0.35f, scores, outC, 0, 2, 1, 8);
+        Prim.attendRowHost(q, 0, pk, pv, 0, 13, 20, 0.35f, scores,
+            outR, 0, 2, 1, 8);
+        j = 0;
+        while (j < 16) {
+            Assert.isTrue(KvCacheTest.fabs((float64) outC.flatGet(j)
+                - (float64) outR.flatGet(j)) < 0.000001);
+            j = j + 1;
+        }
+    }
+
+    // ── 8.1.15 — block-table reads across a mid-generation boundary ─────
+
+    @Test
+    public void blockTableReadsAcrossBoundary() {
+        ModelConfig cfg = KvCacheTest.cacheCfg(1, 0);
+        PagedKvCache c = heap PagedKvCache(cfg, 64, 1, 8);
+        int64[] ps = heap int64[2];
+        ps[0] = 10;
+        ps[1] = 8;
+        Tensor<float32> pk = Tensor.zeros<float32>(ps);
+        Tensor<float32> pv = Tensor.zeros<float32>(ps);
+        int32 t = 0;
+        while (t < 10) {
+            Tensor<float32> k = KvCacheTest.row(8,
+                0.0625f * (float32) ((t * 3 + 2) % 9));
+            Tensor<float32> v = KvCacheTest.row(8,
+                0.0625f * (float32) ((t * 11 + 1) % 7));
+            c.appendRow(0, 0, k, 0, v, 0, t);
+            int32 d = 0;
+            while (d < 8) {
+                pk.flatSet((int64) (t * 8 + d), k.flatGet((int64) d));
+                pv.flatSet((int64) (t * 8 + d), v.flatGet((int64) d));
+                d = d + 1;
+            }
+            t = t + 1;
+        }
+        int64[] qs = heap int64[1];
+        qs[0] = 16;
+        Tensor<float32> q = Tensor.zeros<float32>(qs);
+        int64 j = 0;
+        while (j < 16) {
+            q.flatSet(j, 0.125f * (float32) ((j * 5 + 1) % 9) - 0.5f);
+            j = j + 1;
+        }
+        int64[] ss = heap int64[1];
+        ss[0] = 16;
+        Tensor<float32> scores = Tensor.zeros<float32>(ss);
+        int64[] os = heap int64[1];
+        os[0] = 16;
+        Tensor<float32> outC = Tensor.zeros<float32>(os);
+        Tensor<float32> outR = Tensor.zeros<float32>(os);
+        // p=9 spans blocks 0, 1, 2 (blockTokens 4).
+        c.attendRow(0, 0, q, 0, 0.35f, scores, outC, 0, 2, 1, 8);
+        Prim.attendRowHost(q, 0, pk, pv, 0, 0, 9, 0.35f, scores,
+            outR, 0, 2, 1, 8);
+        j = 0;
+        while (j < 16) {
+            Assert.isTrue(KvCacheTest.fabs((float64) outC.flatGet(j)
+                - (float64) outR.flatGet(j)) < 0.000001);
+            j = j + 1;
+        }
+    }
+
+    // ── 8.1.13 — prefix sharing by refcount ─────────────────────────────
+
+    @Test
+    public void prefixSharingFreesOnlyOnLastRelease() {
+        ModelConfig cfg = KvCacheTest.cacheCfg(1, 0);
+        PagedKvCache c = heap PagedKvCache(cfg, 64, 2, 8);
+        int32 t = 0;
+        while (t < 8) {
+            Tensor<float32> k = KvCacheTest.row(8, (float32) t);
+            c.appendRow(0, 0, k, 0, k, 0, t);
+            t = t + 1;
+        }
+        Assert.equals((int64) 2, (int64) c.usedBlocks());
+        c.forkPrefix(0, 1, 8);
+        // Shared, not copied.
+        Assert.equals((int64) 2, (int64) c.usedBlocks());
+        Assert.equals((int64) 8, (int64) c.lengthOf(1, 0));
+        // Both sequences read the same history.
+        Assert.isTrue(c.kAt(1, 0, 5, 3) == c.kAt(0, 0, 5, 3));
+        c.release(0);
+        // seq1 still references every block: nothing freed.
+        Assert.equals((int64) 2, (int64) c.usedBlocks());
+        Assert.isTrue(c.kAt(1, 0, 7, 0) == 7.0f);
+        c.release(1);
+        Assert.equals((int64) 0, (int64) c.usedBlocks());
+    }
+
+    // ── 8.1.14 — copy-on-write leaves the other history unchanged ───────
+
+    @Test
+    public void copyOnWriteLeavesOtherHistoryUnchanged() {
+        ModelConfig cfg = KvCacheTest.cacheCfg(1, 0);
+        PagedKvCache c = heap PagedKvCache(cfg, 64, 2, 8);
+        int32 t = 0;
+        while (t < 8) {
+            Tensor<float32> k = KvCacheTest.row(8, 10.0f * (float32) t);
+            c.appendRow(0, 0, k, 0, k, 0, t);
+            t = t + 1;
+        }
+        // Fork at 6: block 1 (positions 4–7) is shared AND partial for
+        // the fork — seq1's next append lands INSIDE it.
+        c.forkPrefix(0, 1, 6);
+        int32 freeBefore = c.freeBlocks();
+        Tensor<float32> kx = KvCacheTest.row(8, 777.0f);
+        Assert.isTrue(c.appendRow(1, 0, kx, 0, kx, 0, 6));
+        // The write copied the shared block first (one block consumed)...
+        Assert.equals((int64) (freeBefore - 1), (int64) c.freeBlocks());
+        // ...seq0's history at 6 and 7 is UNTOUCHED (spec 6.15's silent
+        // corruption, asserted directly)...
+        Assert.isTrue(c.kAt(0, 0, 6, 0) == 60.0f);
+        Assert.isTrue(c.kAt(0, 0, 7, 0) == 70.0f);
+        Assert.isTrue(c.kAt(0, 0, 7, 7) == 77.0f);
+        // ...the shared prefix inside the copied block is intact for
+        // seq1, and its own write landed.
+        Assert.isTrue(c.kAt(1, 0, 4, 2) == 42.0f);
+        Assert.isTrue(c.kAt(1, 0, 5, 0) == 50.0f);
+        Assert.isTrue(c.kAt(1, 0, 6, 0) == 777.0f);
+    }
+
+    // ── 8.1.10 — RoPE in a ring uses the ABSOLUTE position ──────────────
+
+    @Test
+    public void ringStoresAbsolutePositionRope() {
+        String cfgPath = "/tmp/cajeta_llama_kvc_rope_cfg.json";
+        String stPath = "/tmp/cajeta_llama_kvc_rope.safetensors";
+        ToyModel.writeConfigX(cfgPath, "LlamaForCausalLM", 16, 32, 1,
+            2, 1, 0, 24, 32, true, "\"sliding_window\":8,");
+        ToyModel s = ToyModel.specVariant(1, 16, 32, 2, 1, 8, 24, true,
+            false, false);
+        ToyModel.writeWeights(stPath, s);
+        LlamaForCausalLM m = LlamaForCausalLM.load(cfgPath, stPath, 32,
+            false);
+
+        int32[] t0 = heap int32[1];
+        t0[0] = 5;
+        int32 cur = m.prefill(t0, 1);
+        int32 fedAt12 = 0;
+        int32 p = 1;
+        while (p <= 12) {
+            if (p == 12) {
+                fedAt12 = cur;
+            }
+            cur = m.decodeStep(cur);
+            p = p + 1;
+        }
+
+        // Expected K row for position 12: embed → input norm → k_proj →
+        // RoPE at ABSOLUTE 12 (slot 12 % 8 = 4 would rotate by 4).
+        ArrayList<String> names = m.parameterNames();
+        ArrayList<Tensor<float32>> ts = m.parameterTensors();
+        Tensor<float32> emb = ts.get(AttentionTest.idx(names,
+            "model.embed_tokens.weight"));
+        Tensor<float32> wIn = ts.get(AttentionTest.idx(names,
+            "model.layers.0.input_layernorm.weight"));
+        Tensor<float32> wk = ts.get(AttentionTest.idx(names,
+            "model.layers.0.self_attn.k_proj.weight"));
+        int64[] xs = heap int64[2];
+        xs[0] = 1;
+        xs[1] = 16;
+        Tensor<float32> x = Tensor.zeros<float32>(xs);
+        int32 d = 0;
+        while (d < 16) {
+            x.flatSet((int64) d, emb.get2((int64) fedAt12, (int64) d));
+            d = d + 1;
+        }
+        Tensor<float32> xn = Prim.rmsnormF32Op(x, wIn, 0.000001f, 0);
+        Tensor<float32> kAbs = Tensor.matmul<float32>(xn, wk);
+        Tensor<float32> kSlot = kAbs.copy();
+        float32[] inv = Prim.invFreq(8, 10000.0f, 0, 1.0f, 1.0f, 4.0f, 0);
+        int64[] ivs = heap int64[1];
+        ivs[0] = 4;
+        Tensor<float32> invT = Tensor.zeros<float32>(ivs);
+        int64 ii = 0;
+        while (ii < 4) {
+            invT.flatSet(ii, inv[(int32) ii]);
+            ii = ii + 1;
+        }
+        int32[] pAbs = heap int32[1];
+        pAbs[0] = 12;
+        int32[] pSlot = heap int32[1];
+        pSlot[0] = 4;
+        Tensor<int32> pa = PrimTest.ivec(pAbs);
+        Tensor<int32> psl = PrimTest.ivec(pSlot);
+        Prim.ropeF32Op(kAbs, pa, invT, 1, 8);
+        Prim.ropeF32Op(kSlot, psl, invT, 1, 8);
+
+        float64 diffAbs = 0.0;
+        float64 diffSlot = 0.0;
+        d = 0;
+        while (d < 8) {
+            float32 got = m.kvCache().kAt(0, 0, 12, d);
+            float64 da = KvCacheTest.fabs((float64) got
+                - (float64) kAbs.flatGet((int64) d));
+            float64 dsv = KvCacheTest.fabs((float64) got
+                - (float64) kSlot.flatGet((int64) d));
+            if (da > diffAbs) {
+                diffAbs = da;
+            }
+            if (dsv > diffSlot) {
+                diffSlot = dsv;
+            }
+            d = d + 1;
+        }
+        Assert.isTrue(diffAbs < 0.00001);
+        Assert.isTrue(diffSlot > 0.001);
+    }
+
+    // ── 8.1.12 — Gemma's 5:1 pattern allocates per layer ────────────────
+
+    @Test
+    public void gemmaPatternDrawsBlocksOnlyForGlobalLayers() {
+        String cfgPath = "/tmp/cajeta_llama_kvc_gp_cfg.json";
+        String stPath = "/tmp/cajeta_llama_kvc_gp.safetensors";
+        ToyModel.writeConfigX(cfgPath, "LlamaForCausalLM", 16, 32, 6,
+            2, 1, 0, 24, 32, true,
+            "\"sliding_window\":8,\"layer_types\":[\"sliding_attention\","
+            + "\"sliding_attention\",\"sliding_attention\","
+            + "\"sliding_attention\",\"sliding_attention\","
+            + "\"full_attention\"],");
+        ToyModel s = ToyModel.specVariant(6, 16, 32, 2, 1, 8, 24, true,
+            false, false);
+        ToyModel.writeWeights(stPath, s);
+        ModelConfig cfg = ModelConfig.parse(cfgPath);
+        cfg.blockTokens = 4;
+        LlamaForCausalLM m = heap LlamaForCausalLM(#cfg, 32);
+        Checkpoint ck = Checkpoint.open(stPath);
+        m.bind(ck, false);
+        ck.close();
+
+        int32[] toks = heap int32[16];
+        int32 i = 0;
+        while (i < 16) {
+            toks[i] = (i * 3 + 1) % 24;
+            i = i + 1;
+        }
+        m.prefill(toks, 16);
+        // Five sliding layers keep 8-row rings and draw nothing; only
+        // the one global layer draws blocks: 16 tokens / 4 = 4 blocks.
+        int32 l = 0;
+        while (l < 5) {
+            Assert.equals((int64) 8, (int64) m.kvCache().ringRows(l));
+            l = l + 1;
+        }
+        Assert.equals((int64) 0, (int64) m.kvCache().ringRows(5));
+        Assert.equals((int64) 4, (int64) m.kvCache().usedBlocks());
+    }
+
+    // ── 8.3.1 — per-token decode time is flat in prefix length ──────────
+
+    @Test
+    public void decodeTimeFlatInPrefixLength() {
+        String cfgPath = "/tmp/cajeta_llama_kvc_tm_cfg.json";
+        String stPath = "/tmp/cajeta_llama_kvc_tm.safetensors";
+        ForwardTest.writeA(cfgPath, stPath, 2);
+        LlamaForCausalLM m = LlamaForCausalLM.load(cfgPath, stPath, 64,
+            false);
+        int32[] toks = heap int32[2];
+        toks[0] = 3;
+        toks[1] = 9;
+        int32 cur = m.prefill(toks, 2);
+        cur = m.decodeStep(cur);   // warm
+
+        int64 t0 = Clock.nanoTime();
+        int32 s = 0;
+        while (s < 8) {
+            cur = m.decodeStep(cur);
+            s = s + 1;
+        }
+        int64 shortNs = Clock.nanoTime() - t0;
+
+        // Grow the prefix to ~50 tokens.
+        while (m.position() < 52) {
+            cur = m.decodeStep(cur);
+        }
+        int64 t1 = Clock.nanoTime();
+        s = 0;
+        while (s < 8) {
+            cur = m.decodeStep(cur);
+            s = s + 1;
+        }
+        int64 longNs = Clock.nanoTime() - t1;
+
+        // Cached decode grows only by the linear attention term (~1.5×
+        // here); a quadratic recompute would pay the ~10× prefix ratio.
+        // Generous bound to keep timing noise out of the verdict.
+        Assert.isTrue(longNs < shortNs * 6);
+    }
+}
