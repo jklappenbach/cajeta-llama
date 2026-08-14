@@ -1,0 +1,727 @@
+package dev.cajeta.llama.model;
+
+import cajeta.lang.Math;
+import cajeta.math.Placement;
+import cajeta.math.Tensor;
+import cajeta.xpu.KernelBuffer;
+import cajeta.xpu.KernelStream;
+import cajeta.xpu.KernelThread;
+
+/**
+ * Transformer primitives (plan Unit 7; spec §5): XPU kernels plus host
+ * floors, the Ewise op+lowering pattern — ops route on operand placement,
+ * and the in-process CPU backend backs the device path everywhere.
+ *
+ * Attention is ONE primitive for prefill, decode and ragged batches
+ * (spec 6.13): rows carry their absolute positions, so causality is
+ * by-construction (row at position `p` reads cache `[from, p]`) — decode
+ * never builds a mask (5.6) — and a finite window is the same `from`
+ * clamp in prefill and decode (5.9). Scores are never materialized:
+ * the kernel is two streaming passes per (row, head, dim) with f32
+ * running max / sum / accumulator in registers (5.7, 5.8), and the host
+ * floor reuses one preallocated `[maxSeq]` scratch line per row.
+ */
+public final class Prim {
+
+    // ── RMSNorm (5.1, 5.12) ─────────────────────────────────────────────
+
+    /**
+     * RMSNorm over rows of `[rows, dim]` (spec 5.1): normalize by
+     * root-mean-square over the last axis, learned scale, NO mean
+     * subtraction. `form` 0 = Llama (`·w`), 1 = Gemma zero-centered
+     * (`·(1+w)`, spec 5.12).
+     */
+    @Kernel
+    public static void rmsnormF32(KernelBuffer<float32> out,
+            KernelBuffer<float32> x, KernelBuffer<float32> w,
+            uint32 rows, uint32 dim, float32 eps, int32 form) {
+        uint32 r = KernelThread.globalIdX();
+        if (r < rows) {
+            float32 ss = 0.0f;
+            uint32 i = 0;
+            while (i < dim) {
+                float32 v = x[r * dim + i];
+                ss = ss + v * v;
+                i = i + 1;
+            }
+            float32 scale = 1.0f / Math.sqrt(ss / (float32) dim + eps);
+            i = 0;
+            while (i < dim) {
+                float32 wi = w[i];
+                if (form == 1) {
+                    wi = 1.0f + wi;
+                }
+                out[r * dim + i] = x[r * dim + i] * scale * wi;
+                i = i + 1;
+            }
+        }
+    }
+
+    /**
+     * Placement-routed RMSNorm op over `[rows, dim]` tensors: all-device →
+     * the kernel; otherwise the host floor. Returns a fresh tensor.
+     */
+    public static #Tensor<float32> rmsnormF32Op(Tensor<float32> x,
+            Tensor<float32> w, float32 eps, int32 form) {
+        Tensor<float32> out = Tensor.zerosLike<float32>(x);
+        int64 dim = x.shapeAt(x.ndim() - 1);
+        int64 rows = x.size() / dim;
+        if (Placement.pair("rmsnorm", "x", x.isOnGpu(), "w", w.isOnGpu())) {
+            out.gpu();
+            uint32 ur = (uint32) rows;
+            KernelStream s = KernelStream.current();
+            rmsnormF32.launch(s, grid: [(ur + 63) / 64], block: [64])
+                (out.deviceBuffer(), x.deviceBuffer(), w.deviceBuffer(),
+                 ur, (uint32) dim, eps, form);
+            s.sync();
+        } else {
+            int64 r = 0;
+            while (r < rows) {
+                Prim.rmsnormRowHost(x, r * dim, w, eps, out, r * dim,
+                    (int32) dim, form);
+                r = r + 1;
+            }
+        }
+        return #out;
+    }
+
+    /** Host floor: one row, either norm form, flat offsets; in-place safe. */
+    static void rmsnormRowHost(Tensor<float32> src, int64 srcOff,
+            Tensor<float32> w, float32 eps,
+            Tensor<float32> dst, int64 dstOff, int32 dim, int32 form) {
+        float32 ss = 0.0f;
+        int64 i = 0;
+        while (i < (int64) dim) {
+            float32 v = src.flatGet(srcOff + i);
+            ss = ss + v * v;
+            i = i + 1;
+        }
+        float32 scale = 1.0f / Math.sqrt(ss / (float32) dim + eps);
+        i = 0;
+        while (i < (int64) dim) {
+            float32 wi = w.flatGet(i);
+            if (form == 1) {
+                wi = 1.0f + wi;
+            }
+            dst.flatSet(dstOff + i, src.flatGet(srcOff + i) * scale * wi);
+            i = i + 1;
+        }
+        return;
+    }
+
+    // ── Gated MLP activation (5.4) ──────────────────────────────────────
+
+    /**
+     * Fused gate activation × up: `out[i] = act(g[i]) · u[i]`. `act` 0 =
+     * SiLU (SwiGLU), 1 = gelu_pytorch_tanh (GeGLU).
+     */
+    @Kernel
+    public static void gluF32(KernelBuffer<float32> out,
+            KernelBuffer<float32> g, KernelBuffer<float32> u,
+            uint32 n, int32 act) {
+        uint32 i = KernelThread.globalIdX();
+        if (i < n) {
+            float32 x = g[i];
+            float32 a = 0.0f;
+            if (act == 1) {
+                // gelu_pytorch_tanh: 0.5x(1 + tanh(√(2/π)(x + 0.044715x³)))
+                float32 t = 0.7978845608f * (x + 0.044715f * x * x * x);
+                float32 th = 1.0f - 2.0f / (Math.exp(2.0f * t) + 1.0f);
+                a = 0.5f * x * (1.0f + th);
+            } else {
+                a = x / (1.0f + Math.exp(0.0f - x));
+            }
+            out[i] = a * u[i];
+        }
+    }
+
+    /** Placement-routed GLU op over equal-shaped tensors. */
+    public static #Tensor<float32> gluF32Op(Tensor<float32> g,
+            Tensor<float32> u, int32 act) {
+        Tensor<float32> out = Tensor.zerosLike<float32>(g);
+        int64 n = g.size();
+        if (Placement.pair("glu", "g", g.isOnGpu(), "u", u.isOnGpu())) {
+            out.gpu();
+            uint32 un = (uint32) n;
+            KernelStream s = KernelStream.current();
+            gluF32.launch(s, grid: [(un + 63) / 64], block: [64])
+                (out.deviceBuffer(), g.deviceBuffer(), u.deviceBuffer(),
+                 un, act);
+            s.sync();
+        } else {
+            Prim.gluRowHost(g, 0, u, 0, out, 0, (int32) n, act);
+        }
+        return #out;
+    }
+
+    /** Host floor: `dst = act(g) · u` over a flat range; in-place safe. */
+    static void gluRowHost(Tensor<float32> g, int64 gOff,
+            Tensor<float32> u, int64 uOff,
+            Tensor<float32> dst, int64 dstOff, int32 n, int32 act) {
+        int64 i = 0;
+        while (i < (int64) n) {
+            float32 x = g.flatGet(gOff + i);
+            float32 a = 0.0f;
+            if (act == 1) {
+                float32 t = 0.7978845608f * (x + 0.044715f * x * x * x);
+                float32 th = 1.0f - 2.0f / (Math.exp(2.0f * t) + 1.0f);
+                a = 0.5f * x * (1.0f + th);
+            } else {
+                a = x / (1.0f + Math.exp(0.0f - x));
+            }
+            dst.flatSet(dstOff + i, a * u.flatGet(uOff + i));
+            i = i + 1;
+        }
+        return;
+    }
+
+    // ── RoPE (5.2) and its scaling variants (5.3) ───────────────────────
+
+    /**
+     * Per-dimension inverse frequencies for `headDim`, theta base, and
+     * the layer's declared scaling (spec 5.3). `type`: 0 none, 1 linear,
+     * 2 ntk/dynamic, 3 yarn, 4 llama3.
+     *
+     * - linear: every frequency divided by `factor` (positions
+     *   effectively interpolated).
+     * - ntk/dynamic: the theta base is rescaled by
+     *   `factor^(dim/(dim-2))`, spreading the interpolation across dims.
+     * - yarn: per-dim ramp between unscaled (high-frequency dims) and
+     *   `/factor` (low-frequency dims); `low`/`high` are beta_slow /
+     *   beta_fast, ramped on `origMax / wavelength`.
+     * - llama3: piecewise by wavelength against `origMax/low` and
+     *   `origMax/high`, with a smooth blend between (Llama 3.1+).
+     */
+    public static #float32[] invFreq(int32 headDim, float32 theta,
+            int32 type, float32 factor, float32 low, float32 high,
+            int32 origMax) {
+        int32 half = headDim / 2;
+        float32[] inv = heap float32[half];
+        float32 base = theta;
+        if (type == 2) {
+            base = theta * Math.pow(factor,
+                (float32) headDim / ((float32) headDim - 2.0f));
+        }
+        int32 d = 0;
+        while (d < half) {
+            float32 f = Math.pow(base,
+                (0.0f - (float32) (2 * d)) / (float32) headDim);
+            if (type == 1) {
+                f = f / factor;
+            } else if (type == 3) {
+                // yarn ramp on r = origMax / wavelength = origMax·f / 2π.
+                float32 r = (float32) origMax * f / 6.2831853f;
+                float32 g = (r - low) / (high - low);
+                if (g < 0.0f) {
+                    g = 0.0f;
+                }
+                if (g > 1.0f) {
+                    g = 1.0f;
+                }
+                f = g * f + (1.0f - g) * (f / factor);
+            } else if (type == 4) {
+                float32 wavelen = 6.2831853f / f;
+                float32 lowWavelen = (float32) origMax / low;
+                float32 highWavelen = (float32) origMax / high;
+                if (wavelen > lowWavelen) {
+                    f = f / factor;
+                } else if (wavelen > highWavelen) {
+                    float32 sm = ((float32) origMax / wavelen - low)
+                        / (high - low);
+                    f = (1.0f - sm) * (f / factor) + sm * f;
+                }
+            }
+            inv[d] = f;
+            d = d + 1;
+        }
+        return #inv;
+    }
+
+    /**
+     * Rotary embedding for one row at absolute position `pos`, HF
+     * split-half convention: pair (d, d+half), angle `pos·invFreq[d]`.
+     * In place. (Spec 5.2: the LAYER's theta base — `invFreq` is
+     * per-layer state.)
+     */
+    static void ropeRowHost(Tensor<float32> t, int64 off, int32 nHeads,
+            int32 headDim, int32 pos, float32[] invFreq) {
+        int32 half = headDim / 2;
+        int32 h = 0;
+        while (h < nHeads) {
+            int64 base = off + (int64) (h * headDim);
+            int32 d = 0;
+            while (d < half) {
+                float32 ang = (float32) pos * invFreq[d];
+                float32 c = Math.cos(ang);
+                float32 s = Math.sin(ang);
+                float32 a = t.flatGet(base + (int64) d);
+                float32 b = t.flatGet(base + (int64) (d + half));
+                t.flatSet(base + (int64) d, a * c - b * s);
+                t.flatSet(base + (int64) (d + half), a * s + b * c);
+                d = d + 1;
+            }
+            h = h + 1;
+        }
+        return;
+    }
+
+    /** RoPE kernel over `[rows, nHeads·headDim]`, positions per row. */
+    @Kernel
+    public static void ropeF32(KernelBuffer<float32> t,
+            KernelBuffer<float32> invFreq, KernelBuffer<int32> pos,
+            uint32 rows, uint32 nHeads, uint32 headDim) {
+        uint32 id = KernelThread.globalIdX();
+        uint32 half = headDim / 2;
+        uint32 lanes = rows * nHeads * half;
+        if (id < lanes) {
+            uint32 r = id / (nHeads * half);
+            uint32 rem = id % (nHeads * half);
+            uint32 h = rem / half;
+            uint32 d = rem % half;
+            uint32 base = r * (nHeads * headDim) + h * headDim;
+            float32 ang = (float32) pos[r] * invFreq[d];
+            float32 c = Math.cos(ang);
+            float32 s = Math.sin(ang);
+            float32 a = t[base + d];
+            float32 b = t[base + d + half];
+            t[base + d] = a * c - b * s;
+            t[base + d + half] = a * s + b * c;
+        }
+    }
+
+    /**
+     * Placement-routed RoPE op over `[rows, nHeads·headDim]`: rotates in
+     * place. `positions` is `[rows]` int32 absolute positions.
+     */
+    public static void ropeF32Op(Tensor<float32> t, Tensor<int32> positions,
+            Tensor<float32> invFreqT, int32 nHeads, int32 headDim) {
+        int64 rows = positions.size();
+        if (Placement.pair("rope", "t", t.isOnGpu(),
+                "positions", positions.isOnGpu())) {
+            uint32 lanes = (uint32) (rows * (int64) nHeads
+                * (int64) (headDim / 2));
+            KernelStream s = KernelStream.current();
+            ropeF32.launch(s, grid: [(lanes + 63) / 64], block: [64])
+                (t.deviceBuffer(), invFreqT.deviceBuffer(),
+                 positions.deviceBuffer(), (uint32) rows,
+                 (uint32) nHeads, (uint32) headDim);
+            s.sync();
+        } else {
+            int32 half = headDim / 2;
+            int64 r = 0;
+            while (r < rows) {
+                int32 p = positions.flatGet(r);
+                int64 off = r * (int64) (nHeads * headDim);
+                int32 h = 0;
+                while (h < nHeads) {
+                    int64 base = off + (int64) (h * headDim);
+                    int32 d = 0;
+                    while (d < half) {
+                        float32 ang = (float32) p * invFreqT.flatGet((int64) d);
+                        float32 c = Math.cos(ang);
+                        float32 s = Math.sin(ang);
+                        float32 a = t.flatGet(base + (int64) d);
+                        float32 b = t.flatGet(base + (int64) (d + half));
+                        t.flatSet(base + (int64) d, a * c - b * s);
+                        t.flatSet(base + (int64) (d + half), a * s + b * c);
+                        d = d + 1;
+                    }
+                    h = h + 1;
+                }
+                r = r + 1;
+            }
+        }
+        return;
+    }
+
+    // ── Attention (5.5–5.9, 5.13, 6.13) ─────────────────────────────────
+
+    /**
+     * Host attention for ONE query row at absolute position `p` against a
+     * packed KV region: rows `[kvRowBase + t]` of `[*, nKv·headDim]`
+     * caches, keys `t` in `[from, p]`. GQA shares KV heads across query
+     * groups with no repeat tensor (5.5); `from` carries the window
+     * clamp (5.9); `scale` the declared query scale (5.13); `scores` is
+     * the caller's preallocated scratch line — allocation-free.
+     */
+    static void attendRowHost(Tensor<float32> q, int64 qOff,
+            Tensor<float32> kC, Tensor<float32> vC, int64 kvRowBase,
+            int32 from, int32 p, float32 scale, Tensor<float32> scores,
+            Tensor<float32> outv, int64 outOff,
+            int32 nHeads, int32 nKv, int32 headDim) {
+        int32 kvDim = nKv * headDim;
+        int32 group = nHeads / nKv;
+        int32 h = 0;
+        while (h < nHeads) {
+            int32 kvh = h / group;
+            int64 qBase = qOff + (int64) (h * headDim);
+            int64 kvHead = (int64) (kvh * headDim);
+            int32 count = p + 1 - from;
+            int64 t = 0;
+            while (t < (int64) count) {
+                float32 s = 0.0f;
+                int64 kRow = (kvRowBase + (int64) from + t) * (int64) kvDim
+                    + kvHead;
+                int64 d = 0;
+                while (d < (int64) headDim) {
+                    s = s + q.flatGet(qBase + d) * kC.flatGet(kRow + d);
+                    d = d + 1;
+                }
+                scores.flatSet(t, s * scale);
+                t = t + 1;
+            }
+            float32 mx = scores.flatGet(0);
+            t = 1;
+            while (t < (int64) count) {
+                float32 sv = scores.flatGet(t);
+                if (sv > mx) {
+                    mx = sv;
+                }
+                t = t + 1;
+            }
+            float32 sum = 0.0f;
+            t = 0;
+            while (t < (int64) count) {
+                float32 e = Math.exp(scores.flatGet(t) - mx);
+                scores.flatSet(t, e);
+                sum = sum + e;
+                t = t + 1;
+            }
+            float32 rs = 1.0f / sum;
+            int64 d = 0;
+            while (d < (int64) headDim) {
+                float32 acc = 0.0f;
+                t = 0;
+                while (t < (int64) count) {
+                    acc = acc + scores.flatGet(t) * vC.flatGet(
+                        (kvRowBase + (int64) from + t) * (int64) kvDim
+                        + kvHead + d);
+                    t = t + 1;
+                }
+                outv.flatSet(outOff + (int64) (h * headDim) + d, acc * rs);
+                d = d + 1;
+            }
+            h = h + 1;
+        }
+        return;
+    }
+
+    /**
+     * f16-STORAGE attention row with f32 ACCUMULATION throughout
+     * (spec 5.7): scores, softmax and the V reduction all carry f32; only
+     * the loads are f16. Same contract as {@link #attendRowHost}.
+     */
+    static void attendRowHostF16(Tensor<float16> q, int64 qOff,
+            Tensor<float16> kC, Tensor<float16> vC, int64 kvRowBase,
+            int32 from, int32 p, float32 scale, Tensor<float32> scores,
+            Tensor<float32> outv, int64 outOff,
+            int32 nHeads, int32 nKv, int32 headDim) {
+        int32 kvDim = nKv * headDim;
+        int32 group = nHeads / nKv;
+        int32 h = 0;
+        while (h < nHeads) {
+            int32 kvh = h / group;
+            int64 qBase = qOff + (int64) (h * headDim);
+            int64 kvHead = (int64) (kvh * headDim);
+            int32 count = p + 1 - from;
+            int64 t = 0;
+            while (t < (int64) count) {
+                float32 s = 0.0f;
+                int64 kRow = (kvRowBase + (int64) from + t) * (int64) kvDim
+                    + kvHead;
+                int64 d = 0;
+                while (d < (int64) headDim) {
+                    s = s + (float32) q.flatGet(qBase + d)
+                        * (float32) kC.flatGet(kRow + d);
+                    d = d + 1;
+                }
+                scores.flatSet(t, s * scale);
+                t = t + 1;
+            }
+            float32 mx = scores.flatGet(0);
+            t = 1;
+            while (t < (int64) count) {
+                float32 sv = scores.flatGet(t);
+                if (sv > mx) {
+                    mx = sv;
+                }
+                t = t + 1;
+            }
+            float32 sum = 0.0f;
+            t = 0;
+            while (t < (int64) count) {
+                float32 e = Math.exp(scores.flatGet(t) - mx);
+                scores.flatSet(t, e);
+                sum = sum + e;
+                t = t + 1;
+            }
+            float32 rs = 1.0f / sum;
+            int64 d = 0;
+            while (d < (int64) headDim) {
+                float32 acc = 0.0f;
+                t = 0;
+                while (t < (int64) count) {
+                    acc = acc + scores.flatGet(t) * (float32) vC.flatGet(
+                        (kvRowBase + (int64) from + t) * (int64) kvDim
+                        + kvHead + d);
+                    t = t + 1;
+                }
+                outv.flatSet(outOff + (int64) (h * headDim) + d, acc * rs);
+                d = d + 1;
+            }
+            h = h + 1;
+        }
+        return;
+    }
+
+    /**
+     * Ragged-batch attention kernel (spec 6.13): every query row carries
+     * its batch item (`seqOf`) and absolute position (`qPos`); item KV
+     * lives at row base `kvBase[item]` of the PACKED `k`/`v` buffers.
+     * Sequences of different lengths share this one launch with no
+     * padding; causality is by-construction (`t ≤ p`); `window` > 0
+     * clamps `from` in prefill and decode alike (5.9).
+     *
+     * One thread per (row, head, dim): two streaming passes with f32
+     * running max / sum / accumulator in registers — NO score
+     * materialization at any size (5.7, 5.8).
+     */
+    @Kernel
+    public static void attendF32(KernelBuffer<float32> out,
+            KernelBuffer<float32> q, KernelBuffer<float32> k,
+            KernelBuffer<float32> v, KernelBuffer<int32> seqOf,
+            KernelBuffer<int32> qPos, KernelBuffer<int32> kvBase,
+            uint32 totalRows, uint32 nH, uint32 nKv, uint32 hd,
+            int32 window, float32 scale) {
+        uint32 id = KernelThread.globalIdX();
+        uint32 lanes = totalRows * nH * hd;
+        if (id < lanes) {
+            uint32 r = id / (nH * hd);
+            uint32 rem = id % (nH * hd);
+            uint32 h = rem / hd;
+            uint32 d = rem % hd;
+            int32 item = seqOf[r];
+            int32 p = qPos[r];
+            int32 from = 0;
+            if (window > 0 && p + 1 > window) {
+                from = p + 1 - window;
+            }
+            uint32 kvDim = nKv * hd;
+            uint32 kvh = h / (nH / nKv);
+            uint32 qBase = r * (nH * hd) + h * hd;
+            uint32 base = (uint32) kvBase[item];
+            // Pass 1: running max of the scaled scores.
+            float32 mx = 0.0f - 3.0e38f;
+            int32 t = from;
+            while (t <= p) {
+                uint32 kRow = (base + (uint32) t) * kvDim + kvh * hd;
+                float32 s = 0.0f;
+                uint32 dd = 0;
+                while (dd < hd) {
+                    s = s + q[qBase + dd] * k[kRow + dd];
+                    dd = dd + 1;
+                }
+                s = s * scale;
+                if (s > mx) {
+                    mx = s;
+                }
+                t = t + 1;
+            }
+            // Pass 2: normalizer and the weighted V component together.
+            float32 l = 0.0f;
+            float32 acc = 0.0f;
+            t = from;
+            while (t <= p) {
+                uint32 kRow = (base + (uint32) t) * kvDim + kvh * hd;
+                float32 s = 0.0f;
+                uint32 dd = 0;
+                while (dd < hd) {
+                    s = s + q[qBase + dd] * k[kRow + dd];
+                    dd = dd + 1;
+                }
+                float32 e = Math.exp(s * scale - mx);
+                l = l + e;
+                acc = acc + e * v[kRow + d];
+                t = t + 1;
+            }
+            out[qBase + d] = acc / l;
+        }
+    }
+
+    /** {@link #attendF32} at f16 storage — accumulation stays f32 (5.7). */
+    @Kernel
+    public static void attendF16(KernelBuffer<float32> out,
+            KernelBuffer<float16> q, KernelBuffer<float16> k,
+            KernelBuffer<float16> v, KernelBuffer<int32> seqOf,
+            KernelBuffer<int32> qPos, KernelBuffer<int32> kvBase,
+            uint32 totalRows, uint32 nH, uint32 nKv, uint32 hd,
+            int32 window, float32 scale) {
+        uint32 id = KernelThread.globalIdX();
+        uint32 lanes = totalRows * nH * hd;
+        if (id < lanes) {
+            uint32 r = id / (nH * hd);
+            uint32 rem = id % (nH * hd);
+            uint32 h = rem / hd;
+            uint32 d = rem % hd;
+            int32 item = seqOf[r];
+            int32 p = qPos[r];
+            int32 from = 0;
+            if (window > 0 && p + 1 > window) {
+                from = p + 1 - window;
+            }
+            uint32 kvDim = nKv * hd;
+            uint32 kvh = h / (nH / nKv);
+            uint32 qBase = r * (nH * hd) + h * hd;
+            uint32 base = (uint32) kvBase[item];
+            float32 mx = 0.0f - 3.0e38f;
+            int32 t = from;
+            while (t <= p) {
+                uint32 kRow = (base + (uint32) t) * kvDim + kvh * hd;
+                float32 s = 0.0f;
+                uint32 dd = 0;
+                while (dd < hd) {
+                    s = s + (float32) q[qBase + dd] * (float32) k[kRow + dd];
+                    dd = dd + 1;
+                }
+                s = s * scale;
+                if (s > mx) {
+                    mx = s;
+                }
+                t = t + 1;
+            }
+            float32 l = 0.0f;
+            float32 acc = 0.0f;
+            t = from;
+            while (t <= p) {
+                uint32 kRow = (base + (uint32) t) * kvDim + kvh * hd;
+                float32 s = 0.0f;
+                uint32 dd = 0;
+                while (dd < hd) {
+                    s = s + (float32) q[qBase + dd] * (float32) k[kRow + dd];
+                    dd = dd + 1;
+                }
+                float32 e = Math.exp(s * scale - mx);
+                l = l + e;
+                acc = acc + e * (float32) v[kRow + d];
+                t = t + 1;
+            }
+            out[qBase + d] = acc / l;
+        }
+    }
+
+    /**
+     * Placement-routed ragged attention op (spec 6.13). `q` is
+     * `[totalRows, nH·hd]`; `k`/`v` are the packed caches; `seqOf`,
+     * `qPos` are `[totalRows]`; `kvBase` is `[items]` row bases. Returns
+     * `[totalRows, nH·hd]`. All-device → one kernel launch; otherwise the
+     * host floor loops rows over {@link #attendRowHost} with a scratch
+     * line sized to the longest attended span.
+     */
+    public static #Tensor<float32> attendRaggedF32Op(Tensor<float32> q,
+            Tensor<float32> k, Tensor<float32> v, Tensor<int32> seqOf,
+            Tensor<int32> qPos, Tensor<int32> kvBase,
+            int32 nH, int32 nKv, int32 hd, int32 window, float32 scale) {
+        Tensor<float32> out = Tensor.zerosLike<float32>(q);
+        int64 totalRows = seqOf.size();
+        if (Placement.pair("attend", "q", q.isOnGpu(), "k", k.isOnGpu())) {
+            out.gpu();
+            uint32 lanes = (uint32) (totalRows * (int64) nH * (int64) hd);
+            KernelStream s = KernelStream.current();
+            attendF32.launch(s, grid: [(lanes + 63) / 64], block: [64])
+                (out.deviceBuffer(), q.deviceBuffer(), k.deviceBuffer(),
+                 v.deviceBuffer(), seqOf.deviceBuffer(), qPos.deviceBuffer(),
+                 kvBase.deviceBuffer(), (uint32) totalRows,
+                 (uint32) nH, (uint32) nKv, (uint32) hd, window, scale);
+            s.sync();
+        } else {
+            // Scratch line sized to the longest attended span.
+            int32 longest = 1;
+            int64 r = 0;
+            while (r < totalRows) {
+                int32 p = qPos.flatGet(r);
+                int32 from = 0;
+                if (window > 0 && p + 1 > window) {
+                    from = p + 1 - window;
+                }
+                if (p + 1 - from > longest) {
+                    longest = p + 1 - from;
+                }
+                r = r + 1;
+            }
+            int64[] ss = heap int64[1];
+            ss[0] = (int64) longest;
+            Tensor<float32> scores = Tensor.zeros<float32>(ss);
+            r = 0;
+            while (r < totalRows) {
+                int32 p = qPos.flatGet(r);
+                int32 from = 0;
+                if (window > 0 && p + 1 > window) {
+                    from = p + 1 - window;
+                }
+                int64 base = (int64) kvBase.flatGet((int64) seqOf.flatGet(r));
+                Prim.attendRowHost(q, r * (int64) (nH * hd), k, v, base,
+                    from, p, scale, scores, out, r * (int64) (nH * hd),
+                    nH, nKv, hd);
+                r = r + 1;
+            }
+        }
+        return #out;
+    }
+
+    /**
+     * {@link #attendRaggedF32Op} at f16 STORAGE: q/k/v are f16, the
+     * result and every accumulation are f32 (spec 5.7). Same routing.
+     */
+    public static #Tensor<float32> attendRaggedF16Op(Tensor<float16> q,
+            Tensor<float16> k, Tensor<float16> v, Tensor<int32> seqOf,
+            Tensor<int32> qPos, Tensor<int32> kvBase,
+            int32 nH, int32 nKv, int32 hd, int32 window, float32 scale) {
+        int64 totalRows = seqOf.size();
+        int64[] os = heap int64[2];
+        os[0] = totalRows;
+        os[1] = (int64) (nH * hd);
+        Tensor<float32> out = Tensor.zeros<float32>(os);
+        if (Placement.pair("attend", "q", q.isOnGpu(), "k", k.isOnGpu())) {
+            out.gpu();
+            uint32 lanes = (uint32) (totalRows * (int64) nH * (int64) hd);
+            KernelStream s = KernelStream.current();
+            attendF16.launch(s, grid: [(lanes + 63) / 64], block: [64])
+                (out.deviceBuffer(), q.deviceBuffer(), k.deviceBuffer(),
+                 v.deviceBuffer(), seqOf.deviceBuffer(), qPos.deviceBuffer(),
+                 kvBase.deviceBuffer(), (uint32) totalRows,
+                 (uint32) nH, (uint32) nKv, (uint32) hd, window, scale);
+            s.sync();
+        } else {
+            int32 longest = 1;
+            int64 r = 0;
+            while (r < totalRows) {
+                int32 p = qPos.flatGet(r);
+                int32 from = 0;
+                if (window > 0 && p + 1 > window) {
+                    from = p + 1 - window;
+                }
+                if (p + 1 - from > longest) {
+                    longest = p + 1 - from;
+                }
+                r = r + 1;
+            }
+            int64[] ss = heap int64[1];
+            ss[0] = (int64) longest;
+            Tensor<float32> scores = Tensor.zeros<float32>(ss);
+            r = 0;
+            while (r < totalRows) {
+                int32 p = qPos.flatGet(r);
+                int32 from = 0;
+                if (window > 0 && p + 1 > window) {
+                    from = p + 1 - window;
+                }
+                int64 base = (int64) kvBase.flatGet((int64) seqOf.flatGet(r));
+                Prim.attendRowHostF16(q, r * (int64) (nH * hd), k, v, base,
+                    from, p, scale, scores, out, r * (int64) (nH * hd),
+                    nH, nKv, hd);
+                r = r + 1;
+            }
+        }
+        return #out;
+    }
+}

@@ -1,0 +1,528 @@
+package dev.cajeta.llama.selftest;
+
+import dev.cajeta.unit.Assert;
+import dev.cajeta.llama.LlamaException;
+import dev.cajeta.llama.model.ModelConfig;
+import dev.cajeta.llama.model.Prim;
+import cajeta.lang.Math;
+import cajeta.lang.String;
+import cajeta.math.Tensor;
+
+/**
+ * cajeta-llama plan Unit 7 TDD — transformer primitives (spec §5).
+ * References are computed IN-TEST at float64 through independent code
+ * paths, so a primitive bug and a reference bug cannot cancel; scaling
+ * variants are additionally pinned by structural identities (linear
+ * scaling at factor f equals the unscaled rotation at position p/f;
+ * yarn/llama3 leave high-frequency dims untouched and divide
+ * low-frequency dims exactly by the factor).
+ */
+public class PrimTest {
+
+    public PrimTest() { return; }
+
+    static #Tensor<float32> vec(float32[] v) {
+        int64[] s = heap int64[1];
+        s[0] = (int64) v.count();
+        Tensor<float32> t = Tensor.zeros<float32>(s);
+        int64 i = 0;
+        while (i < s[0]) {
+            t.flatSet(i, v[i]);
+            i = i + 1;
+        }
+        return #t;
+    }
+
+    static #Tensor<int32> ivec(int32[] v) {
+        int64[] s = heap int64[1];
+        s[0] = (int64) v.count();
+        Tensor<int32> t = Tensor.zeros<int32>(s);
+        int64 i = 0;
+        while (i < s[0]) {
+            t.flatSet(i, v[i]);
+            i = i + 1;
+        }
+        return #t;
+    }
+
+    static float64 fabs(float64 x) {
+        if (x < 0.0) {
+            return 0.0 - x;
+        }
+        return x;
+    }
+
+    // ── 7.1.1 — RMSNorm: rms over last axis, learned scale, no mean sub ─
+
+    @Test
+    public void rmsnormMatchesReferenceHostAndDevice() {
+        int32 rows = 3;
+        int32 dim = 8;
+        int64[] sh = heap int64[2];
+        sh[0] = (int64) rows;
+        sh[1] = (int64) dim;
+        Tensor<float32> x = Tensor.zeros<float32>(sh);
+        int64[] sw = heap int64[1];
+        sw[0] = (int64) dim;
+        Tensor<float32> w = Tensor.zeros<float32>(sw);
+        int64 i = 0;
+        while (i < (int64) (rows * dim)) {
+            x.flatSet(i, 0.25f * (float32) ((i * 3 + 1) % 11) - 1.0f);
+            i = i + 1;
+        }
+        i = 0;
+        while (i < (int64) dim) {
+            w.flatSet(i, 0.125f * (float32) (i + 1));
+            i = i + 1;
+        }
+        float32 eps = 0.000001f;
+
+        Tensor<float32> yh = Prim.rmsnormF32Op(x, w, eps, 0);
+
+        int32 r = 0;
+        while (r < rows) {
+            float64 ss = 0.0;
+            int32 d = 0;
+            while (d < dim) {
+                float64 v = (float64) x.flatGet((int64) (r * dim + d));
+                ss = ss + v * v;
+                d = d + 1;
+            }
+            float64 rms = Math.sqrt(ss / (float64) dim + (float64) eps);
+            d = 0;
+            while (d < dim) {
+                float64 want = (float64) x.flatGet((int64) (r * dim + d))
+                    / rms * (float64) w.flatGet((int64) d);
+                float64 got = (float64) yh.flatGet((int64) (r * dim + d));
+                Assert.isTrue(PrimTest.fabs(want - got) < 0.00001);
+                d = d + 1;
+            }
+            r = r + 1;
+        }
+
+        // Device path (CPU backend) agrees with the host path.
+        x.gpu();
+        w.gpu();
+        Tensor<float32> yd = Prim.rmsnormF32Op(x, w, eps, 0);
+        Assert.isTrue(yd.isOnGpu());
+        yd.cpu();
+        i = 0;
+        while (i < (int64) (rows * dim)) {
+            Assert.isTrue(PrimTest.fabs((float64) yh.flatGet(i)
+                - (float64) yd.flatGet(i)) < 0.00001);
+            i = i + 1;
+        }
+    }
+
+    // ── 7.1.11 — Gemma zero-centered (1+w) form, not the Llama form ─────
+
+    @Test
+    public void gemmaRmsnormIsZeroCenteredNotLlamaForm() {
+        int32 dim = 6;
+        int64[] sh = heap int64[2];
+        sh[0] = 2;
+        sh[1] = (int64) dim;
+        Tensor<float32> x = Tensor.zeros<float32>(sh);
+        int64 i = 0;
+        while (i < (int64) (2 * dim)) {
+            x.flatSet(i, 0.5f * (float32) ((i * 5 + 2) % 7) - 1.5f);
+            i = i + 1;
+        }
+        // Gemma checkpoints store weights NEAR ZERO (scale = 1 + w).
+        int64[] sw = heap int64[1];
+        sw[0] = (int64) dim;
+        Tensor<float32> w = Tensor.zeros<float32>(sw);
+        i = 0;
+        while (i < (int64) dim) {
+            w.flatSet(i, 0.03125f * (float32) (i - 3));
+            i = i + 1;
+        }
+        float32 eps = 0.000001f;
+        Tensor<float32> yg = Prim.rmsnormF32Op(x, w, eps, 1);
+        Tensor<float32> yl = Prim.rmsnormF32Op(x, w, eps, 0);
+
+        int32 r = 0;
+        while (r < 2) {
+            float64 ss = 0.0;
+            int32 d = 0;
+            while (d < dim) {
+                float64 v = (float64) x.flatGet((int64) (r * dim + d));
+                ss = ss + v * v;
+                d = d + 1;
+            }
+            float64 rms = Math.sqrt(ss / (float64) dim + (float64) eps);
+            d = 0;
+            while (d < dim) {
+                float64 want = (float64) x.flatGet((int64) (r * dim + d))
+                    / rms * (1.0 + (float64) w.flatGet((int64) d));
+                float64 got = (float64) yg.flatGet((int64) (r * dim + d));
+                Assert.isTrue(PrimTest.fabs(want - got) < 0.00001);
+                d = d + 1;
+            }
+            r = r + 1;
+        }
+        // Applying the Llama form to Gemma weights is plausible and WRONG
+        // (spec 5.12): near-zero weights nearly zero the output.
+        float64 maxDiff = 0.0;
+        i = 0;
+        while (i < (int64) (2 * dim)) {
+            float64 df = PrimTest.fabs((float64) yg.flatGet(i)
+                - (float64) yl.flatGet(i));
+            if (df > maxDiff) {
+                maxDiff = df;
+            }
+            i = i + 1;
+        }
+        Assert.isTrue(maxDiff > 0.1);
+    }
+
+    // ── 7.1.2 — RoPE rotation at position p for the layer's theta base ──
+
+    @Test
+    public void ropeMatchesReferenceRotation() {
+        int32 hd = 8;
+        int32 half = 4;
+        float32[] xv = heap float32[8];
+        int32 j = 0;
+        while (j < 8) {
+            xv[j] = 0.25f * (float32) (j + 1) - 1.0f;
+            j = j + 1;
+        }
+        int64[] sh = heap int64[2];
+        sh[0] = 1;
+        sh[1] = 8;
+        Tensor<float32> t = Tensor.zeros<float32>(sh);
+        int64 i = 0;
+        while (i < 8) {
+            t.flatSet(i, xv[(int32) i]);
+            i = i + 1;
+        }
+        float32[] inv = Prim.invFreq(hd, 10000.0f, 0, 1.0f, 1.0f, 4.0f, 0);
+        Tensor<float32> invT = PrimTest.vec(inv);
+        int32[] pv = heap int32[1];
+        pv[0] = 7;
+        Tensor<int32> pos = PrimTest.ivec(pv);
+        Prim.ropeF32Op(t, pos, invT, 1, hd);
+
+        int32 d = 0;
+        while (d < half) {
+            float64 f = Math.pow(10000.0,
+                (0.0 - (float64) (2 * d)) / (float64) hd);
+            float64 ang = 7.0 * f;
+            float64 c = Math.cos(ang);
+            float64 s = Math.sin(ang);
+            float64 a = (float64) xv[d];
+            float64 b = (float64) xv[d + half];
+            float64 wantA = a * c - b * s;
+            float64 wantB = a * s + b * c;
+            Assert.isTrue(PrimTest.fabs(wantA
+                - (float64) t.flatGet((int64) d)) < 0.00001);
+            Assert.isTrue(PrimTest.fabs(wantB
+                - (float64) t.flatGet((int64) (d + half))) < 0.00001);
+            d = d + 1;
+        }
+
+        // A different theta base rotates differently (spec 5.2: the
+        // LAYER's base, not a global).
+        Tensor<float32> t2 = Tensor.zeros<float32>(sh);
+        i = 0;
+        while (i < 8) {
+            t2.flatSet(i, xv[(int32) i]);
+            i = i + 1;
+        }
+        float32[] inv2 = Prim.invFreq(hd, 500.0f, 0, 1.0f, 1.0f, 4.0f, 0);
+        Tensor<float32> invT2 = PrimTest.vec(inv2);
+        Prim.ropeF32Op(t2, pos, invT2, 1, hd);
+        float64 md = 0.0;
+        i = 0;
+        while (i < 8) {
+            float64 df = PrimTest.fabs((float64) t.flatGet(i)
+                - (float64) t2.flatGet(i));
+            if (df > md) {
+                md = df;
+            }
+            i = i + 1;
+        }
+        Assert.isTrue(md > 0.001);
+    }
+
+    // ── 7.1.3 — declared RoPE scaling: linear, ntk, yarn, llama3 ────────
+
+    @Test
+    public void ropeScalingVariantsMatchTheirContracts() {
+        int32 hd = 16;
+        int32 half = 8;
+        float32 th = 10000.0f;
+        float32[] base = Prim.invFreq(hd, th, 0, 1.0f, 1.0f, 4.0f, 0);
+        Assert.isTrue(base[0] == 1.0f);
+
+        // LINEAR factor 2: rotating at position 8 equals the unscaled
+        // rotation at position 4 — the defining identity.
+        float32[] lin = Prim.invFreq(hd, th, 1, 2.0f, 1.0f, 4.0f, 0);
+        int64[] sh = heap int64[2];
+        sh[0] = 1;
+        sh[1] = (int64) hd;
+        Tensor<float32> a = Tensor.zeros<float32>(sh);
+        Tensor<float32> b = Tensor.zeros<float32>(sh);
+        int64 i = 0;
+        while (i < (int64) hd) {
+            float32 v = 0.125f * (float32) ((i * 7 + 3) % 9) - 0.5f;
+            a.flatSet(i, v);
+            b.flatSet(i, v);
+            i = i + 1;
+        }
+        int32[] p8 = heap int32[1];
+        p8[0] = 8;
+        int32[] p4 = heap int32[1];
+        p4[0] = 4;
+        Prim.ropeF32Op(a, PrimTest.ivec(p8), PrimTest.vec(lin), 1, hd);
+        Prim.ropeF32Op(b, PrimTest.ivec(p4), PrimTest.vec(base), 1, hd);
+        i = 0;
+        while (i < (int64) hd) {
+            Assert.isTrue(PrimTest.fabs((float64) a.flatGet(i)
+                - (float64) b.flatGet(i)) < 0.000001);
+            i = i + 1;
+        }
+
+        // NTK factor 4: the theta base rescales by factor^(hd/(hd-2)).
+        float32[] ntk = Prim.invFreq(hd, th, 2, 4.0f, 1.0f, 4.0f, 0);
+        Assert.isTrue(ntk[0] == 1.0f);
+        float64 base2 = 10000.0 * Math.pow(4.0, 16.0 / 14.0);
+        int32 d = 1;
+        while (d < half) {
+            float64 want = Math.pow(base2,
+                (0.0 - (float64) (2 * d)) / 16.0);
+            Assert.isTrue(PrimTest.fabs((float64) ntk[d] - want)
+                / want < 0.0001);
+            d = d + 1;
+        }
+
+        // YARN factor 2, beta_slow 1, beta_fast 32, origMax 4096:
+        // high-frequency dims stay unscaled, low-frequency dims divide by
+        // the factor, the ramp sits strictly between.
+        float32[] yarn = Prim.invFreq(hd, th, 3, 2.0f, 1.0f, 32.0f, 4096);
+        d = 0;
+        while (d < half) {
+            float64 bf = (float64) base[d];
+            float64 r = 4096.0 * bf / 6.2831853;
+            float64 got = (float64) yarn[d];
+            if (r >= 32.0) {
+                Assert.isTrue(PrimTest.fabs(got - bf) / bf < 0.0001);
+            } else if (r <= 1.0) {
+                Assert.isTrue(PrimTest.fabs(got - bf / 2.0)
+                    / (bf / 2.0) < 0.0001);
+            } else {
+                Assert.isTrue(got > bf / 2.0);
+                Assert.isTrue(got < bf);
+            }
+            d = d + 1;
+        }
+
+        // LLAMA3 factor 8, low_freq_factor 1, high_freq_factor 4,
+        // origMax 8192: piecewise by wavelength with a smooth middle.
+        float32[] l3 = Prim.invFreq(hd, th, 4, 8.0f, 1.0f, 4.0f, 8192);
+        d = 0;
+        while (d < half) {
+            float64 bf = (float64) base[d];
+            float64 wl = 6.2831853 / bf;
+            float64 got = (float64) l3[d];
+            if (wl > 8192.0) {
+                Assert.isTrue(PrimTest.fabs(got - bf / 8.0)
+                    / (bf / 8.0) < 0.0001);
+            } else if (wl < 2048.0) {
+                Assert.isTrue(PrimTest.fabs(got - bf) / bf < 0.0001);
+            } else {
+                Assert.isTrue(got > bf / 8.0);
+                Assert.isTrue(got < bf * 1.0001);
+            }
+            d = d + 1;
+        }
+    }
+
+    // ── 7.1.4 — SwiGLU and GeGLU, selected by config ────────────────────
+
+    @Test
+    public void gluMatchesReferencesAndConfigSelects() {
+        int32 n = 8;
+        float32[] gv = heap float32[8];
+        float32[] uv = heap float32[8];
+        int32 j = 0;
+        while (j < 8) {
+            gv[j] = 0.75f * (float32) (j - 4);
+            uv[j] = 0.5f * (float32) (j + 1) - 2.0f;
+            j = j + 1;
+        }
+        Tensor<float32> g = PrimTest.vec(gv);
+        Tensor<float32> u = PrimTest.vec(uv);
+
+        Tensor<float32> ys = Prim.gluF32Op(g, u, 0);
+        Tensor<float32> yg = Prim.gluF32Op(g, u, 1);
+        int32 d = 0;
+        while (d < n) {
+            float64 x = (float64) gv[d];
+            float64 silu = x / (1.0 + Math.exp(0.0 - x));
+            float64 wantS = silu * (float64) uv[d];
+            Assert.isTrue(PrimTest.fabs(wantS
+                - (float64) ys.flatGet((int64) d)) < 0.00001);
+            float64 t = 0.79788456080286536 * (x + 0.044715 * x * x * x);
+            float64 e2 = Math.exp(2.0 * t);
+            float64 tanh = (e2 - 1.0) / (e2 + 1.0);
+            float64 gelu = 0.5 * x * (1.0 + tanh);
+            float64 wantG = gelu * (float64) uv[d];
+            Assert.isTrue(PrimTest.fabs(wantG
+                - (float64) yg.flatGet((int64) d)) < 0.0001);
+            d = d + 1;
+        }
+
+        // Device path agrees for both activations.
+        g.gpu();
+        u.gpu();
+        Tensor<float32> ysd = Prim.gluF32Op(g, u, 0);
+        Tensor<float32> ygd = Prim.gluF32Op(g, u, 1);
+        ysd.cpu();
+        ygd.cpu();
+        int64 i = 0;
+        while (i < (int64) n) {
+            Assert.isTrue(PrimTest.fabs((float64) ys.flatGet(i)
+                - (float64) ysd.flatGet(i)) < 0.00001);
+            Assert.isTrue(PrimTest.fabs((float64) yg.flatGet(i)
+                - (float64) ygd.flatGet(i)) < 0.00001);
+            i = i + 1;
+        }
+
+        // Config selection (spec 5.4): gelu_pytorch_tanh maps to GeGLU,
+        // anything unknown errors naming itself and the supported set.
+        String cfgPath = "/tmp/cajeta_llama_prim_act_cfg.json";
+        ToyModel.writeConfigX(cfgPath, "LlamaForCausalLM", 32, 64, 1, 2, 1,
+            0, 32, 16, false, "\"hidden_act\":\"gelu_pytorch_tanh\",");
+        ModelConfig cfg = ModelConfig.parse(cfgPath);
+        Assert.equals((int64) 1, (int64) cfg.activation);
+        String badPath = "/tmp/cajeta_llama_prim_actbad_cfg.json";
+        ToyModel.writeConfigX(badPath, "LlamaForCausalLM", 32, 64, 1, 2, 1,
+            0, 32, 16, false, "\"hidden_act\":\"relu\",");
+        boolean threw = false;
+        String msg = "";
+        try {
+            ModelConfig cfg2 = ModelConfig.parse(badPath);
+            Assert.isTrue(cfg2 == null);
+        } catch (LlamaException ex) {
+            threw = true;
+            msg = ex.message;
+        }
+        Assert.isTrue(threw);
+        Assert.isTrue(msg.contains("relu"));
+        Assert.isTrue(msg.contains("silu"));
+    }
+
+    // ── 7.1.7 — softmax accumulates f32 at f16 storage ──────────────────
+
+    @Test
+    public void softmaxAccumulatesF32AtF16Storage() {
+        // 4096 keys with EQUAL scores; V is +2 for the first half and -2
+        // for the second, so the true attention output is exactly 0. An
+        // f16 accumulator stalls on the +2 ramp around 4096 (ulp 4) and
+        // cannot ride it back down — only f32 accumulation lands near 0.
+        int32 tt = 4096;
+        int32 hd = 4;
+        int64[] qs = heap int64[2];
+        qs[0] = 1;
+        qs[1] = (int64) hd;
+        Tensor<float16> q = Tensor.zeros<float16>(qs);
+        int64 i = 0;
+        while (i < (int64) hd) {
+            q.flatSet(i, (float16) 0.25f);
+            i = i + 1;
+        }
+        int64[] ks = heap int64[2];
+        ks[0] = (int64) tt;
+        ks[1] = (int64) hd;
+        Tensor<float16> k = Tensor.zeros<float16>(ks);
+        Tensor<float16> v = Tensor.zeros<float16>(ks);
+        i = 0;
+        while (i < (int64) (tt * hd)) {
+            k.flatSet(i, (float16) 0.25f);
+            i = i + 1;
+        }
+        int32 t = 0;
+        while (t < tt) {
+            float32 vv = 2.0f;
+            if (t >= tt / 2) {
+                vv = 0.0f - 2.0f;
+            }
+            int32 d = 0;
+            while (d < hd) {
+                v.flatSet((int64) (t * hd + d), (float16) vv);
+                d = d + 1;
+            }
+            t = t + 1;
+        }
+        int32[] so = heap int32[1];
+        so[0] = 0;
+        int32[] qp = heap int32[1];
+        qp[0] = tt - 1;
+        int32[] kb = heap int32[1];
+        kb[0] = 0;
+        Tensor<float32> out = Prim.attendRaggedF16Op(q, k, v,
+            PrimTest.ivec(so), PrimTest.ivec(qp), PrimTest.ivec(kb),
+            1, 1, hd, 0, 0.5f);
+        int32 d = 0;
+        while (d < hd) {
+            Assert.isTrue(PrimTest.fabs(
+                (float64) out.flatGet((int64) d)) < 0.01);
+            d = d + 1;
+        }
+
+        // Same discriminator through the f16 KERNEL on the CPU backend.
+        int32 tk = 256;
+        int64[] ks2 = heap int64[2];
+        ks2[0] = (int64) tk;
+        ks2[1] = (int64) hd;
+        Tensor<float16> k2 = Tensor.zeros<float16>(ks2);
+        Tensor<float16> v2 = Tensor.zeros<float16>(ks2);
+        i = 0;
+        while (i < (int64) (tk * hd)) {
+            k2.flatSet(i, (float16) 0.25f);
+            i = i + 1;
+        }
+        t = 0;
+        while (t < tk) {
+            float32 vv = 2.0f;
+            if (t >= tk / 2) {
+                vv = 0.0f - 2.0f;
+            }
+            int32 dd = 0;
+            while (dd < hd) {
+                v2.flatSet((int64) (t * hd + dd), (float16) vv);
+                dd = dd + 1;
+            }
+            t = t + 1;
+        }
+        Tensor<float16> q2 = Tensor.zeros<float16>(qs);
+        i = 0;
+        while (i < (int64) hd) {
+            q2.flatSet(i, (float16) 0.25f);
+            i = i + 1;
+        }
+        int32[] qp2 = heap int32[1];
+        qp2[0] = tk - 1;
+        Tensor<int32> soT = PrimTest.ivec(so);
+        Tensor<int32> qpT = PrimTest.ivec(qp2);
+        Tensor<int32> kbT = PrimTest.ivec(kb);
+        q2.gpu();
+        k2.gpu();
+        v2.gpu();
+        soT.gpu();
+        qpT.gpu();
+        kbT.gpu();
+        Tensor<float32> outD = Prim.attendRaggedF16Op(q2, k2, v2,
+            soT, qpT, kbT, 1, 1, hd, 0, 0.5f);
+        Assert.isTrue(outD.isOnGpu());
+        outD.cpu();
+        d = 0;
+        while (d < hd) {
+            Assert.isTrue(PrimTest.fabs(
+                (float64) outD.flatGet((int64) d)) < 0.01);
+            d = d + 1;
+        }
+    }
+}

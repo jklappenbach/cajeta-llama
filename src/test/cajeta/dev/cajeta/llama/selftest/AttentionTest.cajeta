@@ -1,0 +1,618 @@
+package dev.cajeta.llama.selftest;
+
+import dev.cajeta.unit.Assert;
+import dev.cajeta.llama.io.Checkpoint;
+import dev.cajeta.llama.model.LlamaForCausalLM;
+import dev.cajeta.llama.model.ModelConfig;
+import dev.cajeta.llama.model.Prim;
+import cajeta.collection.ArrayList;
+import cajeta.lang.Cajeta;
+import cajeta.lang.Math;
+import cajeta.lang.String;
+import cajeta.math.Tensor;
+
+/**
+ * cajeta-llama plan Unit 7 TDD — attention behavior (spec 5.5, 5.6, 5.8,
+ * 5.9, 5.13) and the block wiring (5.10, 5.11), including the model-level
+ * windowed-decode gate the spec calls out as the silent failure.
+ */
+public class AttentionTest {
+
+    public AttentionTest() { return; }
+
+    static float64 fabs(float64 x) {
+        if (x < 0.0) {
+            return 0.0 - x;
+        }
+        return x;
+    }
+
+    /**
+     * float64 reference attention for one query row and one query head,
+     * with EXPLICITLY MATERIALIZED per-query-head K/V (the repeat the
+     * engine must never allocate): keys `[from, p]` of the packed
+     * `[*, nKv·hd]` caches, head `kvh`, scale `sc`. Writes `outRef[hd]`.
+     */
+    static void refHead(Tensor<float32> q, int64 qBase, Tensor<float32> k,
+            Tensor<float32> v, int64 kvRowBase, int32 kvDim, int32 kvh,
+            int32 hd, int32 from, int32 p, float64 sc, float64[] outRef) {
+        int32 count = p + 1 - from;
+        // Materialized repeat: copy this head's K/V run into flat f64.
+        float64[] rk = heap float64[count * hd];
+        float64[] rv = heap float64[count * hd];
+        int32 t = 0;
+        while (t < count) {
+            int64 row = (kvRowBase + (int64) (from + t)) * (int64) kvDim
+                + (int64) (kvh * hd);
+            int32 d = 0;
+            while (d < hd) {
+                rk[t * hd + d] = (float64) k.flatGet(row + (int64) d);
+                rv[t * hd + d] = (float64) v.flatGet(row + (int64) d);
+                d = d + 1;
+            }
+            t = t + 1;
+        }
+        float64[] sc2 = heap float64[count];
+        float64 mx = 0.0 - 1.0e300;
+        t = 0;
+        while (t < count) {
+            float64 s = 0.0;
+            int32 d = 0;
+            while (d < hd) {
+                s = s + (float64) q.flatGet(qBase + (int64) d)
+                    * rk[t * hd + d];
+                d = d + 1;
+            }
+            s = s * sc;
+            sc2[t] = s;
+            if (s > mx) {
+                mx = s;
+            }
+            t = t + 1;
+        }
+        float64 sum = 0.0;
+        t = 0;
+        while (t < count) {
+            sc2[t] = Math.exp(sc2[t] - mx);
+            sum = sum + sc2[t];
+            t = t + 1;
+        }
+        int32 d = 0;
+        while (d < hd) {
+            float64 acc = 0.0;
+            t = 0;
+            while (t < count) {
+                acc = acc + sc2[t] * rv[t * hd + d];
+                t = t + 1;
+            }
+            outRef[d] = acc / sum;
+            d = d + 1;
+        }
+        return;
+    }
+
+    static #Tensor<float32> filled2(int32 rows, int32 cols, int32 seed) {
+        int64[] s = heap int64[2];
+        s[0] = (int64) rows;
+        s[1] = (int64) cols;
+        Tensor<float32> t = Tensor.zeros<float32>(s);
+        int64 i = 0;
+        while (i < (int64) (rows * cols)) {
+            t.flatSet(i, 0.0625f
+                * (float32) (((i + (int64) seed) * 7 + 3) % 15) - 0.4375f);
+            i = i + 1;
+        }
+        return #t;
+    }
+
+    static #Tensor<int32> ivec(int32[] v) {
+        int64[] s = heap int64[1];
+        s[0] = (int64) v.count();
+        Tensor<int32> t = Tensor.zeros<int32>(s);
+        int64 i = 0;
+        while (i < s[0]) {
+            t.flatSet(i, v[i]);
+            i = i + 1;
+        }
+        return #t;
+    }
+
+    // ── 7.1.5 — GQA shares KV heads with NO repeat tensor ───────────────
+
+    @Test
+    public void gqaMatchesRepeatedKvReferenceWithoutRepeatTensor() {
+        int32 nH = 8;
+        int32 nKv = 2;
+        int32 hd = 16;
+        int32 tt = 512;
+        Tensor<float32> q = AttentionTest.filled2(1, nH * hd, 1);
+        Tensor<float32> k = AttentionTest.filled2(tt, nKv * hd, 2);
+        Tensor<float32> v = AttentionTest.filled2(tt, nKv * hd, 3);
+        int32[] so = heap int32[1];
+        so[0] = 0;
+        int32[] qp = heap int32[1];
+        qp[0] = tt - 1;
+        int32[] kb = heap int32[1];
+        kb[0] = 0;
+        Tensor<int32> soT = AttentionTest.ivec(so);
+        Tensor<int32> qpT = AttentionTest.ivec(qp);
+        Tensor<int32> kbT = AttentionTest.ivec(kb);
+        float32 sc = 0.25f;
+
+        int64 b0 = Cajeta.allocatedBytes();
+        Tensor<float32> out = Prim.attendRaggedF32Op(q, k, v, soT, qpT,
+            kbT, nH, nKv, hd, 0, sc);
+        int64 delta = Cajeta.allocatedBytes() - b0;
+        // A materialized per-query-head repeat of K and V would cost
+        // 2·nH·T·hd·4 = 512 KiB here; the op's own allocations (the
+        // [1, nH·hd] result + a [T] scratch line + headers) stay far
+        // under it.
+        Assert.isTrue(delta < 65536);
+
+        float64[] outRef = heap float64[hd];
+        int32 h = 0;
+        while (h < nH) {
+            int32 kvh = h / (nH / nKv);
+            AttentionTest.refHead(q, (int64) (h * hd), k, v, 0,
+                nKv * hd, kvh, hd, 0, tt - 1, (float64) sc, outRef);
+            int32 d = 0;
+            while (d < hd) {
+                Assert.isTrue(AttentionTest.fabs(outRef[d]
+                    - (float64) out.flatGet((int64) (h * hd + d))) < 0.0001);
+                d = d + 1;
+            }
+            h = h + 1;
+        }
+    }
+
+    // ── 7.1.6 + 7.1.8 — causal prefill; decode builds no mask; bounded ──
+
+    @Test
+    public void causalPrefillMatchesReferenceWithBoundedScratch() {
+        int32 nH = 4;
+        int32 nKv = 2;
+        int32 hd = 8;
+        int32 tt = 64;
+        Tensor<float32> q = AttentionTest.filled2(tt, nH * hd, 5);
+        Tensor<float32> k = AttentionTest.filled2(tt, nKv * hd, 6);
+        Tensor<float32> v = AttentionTest.filled2(tt, nKv * hd, 7);
+        int32[] so = heap int32[64];
+        int32[] qp = heap int32[64];
+        int32 r = 0;
+        while (r < tt) {
+            so[r] = 0;
+            qp[r] = r;
+            r = r + 1;
+        }
+        int32[] kb = heap int32[1];
+        kb[0] = 0;
+        float32 sc = 1.0f / Math.sqrt((float32) hd);
+
+        int64 b0 = Cajeta.allocatedBytes();
+        Tensor<float32> out = Prim.attendRaggedF32Op(q, k, v,
+            AttentionTest.ivec(so), AttentionTest.ivec(qp),
+            AttentionTest.ivec(kb), nH, nKv, hd, 0, sc);
+        int64 delta = Cajeta.allocatedBytes() - b0;
+        // 7.1.8: the full (heads, T, T) score matrix would be 64 KiB —
+        // the op allocates the [T, nH·hd] result (8 KiB), one [T] score
+        // line and headers. No mask tensor exists for any row: causality
+        // is `t ≤ p` by construction (5.6), decode included.
+        Assert.isTrue(delta < 32768);
+
+        // Causal correctness: every row r attends exactly [0, r].
+        float64[] outRef = heap float64[hd];
+        r = 0;
+        while (r < tt) {
+            int32 h = 0;
+            while (h < nH) {
+                int32 kvh = h / (nH / nKv);
+                AttentionTest.refHead(q, (int64) (r * nH * hd + h * hd),
+                    k, v, 0, nKv * hd, kvh, hd, 0, r, (float64) sc, outRef);
+                int32 d = 0;
+                while (d < hd) {
+                    Assert.isTrue(AttentionTest.fabs(outRef[d]
+                        - (float64) out.flatGet(
+                            (int64) (r * nH * hd + h * hd + d))) < 0.0001);
+                    d = d + 1;
+                }
+                h = h + 1;
+            }
+            r = r + 8;   // sample rows; full sweep is the ragged test
+        }
+    }
+
+    // ── 7.1.13 — a finite window clamps decode too, not only prefill ────
+
+    @Test
+    public void windowedAttendsOnlyLastWTokens() {
+        int32 hd = 4;
+        int32 tt = 24;
+        int32 w = 8;
+        Tensor<float32> q = AttentionTest.filled2(1, hd, 9);
+        Tensor<float32> k = AttentionTest.filled2(tt, hd, 10);
+        int64[] vs = heap int64[2];
+        vs[0] = (int64) tt;
+        vs[1] = (int64) hd;
+        Tensor<float32> v = Tensor.zeros<float32>(vs);
+        // Poison V outside the window of decode position 20 ([13, 20]);
+        // sane values inside.
+        int32 t = 0;
+        while (t < tt) {
+            float32 val = 0.125f * (float32) (t % 5) - 0.25f;
+            if (t < 13) {
+                val = 1000000.0f;
+            }
+            int32 d = 0;
+            while (d < hd) {
+                v.flatSet((int64) (t * hd + d), val);
+                d = d + 1;
+            }
+            t = t + 1;
+        }
+        int32[] so = heap int32[1];
+        so[0] = 0;
+        int32[] qp = heap int32[1];
+        qp[0] = 20;
+        int32[] kb = heap int32[1];
+        kb[0] = 0;
+        float32 sc = 0.5f;
+        Tensor<float32> out = Prim.attendRaggedF32Op(q, k, v,
+            AttentionTest.ivec(so), AttentionTest.ivec(qp),
+            AttentionTest.ivec(kb), 1, 1, hd, w, sc);
+        // Any out-of-window leakage drags the output toward 10^6.
+        float64[] outRef = heap float64[hd];
+        AttentionTest.refHead(q, 0, k, v, 0, hd, 0, hd, 13, 20,
+            (float64) sc, outRef);
+        int32 d = 0;
+        while (d < hd) {
+            float64 got = (float64) out.flatGet((int64) d);
+            Assert.isTrue(AttentionTest.fabs(got) < 1000.0);
+            Assert.isTrue(AttentionTest.fabs(got - outRef[d]) < 0.0001);
+            d = d + 1;
+        }
+
+        // Before the window binds (p=5 < w) the clamp is inert: the
+        // windowed result equals the full causal reference.
+        int32[] qp2 = heap int32[1];
+        qp2[0] = 5;
+        Tensor<float32> q2 = AttentionTest.filled2(1, hd, 11);
+        Tensor<float32> out2 = Prim.attendRaggedF32Op(q2, k, v,
+            AttentionTest.ivec(so), AttentionTest.ivec(qp2),
+            AttentionTest.ivec(kb), 1, 1, hd, w, sc);
+        AttentionTest.refHead(q2, 0, k, v, 0, hd, 0, hd, 0, 5,
+            (float64) sc, outRef);
+        d = 0;
+        while (d < hd) {
+            Assert.isTrue(AttentionTest.fabs(outRef[d]
+                - (float64) out2.flatGet((int64) d)) < 0.0001);
+            d = d + 1;
+        }
+    }
+
+    // ── 7.1.13 at the MODEL level: the silent decode-past-w failure ─────
+
+    @Test
+    public void windowedLayerMasksInDecodePastW() {
+        String cfgU = "/tmp/cajeta_llama_att_win_u_cfg.json";
+        String cfgW = "/tmp/cajeta_llama_att_win_w_cfg.json";
+        String st = "/tmp/cajeta_llama_att_win.safetensors";
+        ToyModel.writeConfig(cfgU, "LlamaForCausalLM", 32, 64, 2, 2, 1, 0,
+            48, 64, false);
+        ToyModel.writeConfigX(cfgW, "LlamaForCausalLM", 32, 64, 2, 2, 1, 0,
+            48, 64, false, "\"sliding_window\":8,");
+        ToyModel s = ToyModel.spec(2, 32, 64, 2, 1, 16, 48, false);
+        ToyModel.writeWeights(st, s);
+        LlamaForCausalLM mu = LlamaForCausalLM.load(cfgU, st, 64, false);
+        LlamaForCausalLM mw = LlamaForCausalLM.load(cfgW, st, 64, false);
+
+        int32[] toks = heap int32[4];
+        toks[0] = 1;
+        toks[1] = 9;
+        toks[2] = 2;
+        toks[3] = 17;
+        int32 nu = mu.prefill(toks, 4);
+        int32 nw = mw.prefill(toks, 4);
+        // Inside the window the clamp is inert: identical logits.
+        Assert.equals((int64) nu, (int64) nw);
+        Tensor<float32> lu = mu.logits();
+        Tensor<float32> lw = mw.logits();
+        int64 i = 0;
+        while (i < 48) {
+            Assert.isTrue(lu.flatGet(i) == lw.flatGet(i));
+            i = i + 1;
+        }
+
+        // Decode to position 20 — past w=8. An implementation that
+        // windows only prefill stays IDENTICAL here; the real clamp
+        // diverges the logits (spec 5.9's silent failure, made loud).
+        int32 tu = nu;
+        int32 tw = nw;
+        int32 step = 0;
+        while (step < 16) {
+            tu = mu.decodeStep(tu);
+            tw = mw.decodeStep(tw);
+            step = step + 1;
+        }
+        float64 md = 0.0;
+        i = 0;
+        while (i < 48) {
+            float64 df = AttentionTest.fabs((float64) lu.flatGet(i)
+                - (float64) lw.flatGet(i));
+            if (df > md) {
+                md = df;
+            }
+            i = i + 1;
+        }
+        Assert.isTrue(md > 0.000001);
+    }
+
+    // ── 7.1.12 — a declared query scale overrides 1/sqrt(head_dim) ──────
+
+    @Test
+    public void queryScaleOverridesDefault() {
+        int32 hd = 4;
+        int32 tt = 6;
+        Tensor<float32> q = AttentionTest.filled2(1, hd, 13);
+        Tensor<float32> k = AttentionTest.filled2(tt, hd, 14);
+        Tensor<float32> v = AttentionTest.filled2(tt, hd, 15);
+        int32[] so = heap int32[1];
+        so[0] = 0;
+        int32[] qp = heap int32[1];
+        qp[0] = tt - 1;
+        int32[] kb = heap int32[1];
+        kb[0] = 0;
+        Tensor<int32> soT = AttentionTest.ivec(so);
+        Tensor<int32> qpT = AttentionTest.ivec(qp);
+        Tensor<int32> kbT = AttentionTest.ivec(kb);
+
+        Tensor<float32> outD = Prim.attendRaggedF32Op(q, k, v, soT, qpT,
+            kbT, 1, 1, hd, 0, 0.5f);
+        Tensor<float32> outC = Prim.attendRaggedF32Op(q, k, v, soT, qpT,
+            kbT, 1, 1, hd, 0, 0.125f);
+        float64[] outRef = heap float64[hd];
+        AttentionTest.refHead(q, 0, k, v, 0, hd, 0, hd, 0, tt - 1,
+            0.125, outRef);
+        float64 md = 0.0;
+        int32 d = 0;
+        while (d < hd) {
+            Assert.isTrue(AttentionTest.fabs(outRef[d]
+                - (float64) outC.flatGet((int64) d)) < 0.0001);
+            float64 df = AttentionTest.fabs((float64) outD.flatGet((int64) d)
+                - (float64) outC.flatGet((int64) d));
+            if (df > md) {
+                md = df;
+            }
+            d = d + 1;
+        }
+        Assert.isTrue(md > 0.000001);
+
+        // Config: Gemma's query_pre_attn_scalar becomes 1/sqrt(scalar).
+        String cfgPath = "/tmp/cajeta_llama_att_qs_cfg.json";
+        ToyModel.writeConfigX(cfgPath, "LlamaForCausalLM", 32, 64, 1, 2, 1,
+            0, 32, 16, false, "\"query_pre_attn_scalar\":64,");
+        ModelConfig cfg = ModelConfig.parse(cfgPath);
+        Assert.isTrue(AttentionTest.fabs((float64) cfg.queryScale
+            - 0.125) < 0.000001);
+    }
+
+    // ── 7.1.9 + 7.1.10 — block wiring: two-norm and four-norm, QK-norm ──
+
+    /**
+     * Composes the expected block pipeline from PUBLIC pieces —
+     * `Tensor.matmul`, `Prim.rmsnormF32Op` / `ropeF32Op` / `gluF32Op` /
+     * `attendRaggedF32Op` — over the model's own bound weights, and
+     * demands the model's prefill logits match. A wiring mistake in
+     * `forwardRows` (wrong norm order, rope before QK-norm, post-norms on
+     * the wrong tensor, wrong activation) diverges immediately.
+     */
+    static void assertBlockMatchesComposition(String cfgPath, String stPath,
+            boolean qkNorm, boolean fourNorm, int32 normForm, int32 act) {
+        ModelConfig cfg = ModelConfig.parse(cfgPath);
+        cfg.qkNorm = qkNorm;
+        cfg.fourNorm = fourNorm;
+        cfg.normForm = normForm;
+        cfg.activation = act;
+        int32 h = cfg.hiddenSize;
+        int32 nH = cfg.numHeads;
+        int32 nKv = cfg.numKvHeads;
+        int32 hd = cfg.headDim;
+        int32 vocab = cfg.vocabSize;
+        float32 eps = cfg.rmsNormEps;
+        LlamaForCausalLM m = heap LlamaForCausalLM(#cfg, 32);
+        Checkpoint ck = Checkpoint.open(stPath);
+        m.bind(ck, false);
+        ck.close();
+
+        ArrayList<String> names = m.parameterNames();
+        ArrayList<Tensor<float32>> ts = m.parameterTensors();
+
+        int32[] toks = heap int32[2];
+        toks[0] = 1;
+        toks[1] = 3;
+        int32 got = m.prefill(toks, 2);
+        Tensor<float32> gotLogits = m.logits();
+
+        // ── Reference composition ──
+        Tensor<float32> emb = ts.get(AttentionTest.idx(names,
+            "model.embed_tokens.weight"));
+        int64[] xs = heap int64[2];
+        xs[0] = 2;
+        xs[1] = (int64) h;
+        Tensor<float32> x = Tensor.zeros<float32>(xs);
+        int32 r = 0;
+        while (r < 2) {
+            int32 d = 0;
+            while (d < h) {
+                x.flatSet((int64) (r * h + d),
+                    emb.get2((int64) toks[r], (int64) d));
+                d = d + 1;
+            }
+            r = r + 1;
+        }
+        String p = "model.layers.0.";
+        Tensor<float32> wq = ts.get(AttentionTest.idx(names,
+            p + "self_attn.q_proj.weight"));
+        Tensor<float32> wk = ts.get(AttentionTest.idx(names,
+            p + "self_attn.k_proj.weight"));
+        Tensor<float32> wv = ts.get(AttentionTest.idx(names,
+            p + "self_attn.v_proj.weight"));
+        Tensor<float32> wo = ts.get(AttentionTest.idx(names,
+            p + "self_attn.o_proj.weight"));
+        Tensor<float32> wIn = ts.get(AttentionTest.idx(names,
+            p + "input_layernorm.weight"));
+        Tensor<float32> wPa = ts.get(AttentionTest.idx(names,
+            p + "post_attention_layernorm.weight"));
+        Tensor<float32> wGate = ts.get(AttentionTest.idx(names,
+            p + "mlp.gate_proj.weight"));
+        Tensor<float32> wUp = ts.get(AttentionTest.idx(names,
+            p + "mlp.up_proj.weight"));
+        Tensor<float32> wDown = ts.get(AttentionTest.idx(names,
+            p + "mlp.down_proj.weight"));
+
+        Tensor<float32> xn = Prim.rmsnormF32Op(x, wIn, eps, normForm);
+        Tensor<float32> q = Tensor.matmul<float32>(xn, wq);
+        Tensor<float32> k = Tensor.matmul<float32>(xn, wk);
+        Tensor<float32> v = Tensor.matmul<float32>(xn, wv);
+        if (qkNorm) {
+            // QK-norm BEFORE RoPE (5.10), per head: reshape to
+            // [rows·heads, hd] so each head is one norm row, then write
+            // the normed values BACK INTO the owned q/k (the reshape
+            // views are block-locals and must not escape this block).
+            Tensor<float32> wqn = ts.get(AttentionTest.idx(names,
+                p + "self_attn.q_norm.weight"));
+            Tensor<float32> wkn = ts.get(AttentionTest.idx(names,
+                p + "self_attn.k_norm.weight"));
+            int64[] qhs = heap int64[2];
+            qhs[0] = (int64) (2 * nH);
+            qhs[1] = (int64) hd;
+            Tensor<float32> qh = q.reshape(qhs);
+            Tensor<float32> qn2 = Prim.rmsnormF32Op(qh, wqn, eps, normForm);
+            int64 z = 0;
+            while (z < qn2.size()) {
+                q.flatSet(z, qn2.flatGet(z));
+                z = z + 1;
+            }
+            int64[] khs = heap int64[2];
+            khs[0] = (int64) (2 * nKv);
+            khs[1] = (int64) hd;
+            Tensor<float32> kh = k.reshape(khs);
+            Tensor<float32> kn2 = Prim.rmsnormF32Op(kh, wkn, eps, normForm);
+            z = 0;
+            while (z < kn2.size()) {
+                k.flatSet(z, kn2.flatGet(z));
+                z = z + 1;
+            }
+        }
+        float32[] inv = Prim.invFreq(hd, cfg.ropeTheta, 0, 1.0f, 1.0f,
+            4.0f, 0);
+        int64[] ivs = heap int64[1];
+        ivs[0] = (int64) (hd / 2);
+        Tensor<float32> invT = Tensor.zeros<float32>(ivs);
+        int64 ii = 0;
+        while (ii < ivs[0]) {
+            invT.flatSet(ii, inv[(int32) ii]);
+            ii = ii + 1;
+        }
+        int32[] pv = heap int32[2];
+        pv[0] = 0;
+        pv[1] = 1;
+        Tensor<int32> posT = AttentionTest.ivec(pv);
+        Prim.ropeF32Op(q, posT, invT, nH, hd);
+        Prim.ropeF32Op(k, posT, invT, nKv, hd);
+        int32[] so = heap int32[2];
+        so[0] = 0;
+        so[1] = 0;
+        int32[] kb = heap int32[1];
+        kb[0] = 0;
+        float32 sc = 1.0f / Math.sqrt((float32) hd);
+        Tensor<float32> ao = Prim.attendRaggedF32Op(q, k, v,
+            AttentionTest.ivec(so), posT, AttentionTest.ivec(kb),
+            nH, nKv, hd, 0, sc);
+        Tensor<float32> proj = Tensor.matmul<float32>(ao, wo);
+        if (fourNorm) {
+            proj = Prim.rmsnormF32Op(proj, wPa, eps, normForm);
+        }
+        x = Tensor.add<float32>(x, proj);
+
+        Tensor<float32> preW = wPa;
+        if (fourNorm) {
+            preW = ts.get(AttentionTest.idx(names,
+                p + "pre_feedforward_layernorm.weight"));
+        }
+        Tensor<float32> x2 = Prim.rmsnormF32Op(x, preW, eps, normForm);
+        Tensor<float32> gate = Tensor.matmul<float32>(x2, wGate);
+        Tensor<float32> up = Tensor.matmul<float32>(x2, wUp);
+        Tensor<float32> glu = Prim.gluF32Op(gate, up, act);
+        Tensor<float32> mo = Tensor.matmul<float32>(glu, wDown);
+        if (fourNorm) {
+            Tensor<float32> wPf = ts.get(AttentionTest.idx(names,
+                p + "post_feedforward_layernorm.weight"));
+            mo = Prim.rmsnormF32Op(mo, wPf, eps, normForm);
+        }
+        x = Tensor.add<float32>(x, mo);
+
+        Tensor<float32> wNorm = ts.get(AttentionTest.idx(names,
+            "model.norm.weight"));
+        Tensor<float32> xf = Prim.rmsnormF32Op(x, wNorm, eps, normForm);
+        // Tied output projection against the embedding matrix, last row.
+        float64 maxDiff = 0.0;
+        int32 t = 0;
+        while (t < vocab) {
+            float64 acc = 0.0;
+            int32 d = 0;
+            while (d < h) {
+                acc = acc + (float64) xf.flatGet((int64) (h + d))
+                    * (float64) emb.get2((int64) t, (int64) d);
+                d = d + 1;
+            }
+            float64 df = AttentionTest.fabs(acc
+                - (float64) gotLogits.flatGet((int64) t));
+            if (df > maxDiff) {
+                maxDiff = df;
+            }
+            t = t + 1;
+        }
+        Assert.isTrue(maxDiff < 0.001);
+        Assert.isTrue(got >= 0);
+        Assert.isTrue(got < vocab);
+    }
+
+    static int32 idx(ArrayList<String> names, String want) {
+        int32 i = 0;
+        while (i < names.count()) {
+            if (names.get(i).equals(want)) {
+                return i;
+            }
+            i = i + 1;
+        }
+        Assert.fail("missing parameter: " + want);
+        return -1;
+    }
+
+    @Test
+    public void twoNormLlamaBlockMatchesComposition() {
+        String cfgPath = "/tmp/cajeta_llama_att_blk2_cfg.json";
+        String stPath = "/tmp/cajeta_llama_att_blk2.safetensors";
+        ToyModel.writeConfig(cfgPath, "LlamaForCausalLM", 16, 32, 1, 2, 1,
+            0, 24, 32, true);
+        ToyModel s = ToyModel.specVariant(1, 16, 32, 2, 1, 8, 24, true,
+            false, false);
+        ToyModel.writeWeights(stPath, s);
+        AttentionTest.assertBlockMatchesComposition(cfgPath, stPath,
+            false, false, 0, 0);
+    }
+
+    @Test
+    public void fourNormGemmaBlockMatchesComposition() {
+        String cfgPath = "/tmp/cajeta_llama_att_blk4_cfg.json";
+        String stPath = "/tmp/cajeta_llama_att_blk4.safetensors";
+        ToyModel.writeConfig(cfgPath, "LlamaForCausalLM", 16, 32, 1, 2, 1,
+            0, 24, 32, true);
+        ToyModel s = ToyModel.specVariant(1, 16, 32, 2, 1, 8, 24, true,
+            true, true);
+        ToyModel.writeWeights(stPath, s);
+        // Full Gemma shape: four norms, QK-norm, (1+w) form, GeGLU.
+        AttentionTest.assertBlockMatchesComposition(cfgPath, stPath,
+            true, true, 1, 1);
+    }
+}

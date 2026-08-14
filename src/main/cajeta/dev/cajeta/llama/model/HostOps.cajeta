@@ -27,27 +27,6 @@ public final class HostOps {
         return;
     }
 
-    /** dst row = src row / rms(src row) · w  (Llama-form RMSNorm). */
-    static void rmsnormRow(Tensor<float32> src, int64 srcOff,
-            Tensor<float32> w, float32 eps,
-            Tensor<float32> dst, int64 dstOff, int32 dim) {
-        float32 ss = 0.0f;
-        int64 i = 0;
-        while (i < (int64) dim) {
-            float32 x = src.flatGet(srcOff + i);
-            ss = ss + x * x;
-            i = i + 1;
-        }
-        float32 scale = 1.0f / Math.sqrt(ss / (float32) dim + eps);
-        i = 0;
-        while (i < (int64) dim) {
-            dst.flatSet(dstOff + i,
-                src.flatGet(srcOff + i) * scale * w.flatGet(i));
-            i = i + 1;
-        }
-        return;
-    }
-
     /** dst row = src row · W, with W `[in, out]` contiguous. */
     static void matvecRow(Tensor<float32> src, int64 srcOff,
             Tensor<float32> w,
@@ -83,34 +62,6 @@ public final class HostOps {
         return;
     }
 
-    /**
-     * Rotary embedding at absolute position `pos`, HF split-half
-     * convention: pair (d, d + headDim/2), angle `pos·theta^(-2d/hd)`.
-     */
-    static void ropeRow(Tensor<float32> t, int64 off, int32 nHeads,
-            int32 headDim, int32 pos, float32 theta) {
-        int32 half = headDim / 2;
-        int32 h = 0;
-        while (h < nHeads) {
-            int64 base = off + (int64) (h * headDim);
-            int32 d = 0;
-            while (d < half) {
-                float32 fr = Math.pow(theta,
-                    (0.0f - (float32) (2 * d)) / (float32) headDim);
-                float32 ang = (float32) pos * fr;
-                float32 c = Math.cos(ang);
-                float32 s = Math.sin(ang);
-                float32 a = t.flatGet(base + (int64) d);
-                float32 b = t.flatGet(base + (int64) (d + half));
-                t.flatSet(base + (int64) d, a * c - b * s);
-                t.flatSet(base + (int64) (d + half), a * s + b * c);
-                d = d + 1;
-            }
-            h = h + 1;
-        }
-        return;
-    }
-
     /** Append one (already-RoPE'd) K/V row at absolute position `p`. */
     static void appendKvRow(Tensor<float32> kCache, Tensor<float32> vCache,
             Tensor<float32> k, int64 kOff, Tensor<float32> v, int64 vOff,
@@ -121,86 +72,6 @@ public final class HostOps {
             kCache.flatSet(base + j, k.flatGet(kOff + j));
             vCache.flatSet(base + j, v.flatGet(vOff + j));
             j = j + 1;
-        }
-        return;
-    }
-
-    /**
-     * GQA attention for ONE query row over cache positions [0, count):
-     * per head, scaled dot-product scores into `scores` (softmax in
-     * place), then the weighted V sum into `outv`. Query heads share KV
-     * heads in groups of `nHeads/nKv` — no repeat tensor is ever
-     * materialized (spec 5.5's discipline, ahead of Unit 7's kernels).
-     */
-    static void attendRow(Tensor<float32> q, int64 qOff,
-            Tensor<float32> kCache, Tensor<float32> vCache, int32 count,
-            Tensor<float32> scores, Tensor<float32> outv, int64 outOff,
-            int32 nHeads, int32 nKv, int32 headDim) {
-        int32 kvDim = nKv * headDim;
-        int32 group = nHeads / nKv;
-        float32 inv = 1.0f / Math.sqrt((float32) headDim);
-        int32 h = 0;
-        while (h < nHeads) {
-            int32 kvh = h / group;
-            int64 qBase = qOff + (int64) (h * headDim);
-            int64 kvBase = (int64) (kvh * headDim);
-            int64 t = 0;
-            while (t < (int64) count) {
-                float32 s = 0.0f;
-                int64 kRow = t * (int64) kvDim + kvBase;
-                int64 d = 0;
-                while (d < (int64) headDim) {
-                    s = s + q.flatGet(qBase + d) * kCache.flatGet(kRow + d);
-                    d = d + 1;
-                }
-                scores.flatSet(t, s * inv);
-                t = t + 1;
-            }
-            // Softmax in place over [0, count).
-            float32 mx = scores.flatGet(0);
-            t = 1;
-            while (t < (int64) count) {
-                float32 sv = scores.flatGet(t);
-                if (sv > mx) {
-                    mx = sv;
-                }
-                t = t + 1;
-            }
-            float32 sum = 0.0f;
-            t = 0;
-            while (t < (int64) count) {
-                float32 e = Math.exp(scores.flatGet(t) - mx);
-                scores.flatSet(t, e);
-                sum = sum + e;
-                t = t + 1;
-            }
-            float32 rs = 1.0f / sum;
-            int64 d = 0;
-            while (d < (int64) headDim) {
-                float32 acc = 0.0f;
-                t = 0;
-                while (t < (int64) count) {
-                    acc = acc + scores.flatGet(t)
-                        * vCache.flatGet(t * (int64) kvDim + kvBase + d);
-                    t = t + 1;
-                }
-                outv.flatSet(outOff + (int64) (h * headDim) + d, acc * rs);
-                d = d + 1;
-            }
-            h = h + 1;
-        }
-        return;
-    }
-
-    /** g row = silu(g row) · u row, in place on g. */
-    static void siluMulRow(Tensor<float32> g, int64 gOff,
-            Tensor<float32> u, int64 uOff, int32 n) {
-        int64 i = 0;
-        while (i < (int64) n) {
-            float32 x = g.flatGet(gOff + i);
-            float32 sig = 1.0f / (1.0f + Math.exp(0.0f - x));
-            g.flatSet(gOff + i, x * sig * u.flatGet(uOff + i));
-            i = i + 1;
         }
         return;
     }

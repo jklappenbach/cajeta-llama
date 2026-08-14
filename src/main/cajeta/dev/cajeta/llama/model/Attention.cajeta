@@ -1,34 +1,63 @@
 package dev.cajeta.llama.model;
 
+import cajeta.lang.Math;
 import cajeta.lang.String;
 import dev.cajeta.llama.io.Checkpoint;
 
 /**
- * The GQA attention projections for one decoder layer. Field names are
- * the torch key segments (`q_proj` …), so the reflective walk yields HF
- * keys verbatim. Projection shapes come from the EFFECTIVE head_dim
- * (spec 4.8): q is `[hidden, heads·head_dim]`, k/v are
- * `[hidden, kv_heads·head_dim]`, o is `[heads·head_dim, hidden]`.
+ * The GQA attention projections and per-layer attention configuration for
+ * one decoder layer (spec §5 preamble: window, RoPE base/scaling and
+ * kv-head count are LAYER state; the model config supplies defaults that
+ * layers inherit). Parameter field names are the torch key segments, so
+ * the reflective walk yields HF keys verbatim — including Gemma's
+ * `q_norm`/`k_norm` when QK-norm is declared (spec 5.10).
  */
 public final class Attention extends InfModule {
     Linear q_proj;
     Linear k_proj;
     Linear v_proj;
     Linear o_proj;
+    RMSNorm q_norm;   // null unless the config declares QK-norm
+    RMSNorm k_norm;
     int32 nHeads;
     int32 nKvHeads;
     int32 headDim;
+    /** Attention window in tokens; 0 = infinite (spec 5.9). */
+    int32 window;
+    /** Query scale — declared, or the default `1/sqrt(head_dim)` (5.13). */
+    float32 scale;
+    /** Per-dim RoPE inverse frequencies with the layer's theta base and
+     *  declared scaling baked in (5.2, 5.3). A plain array, deliberately
+     *  not a Tensor: InfModule's walk must not see it as a parameter. */
+    float32[] ropeInv;
 
-    Attention(int32 hidden, int32 nHeads, int32 nKvHeads, int32 headDim) {
-        int32 qd = nHeads * headDim;
-        int32 kvd = nKvHeads * headDim;
+    Attention(ModelConfig cfg) {
+        int32 hidden = cfg.hiddenSize;
+        int32 qd = cfg.qDim();
+        int32 kvd = cfg.kvDim();
         this.q_proj = heap Linear(hidden, qd);
         this.k_proj = heap Linear(hidden, kvd);
         this.v_proj = heap Linear(hidden, kvd);
         this.o_proj = heap Linear(qd, hidden);
-        this.nHeads = nHeads;
-        this.nKvHeads = nKvHeads;
-        this.headDim = headDim;
+        if (cfg.qkNorm) {
+            this.q_norm = heap RMSNorm(cfg.headDim, cfg.rmsNormEps);
+            this.k_norm = heap RMSNorm(cfg.headDim, cfg.rmsNormEps);
+        } else {
+            this.q_norm = null;
+            this.k_norm = null;
+        }
+        this.nHeads = cfg.numHeads;
+        this.nKvHeads = cfg.numKvHeads;
+        this.headDim = cfg.headDim;
+        this.window = cfg.slidingWindow;
+        if (cfg.queryScale != 0.0f) {
+            this.scale = cfg.queryScale;
+        } else {
+            this.scale = 1.0f / Math.sqrt((float32) cfg.headDim);
+        }
+        this.ropeInv = Prim.invFreq(cfg.headDim, cfg.ropeTheta,
+            cfg.ropeScalingType, cfg.ropeScalingFactor, cfg.ropeLowFreq,
+            cfg.ropeHighFreq, cfg.ropeOrigMaxPos);
     }
 
     void bind(Checkpoint ckpt, String prefix, boolean toDevice) {
@@ -36,5 +65,9 @@ public final class Attention extends InfModule {
         this.k_proj.bind(ckpt, prefix + "k_proj.weight", toDevice);
         this.v_proj.bind(ckpt, prefix + "v_proj.weight", toDevice);
         this.o_proj.bind(ckpt, prefix + "o_proj.weight", toDevice);
+        if (this.q_norm != null) {
+            this.q_norm.bind(ckpt, prefix + "q_norm.weight", toDevice);
+            this.k_norm.bind(ckpt, prefix + "k_norm.weight", toDevice);
+        }
     }
 }

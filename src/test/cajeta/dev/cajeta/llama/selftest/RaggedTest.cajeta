@@ -1,0 +1,356 @@
+package dev.cajeta.llama.selftest;
+
+import dev.cajeta.unit.Assert;
+import dev.cajeta.llama.model.Prim;
+import cajeta.math.Tensor;
+
+/**
+ * cajeta-llama plan Unit 7 TDD — ragged-batch attention (spec 6.13):
+ * sequences of different lengths share one call with no padding, indexed
+ * by per-row sequence/position and per-item KV bases. The off-by-one
+ * failure mode is silent cross-sequence contamination, so the fixtures
+ * make every (sequence, position) value distinct enough that any base or
+ * position shift moves an output by ~100.
+ */
+public class RaggedTest {
+
+    public RaggedTest() { return; }
+
+    static float64 fabs(float64 x) {
+        if (x < 0.0) {
+            return 0.0 - x;
+        }
+        return x;
+    }
+
+    static #Tensor<int32> ivec(int32[] v) {
+        int64[] s = heap int64[1];
+        s[0] = (int64) v.count();
+        Tensor<int32> t = Tensor.zeros<int32>(s);
+        int64 i = 0;
+        while (i < s[0]) {
+            t.flatSet(i, v[i]);
+            i = i + 1;
+        }
+        return #t;
+    }
+
+    // ── 7.1.14 — three lengths, one call, matches per-sequence runs ─────
+
+    @Test
+    public void raggedBatchMatchesPerSequenceReference() {
+        // Sequences of lengths 5, 3, 7 packed at row bases 0, 5, 8.
+        int32 nH = 2;
+        int32 nKv = 1;
+        int32 hd = 4;
+        int32 totalKv = 15;
+        int32 totalQ = 15;
+        int64[] qs = heap int64[2];
+        qs[0] = (int64) totalQ;
+        qs[1] = (int64) (nH * hd);
+        Tensor<float32> q = Tensor.zeros<float32>(qs);
+        int64[] ks = heap int64[2];
+        ks[0] = (int64) totalKv;
+        ks[1] = (int64) (nKv * hd);
+        Tensor<float32> k = Tensor.zeros<float32>(ks);
+        Tensor<float32> v = Tensor.zeros<float32>(ks);
+        int64 i = 0;
+        while (i < (int64) (totalQ * nH * hd)) {
+            q.flatSet(i, 0.0625f * (float32) ((i * 5 + 1) % 13) - 0.375f);
+            i = i + 1;
+        }
+        i = 0;
+        while (i < (int64) (totalKv * nKv * hd)) {
+            k.flatSet(i, 0.0625f * (float32) ((i * 3 + 2) % 11) - 0.3125f);
+            v.flatSet(i, 0.0625f * (float32) ((i * 7 + 5) % 9) - 0.25f);
+            i = i + 1;
+        }
+        int32[] lens = heap int32[3];
+        lens[0] = 5;
+        lens[1] = 3;
+        lens[2] = 7;
+        int32[] bases = heap int32[3];
+        bases[0] = 0;
+        bases[1] = 5;
+        bases[2] = 8;
+        int32[] so = heap int32[15];
+        int32[] qp = heap int32[15];
+        int32 row = 0;
+        int32 s2 = 0;
+        while (s2 < 3) {
+            int32 t = 0;
+            while (t < lens[s2]) {
+                so[row] = s2;
+                qp[row] = t;
+                row = row + 1;
+                t = t + 1;
+            }
+            s2 = s2 + 1;
+        }
+        float32 sc = 0.5f;
+        Tensor<float32> outAll = Prim.attendRaggedF32Op(q, k, v,
+            RaggedTest.ivec(so), RaggedTest.ivec(qp),
+            RaggedTest.ivec(bases), nH, nKv, hd, 0, sc);
+
+        // Per-sequence runs: same packed buffers, one item at a time.
+        // (No padding anywhere: each run indexes its own rows only.)
+        row = 0;
+        s2 = 0;
+        while (s2 < 3) {
+            int32 len = lens[s2];
+            int64[] q1s = heap int64[2];
+            q1s[0] = (int64) len;
+            q1s[1] = (int64) (nH * hd);
+            Tensor<float32> q1 = Tensor.zeros<float32>(q1s);
+            int64 j = 0;
+            while (j < (int64) (len * nH * hd)) {
+                q1.flatSet(j, q.flatGet((int64) (row * nH * hd) + j));
+                j = j + 1;
+            }
+            int32[] so1 = heap int32[16];
+            int32[] qp1 = heap int32[16];
+            int32 t = 0;
+            while (t < len) {
+                so1[t] = 0;
+                qp1[t] = t;
+                t = t + 1;
+            }
+            // Slice the per-item index arrays to length.
+            int32[] so1c = heap int32[len];
+            int32[] qp1c = heap int32[len];
+            t = 0;
+            while (t < len) {
+                so1c[t] = so1[t];
+                qp1c[t] = qp1[t];
+                t = t + 1;
+            }
+            int32[] b1 = heap int32[1];
+            b1[0] = bases[s2];
+            Tensor<float32> out1 = Prim.attendRaggedF32Op(q1, k, v,
+                RaggedTest.ivec(so1c), RaggedTest.ivec(qp1c),
+                RaggedTest.ivec(b1), nH, nKv, hd, 0, sc);
+            j = 0;
+            while (j < (int64) (len * nH * hd)) {
+                Assert.isTrue(out1.flatGet(j)
+                    == outAll.flatGet((int64) (row * nH * hd) + j));
+                j = j + 1;
+            }
+            row = row + len;
+            s2 = s2 + 1;
+        }
+
+        // Device: the ONE kernel launch agrees with the host path.
+        q.gpu();
+        k.gpu();
+        v.gpu();
+        Tensor<int32> soT = RaggedTest.ivec(so);
+        Tensor<int32> qpT = RaggedTest.ivec(qp);
+        Tensor<int32> kbT = RaggedTest.ivec(bases);
+        soT.gpu();
+        qpT.gpu();
+        kbT.gpu();
+        Tensor<float32> outDev = Prim.attendRaggedF32Op(q, k, v, soT, qpT,
+            kbT, nH, nKv, hd, 0, sc);
+        Assert.isTrue(outDev.isOnGpu());
+        outDev.cpu();
+        i = 0;
+        while (i < (int64) (totalQ * nH * hd)) {
+            Assert.isTrue(RaggedTest.fabs((float64) outAll.flatGet(i)
+                - (float64) outDev.flatGet(i)) < 0.00001);
+            i = i + 1;
+        }
+    }
+
+    // ── 7.1.15 — cumulative offsets: an off-by-one moves outputs by ~100 ─
+
+    @Test
+    public void cuSeqlenIndexingSelectsExactSlices() {
+        // Keys equal WITHIN each sequence → uniform attention → each
+        // output dim is the MEAN of its sequence's V rows [0, p]. V is
+        // 100·seq + pos, so every (seq, pos) has a closed-form expected
+        // value and any base/position shift is a ~100 or ~1 jump.
+        int32 hd = 2;
+        int32[] lens = heap int32[3];
+        lens[0] = 4;
+        lens[1] = 3;
+        lens[2] = 5;
+        int32[] bases = heap int32[3];
+        bases[0] = 0;
+        bases[1] = 4;
+        bases[2] = 7;
+        int32 totalKv = 12;
+        int64[] ks = heap int64[2];
+        ks[0] = (int64) totalKv;
+        ks[1] = (int64) hd;
+        Tensor<float32> k = Tensor.zeros<float32>(ks);
+        Tensor<float32> v = Tensor.zeros<float32>(ks);
+        int32 s2 = 0;
+        while (s2 < 3) {
+            int32 t = 0;
+            while (t < lens[s2]) {
+                int32 r = bases[s2] + t;
+                int32 d = 0;
+                while (d < hd) {
+                    // K constant per sequence (uniform weights); V coded.
+                    k.flatSet((int64) (r * hd + d),
+                        0.125f * (float32) (s2 + 1));
+                    v.flatSet((int64) (r * hd + d),
+                        100.0f * (float32) s2 + (float32) t);
+                    d = d + 1;
+                }
+                t = t + 1;
+            }
+            s2 = s2 + 1;
+        }
+        int32 totalQ = 12;
+        int64[] qs = heap int64[2];
+        qs[0] = (int64) totalQ;
+        qs[1] = (int64) hd;
+        Tensor<float32> q = Tensor.zeros<float32>(qs);
+        int64 i = 0;
+        while (i < (int64) (totalQ * hd)) {
+            q.flatSet(i, 0.25f);
+            i = i + 1;
+        }
+        int32[] so = heap int32[12];
+        int32[] qp = heap int32[12];
+        int32 row = 0;
+        s2 = 0;
+        while (s2 < 3) {
+            int32 t = 0;
+            while (t < lens[s2]) {
+                so[row] = s2;
+                qp[row] = t;
+                row = row + 1;
+                t = t + 1;
+            }
+            s2 = s2 + 1;
+        }
+        Tensor<float32> out = Prim.attendRaggedF32Op(q, k, v,
+            RaggedTest.ivec(so), RaggedTest.ivec(qp),
+            RaggedTest.ivec(bases), 1, 1, hd, 0, 0.5f);
+        row = 0;
+        s2 = 0;
+        while (s2 < 3) {
+            int32 t = 0;
+            while (t < lens[s2]) {
+                // mean of V over [0, t] = 100·s + t/2.
+                float64 want = 100.0 * (float64) s2 + (float64) t / 2.0;
+                int32 d = 0;
+                while (d < hd) {
+                    float64 got = (float64) out.flatGet(
+                        (int64) (row * hd + d));
+                    Assert.isTrue(RaggedTest.fabs(got - want) < 0.001);
+                    d = d + 1;
+                }
+                row = row + 1;
+                t = t + 1;
+            }
+            s2 = s2 + 1;
+        }
+    }
+
+    // ── 7.1.16 — a batch mixing a prefill chunk and decodes ─────────────
+
+    @Test
+    public void mixedPrefillChunkAndDecodesMatchSeparateRuns() {
+        // Item A: a prefill CHUNK — rows at positions 4..7 of a 8-long
+        // cache (chunked prefill's continuation shape). Item B: one
+        // decode row at position 9 of a 10-long cache. Item C: a decode
+        // at position 0 (fresh sequence). One call must equal three.
+        int32 nH = 2;
+        int32 nKv = 2;
+        int32 hd = 4;
+        int32 kvA = 8;
+        int32 kvB = 10;
+        int32 kvC = 1;
+        int32 totalKv = kvA + kvB + kvC;
+        int64[] ks = heap int64[2];
+        ks[0] = (int64) totalKv;
+        ks[1] = (int64) (nKv * hd);
+        Tensor<float32> k = Tensor.zeros<float32>(ks);
+        Tensor<float32> v = Tensor.zeros<float32>(ks);
+        int64 i = 0;
+        while (i < (int64) (totalKv * nKv * hd)) {
+            k.flatSet(i, 0.0625f * (float32) ((i * 11 + 3) % 13) - 0.375f);
+            v.flatSet(i, 0.0625f * (float32) ((i * 5 + 7) % 15) - 0.4375f);
+            i = i + 1;
+        }
+        int32 totalQ = 6;
+        int64[] qs = heap int64[2];
+        qs[0] = (int64) totalQ;
+        qs[1] = (int64) (nH * hd);
+        Tensor<float32> q = Tensor.zeros<float32>(qs);
+        i = 0;
+        while (i < (int64) (totalQ * nH * hd)) {
+            q.flatSet(i, 0.0625f * (float32) ((i * 9 + 2) % 11) - 0.3125f);
+            i = i + 1;
+        }
+        int32[] so = heap int32[6];
+        int32[] qp = heap int32[6];
+        so[0] = 0;
+        qp[0] = 4;
+        so[1] = 0;
+        qp[1] = 5;
+        so[2] = 0;
+        qp[2] = 6;
+        so[3] = 0;
+        qp[3] = 7;
+        so[4] = 1;
+        qp[4] = 9;
+        so[5] = 2;
+        qp[5] = 0;
+        int32[] bases = heap int32[3];
+        bases[0] = 0;
+        bases[1] = kvA;
+        bases[2] = kvA + kvB;
+        float32 sc = 0.5f;
+        Tensor<float32> outAll = Prim.attendRaggedF32Op(q, k, v,
+            RaggedTest.ivec(so), RaggedTest.ivec(qp),
+            RaggedTest.ivec(bases), nH, nKv, hd, 0, sc);
+
+        // Separate runs per item over the same packed buffers.
+        int32[] itemRow0 = heap int32[3];
+        itemRow0[0] = 0;
+        itemRow0[1] = 4;
+        itemRow0[2] = 5;
+        int32[] itemRows = heap int32[3];
+        itemRows[0] = 4;
+        itemRows[1] = 1;
+        itemRows[2] = 1;
+        int32 it = 0;
+        while (it < 3) {
+            int32 rows = itemRows[it];
+            int64[] q1s = heap int64[2];
+            q1s[0] = (int64) rows;
+            q1s[1] = (int64) (nH * hd);
+            Tensor<float32> q1 = Tensor.zeros<float32>(q1s);
+            int64 j = 0;
+            while (j < (int64) (rows * nH * hd)) {
+                q1.flatSet(j, q.flatGet(
+                    (int64) (itemRow0[it] * nH * hd) + j));
+                j = j + 1;
+            }
+            int32[] so1 = heap int32[rows];
+            int32[] qp1 = heap int32[rows];
+            int32 r = 0;
+            while (r < rows) {
+                so1[r] = 0;
+                qp1[r] = qp[itemRow0[it] + r];
+                r = r + 1;
+            }
+            int32[] b1 = heap int32[1];
+            b1[0] = bases[it];
+            Tensor<float32> out1 = Prim.attendRaggedF32Op(q1, k, v,
+                RaggedTest.ivec(so1), RaggedTest.ivec(qp1),
+                RaggedTest.ivec(b1), nH, nKv, hd, 0, sc);
+            j = 0;
+            while (j < (int64) (rows * nH * hd)) {
+                Assert.isTrue(out1.flatGet(j) == outAll.flatGet(
+                    (int64) (itemRow0[it] * nH * hd) + j));
+                j = j + 1;
+            }
+            it = it + 1;
+        }
+    }
+}

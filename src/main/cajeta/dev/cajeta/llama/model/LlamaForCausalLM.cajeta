@@ -172,12 +172,12 @@ public final class LlamaForCausalLM extends InfModule {
         int32 nH = this.cfg.numHeads;
         int32 nKv = this.cfg.numKvHeads;
         int32 hd = this.cfg.headDim;
-        float32 theta = this.cfg.ropeTheta;
         Tensor<float32> scores = this.pool.scores;
 
         int32 l = 0;
         while (l < this.model.numLayers) {
             DecoderLayer d = this.model.layerArr[l];
+            Attention a = d.self_attn;
             Tensor<float32> kC = this.cache.kL[l];
             Tensor<float32> vC = this.cache.vL[l];
             int32 r = 0;
@@ -188,35 +188,74 @@ public final class LlamaForCausalLM extends InfModule {
                 int64 ri = (int64) r * (int64) inter;
                 int32 p = startPos + r;
 
-                // Attention block.
-                HostOps.rmsnormRow(hs, rh, d.input_layernorm.weight,
-                    d.input_layernorm.eps, xn, rh, h);
-                HostOps.matvecRow(xn, rh, d.self_attn.q_proj.weight,
-                    q, rq, h, qd);
-                HostOps.matvecRow(xn, rh, d.self_attn.k_proj.weight,
-                    k, rkv, h, kvd);
-                HostOps.matvecRow(xn, rh, d.self_attn.v_proj.weight,
-                    v, rkv, h, kvd);
-                HostOps.ropeRow(q, rq, nH, hd, p, theta);
-                HostOps.ropeRow(k, rkv, nKv, hd, p, theta);
+                // Attention sublayer.
+                Prim.rmsnormRowHost(hs, rh, d.input_layernorm.weight,
+                    d.input_layernorm.eps, xn, rh, h, d.normForm);
+                HostOps.matvecRow(xn, rh, a.q_proj.weight, q, rq, h, qd);
+                HostOps.matvecRow(xn, rh, a.k_proj.weight, k, rkv, h, kvd);
+                HostOps.matvecRow(xn, rh, a.v_proj.weight, v, rkv, h, kvd);
+                if (a.q_norm != null) {
+                    // QK-norm BEFORE RoPE (spec 5.10), per head.
+                    int32 hh = 0;
+                    while (hh < nH) {
+                        Prim.rmsnormRowHost(q, rq + (int64) (hh * hd),
+                            a.q_norm.weight, a.q_norm.eps,
+                            q, rq + (int64) (hh * hd), hd, d.normForm);
+                        hh = hh + 1;
+                    }
+                    hh = 0;
+                    while (hh < nKv) {
+                        Prim.rmsnormRowHost(k, rkv + (int64) (hh * hd),
+                            a.k_norm.weight, a.k_norm.eps,
+                            k, rkv + (int64) (hh * hd), hd, d.normForm);
+                        hh = hh + 1;
+                    }
+                }
+                // RoPE at the ABSOLUTE position, per-layer frequencies.
+                Prim.ropeRowHost(q, rq, nH, hd, p, a.ropeInv);
+                Prim.ropeRowHost(k, rkv, nKv, hd, p, a.ropeInv);
                 HostOps.appendKvRow(kC, vC, k, rkv, v, rkv, p, kvd);
-                // Causal by construction: row r sees cache [0, p].
-                HostOps.attendRow(q, rq, kC, vC, p + 1, scores, ao, rq,
-                    nH, nKv, hd);
-                HostOps.matvecRow(ao, rq, d.self_attn.o_proj.weight,
-                    proj, rh, qd, h);
+                // Causal by construction: row r sees cache [from, p];
+                // a finite window clamps `from` in prefill AND decode
+                // through this same line (spec 5.9).
+                int32 from = 0;
+                if (a.window > 0 && p + 1 > a.window) {
+                    from = p + 1 - a.window;
+                }
+                Prim.attendRowHost(q, rq, kC, vC, 0, from, p, a.scale,
+                    scores, ao, rq, nH, nKv, hd);
+                HostOps.matvecRow(ao, rq, a.o_proj.weight, proj, rh, qd, h);
+                if (d.fourNorm) {
+                    // Gemma layout: post-norm on the sublayer OUTPUT.
+                    Prim.rmsnormRowHost(proj, rh,
+                        d.post_attention_layernorm.weight,
+                        d.post_attention_layernorm.eps, proj, rh, h,
+                        d.normForm);
+                }
                 HostOps.addRow(hs, rh, proj, rh, h);
 
-                // MLP block.
-                HostOps.rmsnormRow(hs, rh, d.post_attention_layernorm.weight,
-                    d.post_attention_layernorm.eps, xn, rh, h);
+                // MLP sublayer. Two-norm layout uses
+                // post_attention_layernorm as the pre-MLP norm.
+                RMSNorm pre = d.post_attention_layernorm;
+                if (d.fourNorm) {
+                    pre = d.pre_feedforward_layernorm;
+                }
+                Prim.rmsnormRowHost(hs, rh, pre.weight, pre.eps,
+                    xn, rh, h, d.normForm);
                 HostOps.matvecRow(xn, rh, d.mlp.gate_proj.weight,
                     gate, ri, h, inter);
                 HostOps.matvecRow(xn, rh, d.mlp.up_proj.weight,
                     up, ri, h, inter);
-                HostOps.siluMulRow(gate, ri, up, ri, inter);
+                Prim.gluRowHost(gate, ri, up, ri, gate, ri, inter,
+                    d.activation);
                 HostOps.matvecRow(gate, ri, d.mlp.down_proj.weight,
                     mlpOut, rh, inter, h);
+                if (d.fourNorm) {
+                    Prim.rmsnormRowHost(mlpOut, rh,
+                        d.post_feedforward_layernorm.weight,
+                        d.post_feedforward_layernorm.eps, mlpOut, rh, h,
+                        d.normForm);
+                }
                 HostOps.addRow(hs, rh, mlpOut, rh, h);
                 r = r + 1;
             }
@@ -225,8 +264,8 @@ public final class LlamaForCausalLM extends InfModule {
 
         // Final norm of the last row, then the output projection.
         int64 lastH = (int64) (rows - 1) * (int64) h;
-        HostOps.rmsnormRow(hs, lastH, this.model.norm.weight,
-            this.model.norm.eps, xn, lastH, h);
+        Prim.rmsnormRowHost(hs, lastH, this.model.norm.weight,
+            this.model.norm.eps, xn, lastH, h, this.cfg.normForm);
         if (this.lm_head != null) {
             HostOps.matvecRow(xn, lastH, this.lm_head.weight,
                 this.pool.logits, 0, h, this.cfg.vocabSize);

@@ -4,6 +4,7 @@ import cajeta.codec.json.Json;
 import cajeta.codec.json.JsonObject;
 import cajeta.codec.json.JsonValue;
 import cajeta.io.file.File;
+import cajeta.lang.Math;
 import cajeta.lang.String;
 import dev.cajeta.llama.LlamaException;
 
@@ -32,6 +33,36 @@ public final class ModelConfig {
     public float32 ropeTheta;
     public boolean tieWordEmbeddings;
 
+    // ── Unit 7: per-layer attention defaults (spec §5 preamble) ─────────
+    // Layers inherit these; uniform models are every layer at the default.
+
+    /** Attention window `w` in tokens; 0 = infinite (HF `sliding_window`). */
+    public int32 slidingWindow;
+    /** RoPE scaling: 0 none, 1 linear, 2 ntk/dynamic, 3 yarn, 4 llama3
+     *  (HF `rope_scaling.rope_type`). */
+    public int32 ropeScalingType;
+    public float32 ropeScalingFactor;
+    /** llama3: `low_freq_factor`; yarn: `beta_slow`. */
+    public float32 ropeLowFreq;
+    /** llama3: `high_freq_factor`; yarn: `beta_fast`. */
+    public float32 ropeHighFreq;
+    /** llama3/yarn: `original_max_position_embeddings`. */
+    public int32 ropeOrigMaxPos;
+    /** Query scale; 0 = default `1/sqrt(head_dim)` (spec 5.13). Parsed
+     *  from Gemma's `query_pre_attn_scalar` as `1/sqrt(scalar)`. */
+    public float32 queryScale;
+    /** MLP activation: 0 = SiLU (SwiGLU), 1 = gelu_pytorch_tanh (GeGLU)
+     *  (HF `hidden_act` / `hidden_activation`; spec 5.4). */
+    public int32 activation;
+    /** RMSNorm form: 0 = Llama `·w`, 1 = Gemma zero-centered `·(1+w)`
+     *  (spec 5.12). */
+    public int32 normForm;
+    /** RMSNorm on Q and K before RoPE (spec 5.10). */
+    public boolean qkNorm;
+    /** Four RMSNorms per block — pre/post around both sublayers
+     *  (spec 5.11). */
+    public boolean fourNorm;
+
     ModelConfig() {
         this.architecture = null;
         this.hiddenSize = 0;
@@ -45,6 +76,17 @@ public final class ModelConfig {
         this.rmsNormEps = 0.00001f;
         this.ropeTheta = 10000.0f;
         this.tieWordEmbeddings = false;
+        this.slidingWindow = 0;
+        this.ropeScalingType = 0;
+        this.ropeScalingFactor = 1.0f;
+        this.ropeLowFreq = 1.0f;
+        this.ropeHighFreq = 4.0f;
+        this.ropeOrigMaxPos = 0;
+        this.queryScale = 0.0f;
+        this.activation = 0;
+        this.normForm = 0;
+        this.qkNorm = false;
+        this.fourNorm = false;
     }
 
     public int32 qDim() {
@@ -95,6 +137,61 @@ public final class ModelConfig {
         JsonValue tie = root.get("tie_word_embeddings");
         if (tie != null) {
             c.tieWordEmbeddings = tie.asBoolean();
+        }
+        c.slidingWindow = ModelConfig.optInt(root, "sliding_window", 0);
+        JsonValue qpas = root.get("query_pre_attn_scalar");
+        if (qpas != null) {
+            c.queryScale = 1.0f / Math.sqrt((float32) qpas.asFloat64());
+        }
+        JsonValue act = root.get("hidden_act");
+        if (act == null) {
+            act = root.get("hidden_activation");
+        }
+        if (act != null) {
+            String a2 = act.asString();
+            if (a2.equals("silu")) {
+                c.activation = 0;
+            } else if (a2.equals("gelu_pytorch_tanh")) {
+                c.activation = 1;
+            } else {
+                throw heap LlamaException("model config: activation '" + a2
+                    + "' is not supported; supported: silu, gelu_pytorch_tanh");
+            }
+        }
+        JsonValue rs = root.get("rope_scaling");
+        if (rs != null && !rs.isNull()) {
+            JsonObject ro = rs.asObject();
+            JsonValue ty = ro.get("rope_type");
+            if (ty == null) {
+                ty = ro.get("type");
+            }
+            if (ty != null) {
+                String tn = ty.asString();
+                if (tn.equals("linear")) {
+                    c.ropeScalingType = 1;
+                } else if (tn.equals("dynamic") || tn.equals("ntk")) {
+                    c.ropeScalingType = 2;
+                } else if (tn.equals("yarn")) {
+                    c.ropeScalingType = 3;
+                } else if (tn.equals("llama3")) {
+                    c.ropeScalingType = 4;
+                } else {
+                    throw heap LlamaException("model config: rope_scaling type '"
+                        + tn + "' is not supported; supported: linear, "
+                        + "dynamic, yarn, llama3");
+                }
+            }
+            c.ropeScalingFactor = ModelConfig.optFloat(ro, "factor", 1.0f);
+            c.ropeLowFreq = ModelConfig.optFloat(ro, "low_freq_factor",
+                ModelConfig.optFloat(ro, "beta_slow", 1.0f));
+            c.ropeHighFreq = ModelConfig.optFloat(ro, "high_freq_factor",
+                ModelConfig.optFloat(ro, "beta_fast", 4.0f));
+            c.ropeOrigMaxPos = ModelConfig.optInt(ro,
+                "original_max_position_embeddings", c.maxPositionEmbeddings);
+        }
+        JsonValue qkn = root.get("qk_norm");
+        if (qkn != null) {
+            c.qkNorm = qkn.asBoolean();
         }
         return #c;
     }

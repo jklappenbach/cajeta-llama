@@ -28,9 +28,7 @@ public final class LlamaModel extends InfModule {
         this.numLayers = cfg.numLayers;
         int32 l = 0;
         while (l < cfg.numLayers) {
-            DecoderLayer d = heap DecoderLayer(cfg.hiddenSize,
-                cfg.intermediateSize, cfg.numHeads, cfg.numKvHeads,
-                cfg.headDim, cfg.rmsNormEps);
+            DecoderLayer d = heap DecoderLayer(cfg);
             this.layerArr[l] = d;
             this.layers.add(#d);
             l = l + 1;

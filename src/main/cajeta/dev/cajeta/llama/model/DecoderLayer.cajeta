@@ -4,22 +4,49 @@ import cajeta.lang.String;
 import dev.cajeta.llama.io.Checkpoint;
 
 /**
- * One pre-norm decoder block: `x += attn(input_layernorm(x))`, then
- * `x += mlp(post_attention_layernorm(x))`. Field names are the torch key
- * segments, declared in execution order.
+ * One pre-norm decoder block. Two norm layouts (spec 5.11):
+ *
+ * - Llama (two norms): `x += attn(input_layernorm(x))`, then
+ *   `x += mlp(post_attention_layernorm(x))`.
+ * - Gemma 3 (four norms): the post-norms apply to the SUBLAYER OUTPUT
+ *   before the residual add —
+ *   `x += post_attention_layernorm(attn(input_layernorm(x)))`, then
+ *   `x += post_feedforward_layernorm(mlp(pre_feedforward_layernorm(x)))`.
+ *
+ * Field names are the torch key segments; the two extra norms stay null
+ * (and unnamed in the walk) unless the config declares them.
  */
 public final class DecoderLayer extends InfModule {
     RMSNorm input_layernorm;
     Attention self_attn;
     RMSNorm post_attention_layernorm;
+    RMSNorm pre_feedforward_layernorm;   // null unless fourNorm
+    RMSNorm post_feedforward_layernorm;  // null unless fourNorm
     Mlp mlp;
+    /** 0 = SiLU (SwiGLU), 1 = gelu_pytorch_tanh (GeGLU) — spec 5.4. */
+    int32 activation;
+    /** 0 = Llama `·w`, 1 = Gemma `·(1+w)` — spec 5.12. */
+    int32 normForm;
+    boolean fourNorm;
 
-    DecoderLayer(int32 hidden, int32 inter, int32 nHeads, int32 nKvHeads,
-            int32 headDim, float32 eps) {
-        this.input_layernorm = heap RMSNorm(hidden, eps);
-        this.self_attn = heap Attention(hidden, nHeads, nKvHeads, headDim);
-        this.post_attention_layernorm = heap RMSNorm(hidden, eps);
-        this.mlp = heap Mlp(hidden, inter);
+    DecoderLayer(ModelConfig cfg) {
+        this.input_layernorm = heap RMSNorm(cfg.hiddenSize, cfg.rmsNormEps);
+        this.self_attn = heap Attention(cfg);
+        this.post_attention_layernorm = heap RMSNorm(cfg.hiddenSize,
+            cfg.rmsNormEps);
+        if (cfg.fourNorm) {
+            this.pre_feedforward_layernorm = heap RMSNorm(cfg.hiddenSize,
+                cfg.rmsNormEps);
+            this.post_feedforward_layernorm = heap RMSNorm(cfg.hiddenSize,
+                cfg.rmsNormEps);
+        } else {
+            this.pre_feedforward_layernorm = null;
+            this.post_feedforward_layernorm = null;
+        }
+        this.mlp = heap Mlp(cfg.hiddenSize, cfg.intermediateSize);
+        this.activation = cfg.activation;
+        this.normForm = cfg.normForm;
+        this.fourNorm = cfg.fourNorm;
     }
 
     void bind(Checkpoint ckpt, String prefix, boolean toDevice) {
@@ -28,6 +55,12 @@ public final class DecoderLayer extends InfModule {
         this.self_attn.bind(ckpt, prefix + "self_attn.", toDevice);
         this.post_attention_layernorm.bind(ckpt,
             prefix + "post_attention_layernorm.weight", toDevice);
+        if (this.fourNorm) {
+            this.pre_feedforward_layernorm.bind(ckpt,
+                prefix + "pre_feedforward_layernorm.weight", toDevice);
+            this.post_feedforward_layernorm.bind(ckpt,
+                prefix + "post_feedforward_layernorm.weight", toDevice);
+        }
         this.mlp.bind(ckpt, prefix + "mlp.", toDevice);
     }
 }
