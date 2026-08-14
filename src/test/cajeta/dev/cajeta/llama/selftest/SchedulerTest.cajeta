@@ -1,0 +1,250 @@
+package dev.cajeta.llama.selftest;
+
+import dev.cajeta.unit.Assert;
+import dev.cajeta.llama.io.Checkpoint;
+import dev.cajeta.llama.model.LlamaForCausalLM;
+import dev.cajeta.llama.model.ModelConfig;
+import dev.cajeta.llama.sched.Request;
+import dev.cajeta.llama.sched.Scheduler;
+import cajeta.lang.String;
+
+/**
+ * cajeta-llama plan Unit 9 TDD — the continuous-batching scheduler
+ * (spec 6.19–6.25, 13.14, 13.15). The store does not exist yet, so
+ * preemption exercises recompute-on-resume (6.32); every correctness
+ * assertion compares against solo runs on unconstrained models, which
+ * greedy decoding makes exactly reproducible.
+ */
+public class SchedulerTest {
+
+    public SchedulerTest() { return; }
+
+    /** A bound 2-layer toy model: maxSeqs cache slots, numBlocks pool
+     *  blocks (0 = generous auto-size), blockTokens 4. */
+    static #LlamaForCausalLM mk(String tag, int32 maxSeqs,
+            int32 numBlocks) {
+        String cfgPath = "/tmp/cajeta_llama_sch_" + tag + "_cfg.json";
+        String stPath = "/tmp/cajeta_llama_sch_" + tag + ".safetensors";
+        ForwardTest.writeA(cfgPath, stPath, 2);
+        ModelConfig cfg = ModelConfig.parse(cfgPath);
+        cfg.blockTokens = 4;
+        LlamaForCausalLM m = heap LlamaForCausalLM(#cfg, 64, maxSeqs,
+            numBlocks);
+        Checkpoint ck = Checkpoint.open(stPath);
+        m.bind(ck, false);
+        ck.close();
+        return #m;
+    }
+
+    /** Solo greedy generation on an unconstrained model — the oracle. */
+    static #int32[] solo(int32[] prompt, int32 promptLen, int32 maxNew) {
+        LlamaForCausalLM m = SchedulerTest.mk("solo", 1, 0);
+        int32[] out = heap int32[maxNew];
+        int32 cur = m.prefill(prompt, promptLen);
+        int32 i = 0;
+        while (i < maxNew) {
+            out[i] = cur;
+            if (i + 1 < maxNew) {
+                cur = m.decodeStep(cur);
+            }
+            i = i + 1;
+        }
+        return #out;
+    }
+
+    static #int32[] promptOf(int32 len, int32 seed) {
+        int32[] p = heap int32[len];
+        int32 i = 0;
+        while (i < len) {
+            p[i] = (i * 7 + seed) % 96;
+            i = i + 1;
+        }
+        return #p;
+    }
+
+    static void assertMatchesSolo(Scheduler s, int32 id, int32[] prompt,
+            int32 promptLen, int32 maxNew) {
+        int32[] want = SchedulerTest.solo(prompt, promptLen, maxNew);
+        Request r = s.request(id);
+        Assert.equals((int64) maxNew, (int64) r.generatedCount());
+        int32 i = 0;
+        while (i < maxNew) {
+            Assert.equals((int64) want[i], (int64) r.generatedAt(i));
+            i = i + 1;
+        }
+        return;
+    }
+
+    // ── 9.1.1 + 9.1.2 + 9.3.1 — chunks interleave with decodes ──────────
+
+    @Test
+    public void longPromptChunksInterleaveWithDecodes() {
+        LlamaForCausalLM m = SchedulerTest.mk("il", 2, 0);
+        Scheduler s = heap Scheduler(m, 4);
+        int32[] pa = SchedulerTest.promptOf(2, 3);
+        int32 a = s.submit(pa, 2, 24);
+        // Let A finish its prefill and start decoding.
+        s.stepOnce();
+        s.stepOnce();
+        int32 aGen0 = s.request(a).generatedCount();
+        Assert.isTrue(aGen0 >= 1);
+
+        // Submit a LONG prompt; its chunks must not stall A's decode.
+        int32[] pb = SchedulerTest.promptOf(16, 11);
+        int32 b = s.submit(pb, 16, 4);
+        int32 it = 0;
+        while (it < 4) {
+            int32 before = s.request(a).generatedCount();
+            s.stepOnce();
+            // 9.3.1's iteration form: A emits EVERY iteration — its
+            // inter-token latency equals its solo latency (one item per
+            // iteration) even while B prefills; and 9.1.1: this same
+            // iteration carried B's prefill chunk alongside A's decode.
+            Assert.equals((int64) (before + 1),
+                (int64) s.request(a).generatedCount());
+            it = it + 1;
+        }
+        // B advanced by chunk-sized steps, never the whole prompt at
+        // once: after 4 iterations of chunk 4, exactly the 16-token
+        // prompt is cached and its first token has been emitted.
+        Assert.isTrue(s.request(b).generatedCount() >= 1);
+        s.runAll(200);
+        SchedulerTest.assertMatchesSolo(s, a, pa, 2, 24);
+        SchedulerTest.assertMatchesSolo(s, b, pb, 16, 4);
+        Assert.equals((int64) 2, (int64) s.admittedCount());
+        Assert.equals((int64) 0, (int64) s.preemptedCount());
+    }
+
+    // ── 9.1.3 + 9.1.10 — decode IS the chunked path; degenerate sizes ───
+
+    @Test
+    public void chunkSizesOneAndWholePromptAgree() {
+        int32[] p = SchedulerTest.promptOf(9, 5);
+        int32[] want = SchedulerTest.solo(p, 9, 6);
+
+        int32 ci = 0;
+        int32[] chunks = heap int32[3];
+        chunks[0] = 1;      // everything — prefill included — as N=1
+        chunks[1] = 4;
+        chunks[2] = 64;     // the whole prompt in one chunk
+        while (ci < 3) {
+            LlamaForCausalLM m = SchedulerTest.mk("ck", 1, 0);
+            Scheduler s = heap Scheduler(m, chunks[ci]);
+            int32 id = s.submit(p, 9, 6);
+            s.runAll(200);
+            Request r = s.request(id);
+            Assert.equals((int64) 6, (int64) r.generatedCount());
+            int32 i = 0;
+            while (i < 6) {
+                Assert.equals((int64) want[i], (int64) r.generatedAt(i));
+                i = i + 1;
+            }
+            ci = ci + 1;
+        }
+    }
+
+    // ── 9.1.4 + 9.1.8 — admission headroom; same-step admission ─────────
+
+    @Test
+    public void admissionWaitsForHeadroomAndFollowsCompletion() {
+        // Pool of 8 blocks, 2 full layers, blockTokens 4. A grows to
+        // 12 tokens (6 blocks). B needs 2·ceil(12/4) + 2 = 8 blocks at
+        // admission — more than free while A holds anything, exactly
+        // covered once A releases.
+        LlamaForCausalLM m = SchedulerTest.mk("adm", 2, 8);
+        Scheduler s = heap Scheduler(m, 4);
+        int32[] pa = SchedulerTest.promptOf(4, 7);
+        int32 a = s.submit(pa, 4, 8);
+        s.stepOnce();
+        Assert.equals((int64) 1, (int64) s.admittedCount());
+
+        int32[] pb = SchedulerTest.promptOf(12, 2);
+        int32 b = s.submit(pb, 12, 4);
+        // B must WAIT: admitting it now would immediately preempt (6.19).
+        int32 guard = 0;
+        boolean done = false;
+        int32 admitStep = -1;
+        int32 aDoneStep = -1;
+        while (guard < 100 && !done) {
+            s.stepOnce();
+            if (aDoneStep < 0 && s.request(a).isDone()) {
+                aDoneStep = s.stepCount();
+            }
+            if (admitStep < 0 && s.admittedCount() == 2) {
+                admitStep = s.stepCount();
+            }
+            done = s.allDone();
+            guard = guard + 1;
+        }
+        Assert.isTrue(done);
+        // B was admitted in the SAME step A completed (6.24), not before.
+        Assert.equals((int64) aDoneStep, (int64) admitStep);
+        Assert.equals((int64) 0, (int64) s.preemptedCount());
+        Assert.equals((int64) 0, (int64) s.queuedCount());
+        SchedulerTest.assertMatchesSolo(s, a, pa, 4, 8);
+        SchedulerTest.assertMatchesSolo(s, b, pb, 12, 4);
+    }
+
+    // ── 9.1.5–9.1.7, 9.1.9, 9.3.2 — preempt, resume, no starvation ──────
+
+    @Test
+    public void preemptionRecomputesOnResumeMatchingUninterrupted() {
+        // 20 blocks. A (older) grows to 32 tokens → 16 blocks; B
+        // (younger) to 32 → 16. Both fit at admission; mid-flight the
+        // combined demand exceeds the pool, so the YOUNGEST (B) is
+        // preempted, A runs to completion, and B resumes by recomputing
+        // its prefix (6.32).
+        LlamaForCausalLM m = SchedulerTest.mk("pre", 2, 20);
+        Scheduler s = heap Scheduler(m, 4);
+        int32[] pa = SchedulerTest.promptOf(2, 9);
+        int32[] pb = SchedulerTest.promptOf(8, 4);
+        int32 a = s.submit(pa, 2, 30);
+        int32 b = s.submit(pb, 8, 24);
+        s.runAll(600);
+
+        Assert.isTrue(s.preemptedCount() >= 1);
+        Assert.isTrue(s.resumedCount() >= 1);
+        Assert.equals((int64) 2, (int64) s.admittedCount());
+        Assert.equals((int64) 0, (int64) s.queuedCount());
+
+        // 9.3.2: under preemption pressure both outputs are IDENTICAL to
+        // uninterrupted solo runs — recompute-on-resume is exact.
+        SchedulerTest.assertMatchesSolo(s, a, pa, 2, 30);
+        SchedulerTest.assertMatchesSolo(s, b, pb, 8, 24);
+    }
+
+    @Test
+    public void preemptedRequestResumesPromptlyAfterBlocksFree() {
+        // Same shape as above, but observed step by step: B must resume
+        // within two iterations of A's completion (9.1.7's bound here is
+        // "the next admission phase", i.e. the same or next step).
+        LlamaForCausalLM m = SchedulerTest.mk("res", 2, 20);
+        Scheduler s = heap Scheduler(m, 4);
+        int32[] pa = SchedulerTest.promptOf(2, 9);
+        int32[] pb = SchedulerTest.promptOf(8, 4);
+        int32 a = s.submit(pa, 2, 30);
+        int32 b = s.submit(pb, 8, 24);
+        int32 guard = 0;
+        int32 aDoneStep = -1;
+        int32 resumeStep = -1;
+        boolean sawPreempt = false;
+        while (guard < 600 && !s.allDone()) {
+            s.stepOnce();
+            if (s.preemptedCount() > 0) {
+                sawPreempt = true;
+            }
+            if (aDoneStep < 0 && s.request(a).isDone()) {
+                aDoneStep = s.stepCount();
+            }
+            if (resumeStep < 0 && s.resumedCount() > 0) {
+                resumeStep = s.stepCount();
+            }
+            guard = guard + 1;
+        }
+        Assert.isTrue(s.allDone());
+        Assert.isTrue(sawPreempt);
+        Assert.isTrue(resumeStep >= 0);
+        // Bounded resume: no later than one step after A completed.
+        Assert.isTrue(resumeStep <= aDoneStep + 1);
+    }
+}

@@ -1,0 +1,55 @@
+package dev.cajeta.llama.sched;
+
+/**
+ * One generation request in the scheduler: the prompt, the growing token
+ * stream (prompt + generated — also the recompute source for
+ * resume-after-preemption, spec 6.32), and its scheduling state.
+ */
+public final class Request {
+    /** WAITING → RUNNING → DONE, with RUNNING ⇄ PREEMPTED under pressure. */
+    static final int32 WAITING = 0;
+    static final int32 RUNNING = 1;
+    static final int32 PREEMPTED = 2;
+    static final int32 DONE = 3;
+
+    int32[] all;        // prompt then generated tokens
+    int32 promptLen;
+    int32 totalLen;     // prompt + generated so far
+    int32 maxNew;
+    int32 genCount;
+    int32 state;
+    int32 slot;         // cache sequence id while RUNNING, else -1
+    int32 cachedLen;    // positions currently in the KV cache
+    int32 stamp;        // admission order — the preemption policy's age
+    int32 preemptStamp; // preemption order — the resume FIFO key
+
+    Request(int32[] prompt, int32 promptLen, int32 maxNew) {
+        this.all = heap int32[promptLen + maxNew + 1];
+        int32 i = 0;
+        while (i < promptLen) {
+            this.all[i] = prompt[i];
+            i = i + 1;
+        }
+        this.promptLen = promptLen;
+        this.totalLen = promptLen;
+        this.maxNew = maxNew;
+        this.genCount = 0;
+        this.state = Request.WAITING;
+        this.slot = -1;
+        this.cachedLen = 0;
+        this.stamp = 0;
+        this.preemptStamp = 0;
+    }
+
+    public int32 generatedCount() {
+        return this.genCount;
+    }
+
+    public int32 generatedAt(int32 i) {
+        return this.all[this.promptLen + i];
+    }
+
+    public boolean isDone() {
+        return this.state == Request.DONE;
+    }
+}

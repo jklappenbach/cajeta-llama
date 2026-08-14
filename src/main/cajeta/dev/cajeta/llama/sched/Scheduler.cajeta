@@ -1,0 +1,283 @@
+package dev.cajeta.llama.sched;
+
+import cajeta.collection.ArrayList;
+import dev.cajeta.llama.LlamaException;
+import dev.cajeta.llama.model.LlamaForCausalLM;
+import dev.cajeta.llama.model.PagedKvCache;
+
+/**
+ * The continuous-batching scheduler (plan Unit 9; spec 6.19–6.25,
+ * 13.14, 13.15): iteration-level batch assembly over one step function.
+ *
+ * Every request advances by consuming its unconsumed tokens in chunks of
+ * at most `chunk` through `LlamaForCausalLM.stepSeq` — a prefilling
+ * request has many unconsumed tokens, a decoding request exactly one, so
+ * DECODE IS THE N=1 CHUNK of the same path (13.14) and long prompts
+ * interleave with in-flight decodes by construction (6.21): each
+ * iteration gives every running request one bounded item.
+ *
+ * Stated policies (6.22, 6.23):
+ * - Admission (6.19): a request is admitted only when free blocks cover
+ *   its whole uncached suffix PLUS one block per unwindowed layer of
+ *   decode headroom — admitting churn is not progress.
+ * - Preemption victim: the YOUNGEST running request (latest
+ *   admission/resume stamp). Older work is never sacrificed for newer,
+ *   which is what bounds every request's wait.
+ * - Resume: preempted requests re-admit FIFO by preemption time and take
+ *   priority over new admissions — combined with youngest-victim, no
+ *   request starves (6.23). With no store (6.32), resume recomputes the
+ *   prefix through the same chunked path; the Unit 11 store swaps in
+ *   behind exactly this seam.
+ */
+public final class Scheduler {
+    LlamaForCausalLM model;   // borrowed; the caller keeps it alive
+    int32 chunk;
+    int32 maxSeqs;
+    ArrayList<Request> reqs;
+    int32[] slotReq;          // request id per slot, -1 free
+    int32 admittedN;
+    int32 preemptedN;
+    int32 resumedN;
+    int32 stamp;
+    int32 steps;
+
+    public Scheduler(LlamaForCausalLM model, int32 chunk) {
+        this.model = model;
+        this.chunk = chunk;
+        this.maxSeqs = model.maxSequences();
+        this.reqs = heap ArrayList<Request>();
+        this.slotReq = heap int32[this.maxSeqs];
+        int32 i = 0;
+        while (i < this.maxSeqs) {
+            this.slotReq[i] = -1;
+            i = i + 1;
+        }
+        this.admittedN = 0;
+        this.preemptedN = 0;
+        this.resumedN = 0;
+        this.stamp = 0;
+        this.steps = 0;
+    }
+
+    /** Enqueue a request; returns its id. */
+    public int32 submit(int32[] prompt, int32 promptLen, int32 maxNew) {
+        Request r = heap Request(prompt, promptLen, maxNew);
+        this.reqs.add(#r);
+        return this.reqs.count() - 1;
+    }
+
+    public Request request(int32 id) {
+        return this.reqs.get(id);
+    }
+
+    // ── counters (6.25) ─────────────────────────────────────────────────
+
+    public int32 admittedCount() {
+        return this.admittedN;
+    }
+
+    public int32 preemptedCount() {
+        return this.preemptedN;
+    }
+
+    public int32 resumedCount() {
+        return this.resumedN;
+    }
+
+    /** Requests waiting for a slot or for blocks (incl. preempted). */
+    public int32 queuedCount() {
+        int32 n = 0;
+        int32 i = 0;
+        while (i < this.reqs.count()) {
+            int32 st = this.reqs.get(i).state;
+            if (st == Request.WAITING || st == Request.PREEMPTED) {
+                n = n + 1;
+            }
+            i = i + 1;
+        }
+        return n;
+    }
+
+    public int32 stepCount() {
+        return this.steps;
+    }
+
+    public boolean allDone() {
+        int32 i = 0;
+        while (i < this.reqs.count()) {
+            if (this.reqs.get(i).state != Request.DONE) {
+                return false;
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    // ── the iteration (6.20) ────────────────────────────────────────────
+
+    /**
+     * One scheduling iteration: admit what fits (resumes first), give
+     * every running request one bounded item, emit tokens for requests
+     * whose newest position was consumed, release completions, and admit
+     * again so a completion's blocks serve a waiter within the SAME step
+     * (6.24). Returns whether unfinished requests remain.
+     */
+    public boolean stepOnce() {
+        this.steps = this.steps + 1;
+        this.admitPhase();
+        PagedKvCache cache = this.model.kvCache();
+        int32 i = 0;
+        while (i < this.reqs.count()) {
+            Request r = this.reqs.get(i);
+            if (r.state == Request.RUNNING) {
+                int32 n = r.totalLen - r.cachedLen;
+                if (n > this.chunk) {
+                    n = this.chunk;
+                }
+                // Per-item headroom: preempt YOUNGER requests until this
+                // item fits; if this request is itself the youngest, it
+                // yields (preempts itself) instead (6.22).
+                while (cache.blocksNeededFor(r.slot, n) > cache.freeBlocks()) {
+                    int32 victim = this.youngestRunning();
+                    if (victim < 0) {
+                        throw heap LlamaException(
+                            "scheduler: no preemptable sequence");
+                    }
+                    this.preempt(victim);
+                    if (victim == i) {
+                        break;
+                    }
+                }
+                if (r.state != Request.RUNNING) {
+                    i = i + 1;
+                    continue;
+                }
+                int32 ret = this.model.stepSeq(r.slot, r.all, r.cachedLen, n);
+                r.cachedLen = r.cachedLen + n;
+                if (r.cachedLen == r.totalLen) {
+                    // The newest position was consumed: `ret` is the next
+                    // token (interior chunks discard it).
+                    r.all[r.totalLen] = ret;
+                    r.totalLen = r.totalLen + 1;
+                    r.genCount = r.genCount + 1;
+                    if (r.genCount >= r.maxNew) {
+                        cache.release(r.slot);
+                        this.slotReq[r.slot] = -1;
+                        r.slot = -1;
+                        r.state = Request.DONE;
+                    }
+                }
+            }
+            i = i + 1;
+        }
+        // Completions freed blocks: same-step admission (6.24).
+        this.admitPhase();
+        return !this.allDone();
+    }
+
+    /** Drive to completion, with a hard progress cap. */
+    public void runAll(int32 maxSteps) {
+        int32 s = 0;
+        while (s < maxSteps) {
+            if (!this.stepOnce()) {
+                return;
+            }
+            s = s + 1;
+        }
+        throw heap LlamaException("scheduler: not done after " + maxSteps
+            + " steps");
+    }
+
+    // ── internals ───────────────────────────────────────────────────────
+
+    void admitPhase() {
+        PagedKvCache cache = this.model.kvCache();
+        while (true) {
+            // Resumes first, FIFO by preemption time; then new waiters,
+            // FIFO by submission (6.23).
+            int32 pick = -1;
+            int32 bestPre = 2147483647;
+            int32 i = 0;
+            while (i < this.reqs.count()) {
+                Request r = this.reqs.get(i);
+                if (r.state == Request.PREEMPTED
+                        && r.preemptStamp < bestPre) {
+                    pick = i;
+                    bestPre = r.preemptStamp;
+                }
+                i = i + 1;
+            }
+            boolean isResume = pick >= 0;
+            if (pick < 0) {
+                i = 0;
+                while (i < this.reqs.count()) {
+                    if (this.reqs.get(i).state == Request.WAITING) {
+                        pick = i;
+                        break;
+                    }
+                    i = i + 1;
+                }
+            }
+            if (pick < 0) {
+                return;
+            }
+            int32 slot = -1;
+            i = 0;
+            while (i < this.maxSeqs) {
+                if (this.slotReq[i] < 0) {
+                    slot = i;
+                    break;
+                }
+                i = i + 1;
+            }
+            if (slot < 0) {
+                return;
+            }
+            Request r = this.reqs.get(pick);
+            // 6.19: the whole uncached suffix plus decode headroom.
+            int32 bt = cache.blocksNeededFor(slot, r.totalLen)
+                + cache.fullLayers();
+            if (bt > cache.freeBlocks()) {
+                return;
+            }
+            this.slotReq[slot] = pick;
+            r.slot = slot;
+            r.cachedLen = 0;
+            r.state = Request.RUNNING;
+            this.stamp = this.stamp + 1;
+            r.stamp = this.stamp;
+            if (isResume) {
+                this.resumedN = this.resumedN + 1;
+            } else {
+                this.admittedN = this.admittedN + 1;
+            }
+        }
+    }
+
+    int32 youngestRunning() {
+        int32 best = -1;
+        int32 bestStamp = -1;
+        int32 i = 0;
+        while (i < this.reqs.count()) {
+            Request r = this.reqs.get(i);
+            if (r.state == Request.RUNNING && r.stamp > bestStamp) {
+                best = i;
+                bestStamp = r.stamp;
+            }
+            i = i + 1;
+        }
+        return best;
+    }
+
+    void preempt(int32 id) {
+        Request r = this.reqs.get(id);
+        this.model.kvCache().release(r.slot);
+        this.slotReq[r.slot] = -1;
+        r.slot = -1;
+        r.cachedLen = 0;
+        r.state = Request.PREEMPTED;
+        this.stamp = this.stamp + 1;
+        r.preemptStamp = this.stamp;
+        this.preemptedN = this.preemptedN + 1;
+    }
+}

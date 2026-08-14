@@ -116,6 +116,37 @@ public final class PagedKvCache {
         return this.lenSL[seq * this.layers + layer];
     }
 
+    /** Unwindowed layers — each holds full-context blocks. */
+    public int32 fullLayers() {
+        int32 n = 0;
+        int32 l = 0;
+        while (l < this.layers) {
+            if (this.layerWindow[l] == 0) {
+                n = n + 1;
+            }
+            l = l + 1;
+        }
+        return n;
+    }
+
+    /** Pool blocks `n` more tokens on `seq` would draw — the scheduler's
+     *  admission/headroom arithmetic (spec 6.19). */
+    public int32 blocksNeededFor(int32 seq, int32 n) {
+        int32 total = 0;
+        int32 l = 0;
+        while (l < this.layers) {
+            if (this.layerWindow[l] == 0) {
+                int32 len = this.lenSL[seq * this.layers + l];
+                int32 now = (len + this.blockTokens - 1) / this.blockTokens;
+                int32 then = (len + n + this.blockTokens - 1)
+                    / this.blockTokens;
+                total = total + (then - now);
+            }
+            l = l + 1;
+        }
+        return total;
+    }
+
     // ── append (6.1, 6.2, 6.8, 6.15) ────────────────────────────────────
 
     /**

@@ -418,7 +418,7 @@ public class AttentionTest {
         int32 hd = cfg.headDim;
         int32 vocab = cfg.vocabSize;
         float32 eps = cfg.rmsNormEps;
-        LlamaForCausalLM m = heap LlamaForCausalLM(#cfg, 32);
+        LlamaForCausalLM m = heap LlamaForCausalLM(#cfg, 32, 1, 0);
         Checkpoint ck = Checkpoint.open(stPath);
         m.bind(ck, false);
         ck.close();

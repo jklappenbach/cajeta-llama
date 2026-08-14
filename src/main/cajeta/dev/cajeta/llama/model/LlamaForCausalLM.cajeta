@@ -37,9 +37,16 @@ public final class LlamaForCausalLM extends InfModule {
     ActivationPool pool;
     PagedKvCache cache;
     int32 maxSeq;
+    int32 maxSeqsN;
     int32 pos;
 
-    public LlamaForCausalLM(#ModelConfig cfg, int32 maxSeq) {
+    /**
+     * `maxSeqs` sequences share the cache pool; `numBlocks` 0 auto-sizes
+     * so every sequence can hold a full context (the scheduler passes a
+     * deliberately scarcer pool to exercise admission and preemption).
+     */
+    public LlamaForCausalLM(#ModelConfig cfg, int32 maxSeq, int32 maxSeqs,
+            int32 numBlocks) {
         this.cfg #= cfg;
         this.model = heap LlamaModel(this.cfg);
         if (this.cfg.tieWordEmbeddings) {
@@ -61,13 +68,21 @@ public final class LlamaForCausalLM extends InfModule {
             }
             li = li + 1;
         }
-        int32 nb = fullLayers * blocksPerSeq;
+        int32 nb = numBlocks;
+        if (nb == 0) {
+            nb = fullLayers * blocksPerSeq * maxSeqs;
+        }
         if (nb == 0) {
             nb = 1;
         }
-        this.cache = heap PagedKvCache(this.cfg, maxSeq, 1, nb);
+        this.cache = heap PagedKvCache(this.cfg, maxSeq, maxSeqs, nb);
         this.maxSeq = maxSeq;
+        this.maxSeqsN = maxSeqs;
         this.pos = 0;
+    }
+
+    public int32 maxSequences() {
+        return this.maxSeqsN;
     }
 
     /** The cache — observable occupancy for tests and the scheduler. */
@@ -79,7 +94,7 @@ public final class LlamaForCausalLM extends InfModule {
     public static #LlamaForCausalLM load(String configPath, String ckptPath,
             int32 maxSeq, boolean toDevice) {
         LlamaForCausalLM m = heap LlamaForCausalLM(
-            ModelConfig.parse(configPath), maxSeq);
+            ModelConfig.parse(configPath), maxSeq, 1, 0);
         Checkpoint ckpt = Checkpoint.open(ckptPath);
         m.bind(ckpt, toDevice);
         ckpt.close();
@@ -108,18 +123,38 @@ public final class LlamaForCausalLM extends InfModule {
     }
 
     /**
-     * Run the prompt `tokens[0, n)` from the current position: fills the
-     * KV cache, computes logits for the last position, returns its
-     * argmax. One arena block is the only buffer allocation (spec 4.9).
+     * Run the prompt `tokens[0, n)` from the current position of the
+     * DEFAULT sequence — sequence 0's convenience wrapper over
+     * {@link #stepSeq}.
      */
     public int32 prefill(int32[] tokens, int32 n) {
+        int32 r = this.stepSeq(0, tokens, 0, n);
+        this.pos = this.cache.lengthOf(0, 0);
+        return r;
+    }
+
+    /**
+     * THE step function (spec 13.14): consume `n` tokens
+     * `tokens[off, off+n)` of sequence `seq` from its current cache
+     * length — a prefill chunk at n=chunk, a decode at n=1, one forward
+     * path. Returns the argmax over the LAST consumed position's logits
+     * (meaningful when that position is the sequence's newest token;
+     * interior chunks' argmax is discarded by the caller). n=1 runs in
+     * pooled buffers (zero allocations); larger chunks carve one arena
+     * block sized to the actual chunk (spec 4.9).
+     */
+    public int32 stepSeq(int32 seq, int32[] tokens, int32 off, int32 n) {
         if (n <= 0) {
-            throw heap LlamaException("prefill: token count must be positive");
+            throw heap LlamaException("step: token count must be positive");
         }
-        if (this.pos + n > this.maxSeq) {
-            throw heap LlamaException("prefill: " + n
-                + " tokens at position " + this.pos
+        int32 seqPos = this.cache.lengthOf(seq, 0);
+        if (seqPos + n > this.maxSeq) {
+            throw heap LlamaException("step: " + n
+                + " tokens at position " + seqPos
                 + " exceeds maxSeq " + this.maxSeq);
+        }
+        if (n == 1) {
+            return this.stepOne(seq, tokens[off]);
         }
         int64 rows = (int64) n;
         int64 h = (int64) this.cfg.hiddenSize;
@@ -144,32 +179,40 @@ public final class LlamaForCausalLM extends InfModule {
         Tensor<float32> emb = this.model.embed_tokens.weight;
         int32 r = 0;
         while (r < n) {
-            HostOps.embedRow(emb, tokens[r], hs, (int64) r * h,
+            HostOps.embedRow(emb, tokens[off + r], hs, (int64) r * h,
                 this.cfg.hiddenSize);
             r = r + 1;
         }
-        this.forwardRows(hs, xn, q, k, v, ao, proj, gate, up, mlpOut,
-            n, this.pos);
-        this.pos = this.pos + n;
+        int32 seqPos2 = this.cache.lengthOf(seq, 0);
+        this.forwardRows(seq, hs, xn, q, k, v, ao, proj, gate, up, mlpOut,
+            n, seqPos2);
         return HostOps.argmaxRow(this.pool.logits, this.cfg.vocabSize);
     }
 
     /**
-     * One decode step for `token` at the current position, entirely in
-     * pooled buffers: zero heap allocations (6.1.6). Returns the argmax
-     * of the resulting logits.
+     * One decode step for `token` at the current position of sequence 0,
+     * entirely in pooled buffers: zero heap allocations (6.1.6). Returns
+     * the argmax of the resulting logits.
      */
     public int32 decodeStep(int32 token) {
-        if (this.pos >= this.maxSeq) {
+        int32 r = this.stepOne(0, token);
+        this.pos = this.cache.lengthOf(0, 0);
+        return r;
+    }
+
+    /** The N=1 specialization of {@link #stepSeq}: pooled buffers, zero
+     *  heap allocations, same `forwardRows`. */
+    int32 stepOne(int32 seq, int32 token) {
+        int32 seqPos = this.cache.lengthOf(seq, 0);
+        if (seqPos >= this.maxSeq) {
             throw heap LlamaException("decode: context is full (maxSeq "
                 + this.maxSeq + ")");
         }
         ActivationPool p = this.pool;
         HostOps.embedRow(this.model.embed_tokens.weight, token, p.x, 0,
             this.cfg.hiddenSize);
-        this.forwardRows(p.x, p.xn, p.q, p.k, p.v, p.attnOut, p.attnProj,
-            p.gate, p.up, p.mlpOut, 1, this.pos);
-        this.pos = this.pos + 1;
+        this.forwardRows(seq, p.x, p.xn, p.q, p.k, p.v, p.attnOut,
+            p.attnProj, p.gate, p.up, p.mlpOut, 1, seqPos);
         return HostOps.argmaxRow(p.logits, this.cfg.vocabSize);
     }
 
@@ -181,7 +224,7 @@ public final class LlamaForCausalLM extends InfModule {
      * the LAST row into `pool.logits`. Buffers are caller-owned; row `r`
      * of a buffer is its flat range `[r·dim, (r+1)·dim)`.
      */
-    void forwardRows(Tensor<float32> hs, Tensor<float32> xn,
+    void forwardRows(int32 seq, Tensor<float32> hs, Tensor<float32> xn,
             Tensor<float32> q, Tensor<float32> k, Tensor<float32> v,
             Tensor<float32> ao, Tensor<float32> proj,
             Tensor<float32> gate, Tensor<float32> up,
@@ -234,15 +277,16 @@ public final class LlamaForCausalLM extends InfModule {
                 // never the ring slot (spec 6.10).
                 Prim.ropeRowHost(q, rq, nH, hd, p, a.ropeInv);
                 Prim.ropeRowHost(k, rkv, nKv, hd, p, a.ropeInv);
-                if (!this.cache.appendRow(0, l, k, rkv, v, rkv, p)) {
-                    // Single-sequence path: exhaustion is a sizing bug
-                    // here; the Unit 9 scheduler owns it for real (6.4).
+                if (!this.cache.appendRow(seq, l, k, rkv, v, rkv, p)) {
+                    // The scheduler's admission/headroom arithmetic must
+                    // prevent this; hitting it here is an invariant
+                    // violation, not a schedulable event (6.4, 13.15).
                     throw heap LlamaException("kv pool exhausted at layer "
                         + l + " position " + p);
                 }
                 // Causal by construction; the layer's window clamps in
                 // prefill AND decode inside the cache read (spec 5.9).
-                this.cache.attendRow(0, l, q, rq, a.scale, scores, ao, rq,
+                this.cache.attendRow(seq, l, q, rq, a.scale, scores, ao, rq,
                     nH, nKv, hd);
                 HostOps.matvecRow(ao, rq, a.o_proj.weight, proj, rh, qd, h);
                 if (d.fourNorm) {

@@ -128,7 +128,7 @@ public class KvCacheTest {
 
         ModelConfig cfgA = ModelConfig.parse(cfgPath);
         cfgA.blockTokens = 4;
-        LlamaForCausalLM mA = heap LlamaForCausalLM(#cfgA, 64);
+        LlamaForCausalLM mA = heap LlamaForCausalLM(#cfgA, 64, 1, 0);
         Checkpoint ckA = Checkpoint.open(stPath);
         mA.bind(ckA, false);
         ckA.close();
@@ -151,7 +151,7 @@ public class KvCacheTest {
 
         ModelConfig cfgB = ModelConfig.parse(cfgPath);
         cfgB.blockTokens = 4;
-        LlamaForCausalLM mB = heap LlamaForCausalLM(#cfgB, 64);
+        LlamaForCausalLM mB = heap LlamaForCausalLM(#cfgB, 64, 1, 0);
         Checkpoint ckB = Checkpoint.open(stPath);
         mB.bind(ckB, false);
         ckB.close();
@@ -216,7 +216,7 @@ public class KvCacheTest {
         ForwardTest.writeA(cfgPath, stPath, 2);
         ModelConfig cfg = ModelConfig.parse(cfgPath);
         cfg.blockTokens = 4;
-        LlamaForCausalLM m = heap LlamaForCausalLM(#cfg, 64);
+        LlamaForCausalLM m = heap LlamaForCausalLM(#cfg, 64, 1, 0);
         Checkpoint ck = Checkpoint.open(stPath);
         m.bind(ck, false);
         ck.close();
@@ -601,7 +601,7 @@ public class KvCacheTest {
         ToyModel.writeWeights(stPath, s);
         ModelConfig cfg = ModelConfig.parse(cfgPath);
         cfg.blockTokens = 4;
-        LlamaForCausalLM m = heap LlamaForCausalLM(#cfg, 32);
+        LlamaForCausalLM m = heap LlamaForCausalLM(#cfg, 32, 1, 0);
         Checkpoint ck = Checkpoint.open(stPath);
         m.bind(ck, false);
         ck.close();
