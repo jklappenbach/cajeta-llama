@@ -365,11 +365,32 @@ final class TplParser {
             throw heap LlamaException("chat template '" + this.t.name
                 + "': {% for %} at line " + startLine + " expects 'in'");
         }
-        int32 iter = this.parseExpr();
+        // parseOr, NOT parseExpr: inside a for-tag a trailing `if` is the
+        // LOOP FILTER, not Jinja's inline conditional. parseExpr descends
+        // to parseCond, which consumes the `if` into an E_COND with no
+        // else — silently swallowing the filter, which is why the first
+        // attempt at this fix changed nothing. A conditional iterable has
+        // to be parenthesised, exactly as in Jinja.
+        int32 iter = this.parseOr();
         int32 node = this.t.add(Tpl.N_FOR, startLine);
         this.t.setA(node, iter);
         this.t.setStr(node, #names);
         this.t.setD(node, count);
+        // Jinja's LOOP FILTER: `{% for x in seq if cond %}`. The condition
+        // is evaluated with the loop variable BOUND, and filtered-out items
+        // never reach `loop.index` / `loop.length` — so it is not a
+        // conditional over the iterable and cannot be folded into the
+        // parseExpr above.
+        //
+        // Unparsed until now, which is why the qwen3coder
+        // `render_extra_keys` macro emitted EVERY key rather than only the
+        // unhandled ones — duplicating <type>/<description> on each tool
+        // parameter and appending the whole <name>/<description>/
+        // <parameters> block a second time.
+        this.eSkipWs();
+        if (this.eAtWord("if")) {
+            this.t.setE(node, this.parseExpr());
+        }
         int32 body = this.parseBlock();
         this.t.setB(node, body);
         if (this.endTag != null && this.endTag.equals("else")) {

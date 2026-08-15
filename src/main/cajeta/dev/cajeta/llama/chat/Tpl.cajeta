@@ -13,14 +13,16 @@ import cajeta.lang.String;
  */
 public final class Tpl {
 
-    static final int32 W = 7;      // kind, a, b, c, d, nx, line
+    static final int32 W = 8;      // kind, a, b, c, d, nx, line, e
 
     // ── statement kinds ────────────────────────────────────────────────
     static final int32 N_TEXT = 0;   // str = literal
     static final int32 N_OUT = 1;    // a = expr
     static final int32 N_IF = 2;     // a = cond, b = then, c = else
     static final int32 N_FOR = 3;    // a = iter, b = body, c = else,
-                                     // str = "k" or "k,v", d = name count
+                                     // str = "k" or "k,v", d = name count,
+                                     // e = loop filter or -1
+                                     //   `{% for x in seq if cond %}`
     static final int32 N_SET = 4;    // str = name, a = expr
     static final int32 N_MACRO = 5;  // str = name, a = params, b = body
 
@@ -91,6 +93,7 @@ public final class Tpl {
         this.f[base + 4] = 0;
         this.f[base + 5] = 0 - 1;
         this.f[base + 6] = line;
+        this.f[base + 7] = 0 - 1;
         this.n = at + 1;
         return at;
     }
@@ -121,6 +124,15 @@ public final class Tpl {
 
     int32 line(int32 i) {
         return this.f[i * Tpl.W + 6];
+    }
+
+    /** N_FOR only: the `if` loop filter expression, or -1. */
+    int32 e(int32 i) {
+        return this.f[i * Tpl.W + 7];
+    }
+
+    void setE(int32 i, int32 v) {
+        this.f[i * Tpl.W + 7] = v;
     }
 
     void setA(int32 i, int32 v) {

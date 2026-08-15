@@ -431,34 +431,75 @@ final class TplEval {
             this.run(this.t.c(i));       // for/else
             return;
         }
+        // LOOP FILTER (`{% for x in seq if cond %}`) — resolved in a first
+        // pass, before any body runs. Jinja excludes filtered items from
+        // `loop.index` and `loop.length` entirely, so the surviving indices
+        // must be known before the counters can be right; testing the
+        // condition inside the body loop would leave gaps in loop.index and
+        // an inflated loop.length.
+        int32 filter = this.t.e(i);
+        int32[] keep = heap int32[count];
+        int32 keptN = 0;
         int32 mark = this.depth;
         int32 idx = 0;
-        while (idx < count) {
-            this.depth = mark;           // fresh frame each iteration
-            JsonValue item = null;
-            if (arr != null) {
-                item = arr.get(idx);
-                if (nameCount > 1 && item != null
-                        && item.kind() == JsonValue.ARRAY) {
-                    JsonArray pair = item.asArray();
-                    this.push(n1, #TplEval.copy(pair.get(0)));
-                    this.push(n2, #TplEval.copy(pair.get(1)));
-                } else {
-                    this.push(n1, #TplEval.copy(item));
-                }
-            } else {
-                String key = TplEval.keyOf(obj, idx);
-                JsonValue kv = TplEval.str(key);
-                this.push(n1, #kv);
-                if (nameCount > 1) {
-                    this.push(n2, #TplEval.copy(obj.valueAt(idx)));
-                }
+        if (filter < 0) {
+            while (idx < count) {
+                keep[idx] = idx;
+                idx = idx + 1;
             }
-            this.push("loop", #this.loopVar(idx, count, arr));
+            keptN = count;
+        } else {
+            while (idx < count) {
+                this.depth = mark;       // the condition sees the binding
+                this.bindLoopNames(arr, obj, idx, n1, n2, nameCount);
+                if (TplEval.truthy(this.eval(filter))) {
+                    keep[keptN] = idx;
+                    keptN = keptN + 1;
+                }
+                idx = idx + 1;
+            }
+            this.depth = mark;
+        }
+        if (keptN == 0) {
+            this.run(this.t.c(i));       // for/else — a fully filtered
+            return;                      // loop takes the else branch
+        }
+        int32 p = 0;
+        while (p < keptN) {
+            this.depth = mark;           // fresh frame each iteration
+            this.bindLoopNames(arr, obj, keep[p], n1, n2, nameCount);
+            this.push("loop", #this.loopVar(p, keptN, arr));
             this.run(this.t.b(i));
-            idx = idx + 1;
+            p = p + 1;
         }
         this.depth = mark;
+    }
+
+    /**
+     * Bind the loop variable(s) for element `idx`. Factored out of
+     * `execFor` so the loop FILTER pass and the body pass bind identically
+     * — the condition must see exactly the binding the body would.
+     */
+    void bindLoopNames(JsonArray arr, JsonObject obj, int32 idx,
+            String n1, String n2, int32 nameCount) {
+        if (arr != null) {
+            JsonValue item = arr.get(idx);
+            if (nameCount > 1 && item != null
+                    && item.kind() == JsonValue.ARRAY) {
+                JsonArray pair = item.asArray();
+                this.push(n1, #TplEval.copy(pair.get(0)));
+                this.push(n2, #TplEval.copy(pair.get(1)));
+            } else {
+                this.push(n1, #TplEval.copy(item));
+            }
+        } else {
+            String key = TplEval.keyOf(obj, idx);
+            JsonValue kv = TplEval.str(key);
+            this.push(n1, #kv);
+            if (nameCount > 1) {
+                this.push(n2, #TplEval.copy(obj.valueAt(idx)));
+            }
+        }
     }
 
     #JsonValue loopVar(int32 idx, int32 count, JsonArray arr) {
@@ -957,14 +998,42 @@ final class TplEval {
         return false;
     }
 
+    /**
+     * True when `e` is a bare name that resolves to a CALLABLE rather than
+     * a variable.
+     *
+     * Jinja's `is defined` is true for anything the environment resolves,
+     * and that includes callables in `env.globals` — transformers injects
+     * `strftime_now` and `raise_exception`, and `range` is a Jinja builtin.
+     * `eval` only resolves VARIABLES, so a bare function name came back
+     * null and `strftime_now is defined` was FALSE. The Llama-3 template
+     * guards its date with exactly that test:
+     *
+     *     {%- if strftime_now is defined %}
+     *         {%- set date_string = strftime_now("%d %b %Y") %}
+     *     {%- else %}
+     *         {%- set date_string = "26 Jul 2024" %}
+     *
+     * so every llama3 case rendered the template's hardcoded fallback date
+     * instead of the injected clock.
+     */
+    boolean nameIsCallable(int32 e) {
+        if (e < 0 || this.t.k(e) != Tpl.E_NAME) {
+            return false;
+        }
+        String n = this.t.strOf(e);
+        return n.equals("strftime_now") || n.equals("raise_exception")
+            || n.equals("range") || this.macroOf(n) >= 0;
+    }
+
     #JsonValue evalTest(int32 i) {
         String name = this.t.strOf(i);
         JsonValue v = this.eval(this.t.a(i));
         boolean r = false;
         if (name.equals("defined")) {
-            r = v != null;
+            r = v != null || this.nameIsCallable(this.t.a(i));
         } else if (name.equals("undefined")) {
-            r = v == null;
+            r = v == null && !this.nameIsCallable(this.t.a(i));
         } else if (name.equals("none")) {
             r = v != null && v.kind() == JsonValue.NULL;
         } else if (name.equals("string")) {

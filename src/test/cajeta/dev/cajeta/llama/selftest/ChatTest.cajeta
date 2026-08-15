@@ -2,6 +2,8 @@ package dev.cajeta.llama.selftest;
 
 import cajeta.codec.json.Json;
 import cajeta.codec.json.JsonObject;
+import cajeta.codec.json.JsonReader;
+import cajeta.codec.json.JsonToken;
 import cajeta.codec.json.JsonValue;
 import cajeta.io.file.File;
 import cajeta.lang.String;
@@ -69,20 +71,80 @@ public class ChatTest {
         return #t;
     }
 
-    /** The reference rendering for (family, case), or null. */
+    /**
+     * The reference rendering for (family, case), or null.
+     *
+     * STREAMED with `JsonReader.currentDecodedString`, not `Json.parse` +
+     * `asString()`. The parsed tree hands back escapes VERBATIM — the
+     * stdlib says so outright ("escapes verbatim because the reader's
+     * currentBytes() does too") — so `asString()` on a fixture entry
+     * yields a literal backslash-n where the reference has a NEWLINE.
+     * Every byte-exact comparison in this file then failed against an
+     * expectation that had never been decoded, which read as six engine
+     * bugs and was one bug in the harness. Same trap, same fix, as
+     * `ChatTemplate.fromTokenizerConfig` (spec 13.7).
+     */
     static #String expected(String tag, String caseName) {
         int8[] raw = File.readAllBytes(ChatTest.FIX);
-        JsonValue v = Json.parse(raw, (int64) raw.count());
-        JsonValue cases = v.asObject().get("cases");
-        JsonValue fam = cases.asObject().get(tag);
-        if (fam == null) {
+        JsonReader r = heap JsonReader(raw, (int64) raw.count());
+        // {"cases": {"<tag>": {"<caseName>": "<text>"}}}
+        if (!ChatTest.enterKey(r, "cases")) { return null; }
+        if (!ChatTest.enterKey(r, tag)) { return null; }
+        if (!ChatTest.enterKey(r, caseName)) { return null; }
+        // enterKey leaves the reader ON THE KEY; the value is the next
+        // token. A family that lacks this case is a legitimate skip.
+        if (r.next() != JsonToken.STRING) {
             return null;
         }
-        JsonValue row = fam.asObject().get(caseName);
-        if (row == null || row.kind() != JsonValue.STRING) {
-            return null;
+        return #r.currentDecodedString();
+    }
+
+    /**
+     * Scan the object `r` is about to enter for the key `want`. Returns
+     * true with the reader positioned on that KEY (caller advances to the
+     * value), false when the key is absent — the "family lacks this case"
+     * path that `assertCase` treats as a skip.
+     */
+    static boolean enterKey(JsonReader r, String want) {
+        if (r.next() != JsonToken.START_OBJECT) {
+            return false;
         }
-        return #row.asString();
+        boolean found = false;
+        while (!found) {
+            int32 t = r.next();
+            if (t == JsonToken.END_OBJECT || t == JsonToken.END) {
+                return false;
+            }
+            if (t != JsonToken.KEY) {
+                continue;
+            }
+            if (r.currentDecodedString().equals(want)) {
+                found = true;
+            } else {
+                ChatTest.skipValue(r, r.next());
+            }
+        }
+        return found;
+    }
+
+    /** Skip a composite value; scalars need no work. */
+    static void skipValue(JsonReader r, int32 opened) {
+        if (opened != JsonToken.START_OBJECT
+                && opened != JsonToken.START_ARRAY) {
+            return;
+        }
+        int32 depth = 1;
+        while (depth > 0) {
+            int32 e = r.next();
+            if (e == JsonToken.START_OBJECT || e == JsonToken.START_ARRAY) {
+                depth = depth + 1;
+            } else if (e == JsonToken.END_OBJECT
+                    || e == JsonToken.END_ARRAY) {
+                depth = depth - 1;
+            } else if (e == JsonToken.END) {
+                return;
+            }
+        }
     }
 
     static void assertCase(String tag, String caseName, String msgs,
@@ -169,10 +231,21 @@ public class ChatTest {
                 + "{\"role\":\"assistant\",\"content\":\"two\"}]"));
         // Whitespace control: `-%}` eats following whitespace, `{%-`
         // eats preceding; trim_blocks eats ONE newline after a tag.
+        //
+        // Both expectations below were hand-computed and both were WRONG;
+        // the engine was right. Re-derived by running the templates through
+        // ImmutableSandboxedEnvironment(trim_blocks=True,
+        // lstrip_blocks=True) — the same environment transformers uses —
+        // rather than by reasoning about trim_blocks a third time.
         String ws = "A\n{% if true %}\nB\n{% endif %}\nC";
-        Assert.equals("A\nB\n\nC", ChatTest.render(ws, "[]"));
+        // trim_blocks eats the newline after BOTH `%}`s, so no blank line
+        // survives: was asserted "A\nB\n\nC".
+        Assert.equals("A\nB\nC", ChatTest.render(ws, "[]"));
         String ws2 = "A\n{%- if true -%}\n   B\n{%- endif %}\nC";
-        Assert.equals("AB\nC", ChatTest.render(ws2, "[]"));
+        // `{%- endif %}` strips the whitespace BEFORE it (including B's
+        // trailing newline) and trim_blocks eats the one after it, so C
+        // joins directly: was asserted "AB\nC".
+        Assert.equals("ABC", ChatTest.render(ws2, "[]"));
         // Comments vanish.
         Assert.equals("XY", ChatTest.render("X{# a comment #}Y", "[]"));
     }
