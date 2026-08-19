@@ -124,14 +124,14 @@ public final class ModelConfig {
                 + "' is missing or empty");
         }
         JsonValue v = Json.parse(raw, rawLen);
-        JsonObject root = v.asObject();
+        JsonObject root = v.object();
 
         JsonValue archs = root.get("architectures");
-        if (archs == null || archs.asArray().count() < 1) {
+        if (archs == null || archs.array().count() < 1) {
             throw heap LlamaException("model config: '" + path
                 + "' declares no architectures");
         }
-        String arch = archs.asArray().get(0).asString();
+        String arch = archs.array().get(0).asString();
         if (!arch.equals("LlamaForCausalLM")) {
             // Spec 4.5: the error lists the supported architectures.
             throw heap LlamaException("model config: architecture '" + arch
@@ -179,7 +179,7 @@ public final class ModelConfig {
         }
         JsonValue rs = root.get("rope_scaling");
         if (rs != null && !rs.isNull()) {
-            JsonObject ro = rs.asObject();
+            JsonObject ro = rs.object();
             JsonValue ty = ro.get("rope_type");
             if (ty == null) {
                 ty = ro.get("type");
@@ -214,7 +214,7 @@ public final class ModelConfig {
         }
         JsonValue lt = root.get("layer_types");
         if (lt != null && !lt.isNull()) {
-            int32 n = lt.asArray().count();
+            int32 n = lt.array().count();
             if (n != c.numLayers) {
                 throw heap LlamaException("model config: layer_types has "
                     + n + " entries for " + c.numLayers + " layers");
@@ -222,7 +222,7 @@ public final class ModelConfig {
             int32[] lw = heap int32[n];
             int32 li = 0;
             while (li < n) {
-                String tname = lt.asArray().get(li).asString();
+                String tname = lt.array().get(li).asString();
                 if (tname.equals("sliding_attention")) {
                     lw[li] = c.slidingWindow;
                 } else if (tname.equals("full_attention")) {

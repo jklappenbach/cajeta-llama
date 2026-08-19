@@ -167,9 +167,9 @@ final class TplEval {
             return v.asBytesLength() > 0;
         }
         if (k == JsonValue.ARRAY) {
-            return v.asArray().count() > 0;
+            return v.array().count() > 0;
         }
-        return v.asObject().count() > 0;
+        return v.object().count() > 0;
     }
 
     /** Jinja's `str()` for interpolation. */
@@ -238,7 +238,7 @@ final class TplEval {
             return;
         }
         if (k == JsonValue.ARRAY) {
-            JsonArray arr = v.asArray();
+            JsonArray arr = v.array();
             int32 n = arr.count();
             b.addByte(91);
             int32 i = 0;
@@ -266,7 +266,7 @@ final class TplEval {
             b.addByte(93);
             return;
         }
-        JsonObject o = v.asObject();
+        JsonObject o = v.object();
         int32 n2 = o.count();
         b.addByte(123);
         int32 j = 0;
@@ -417,10 +417,10 @@ final class TplEval {
         JsonArray arr = null;
         JsonObject obj = null;
         if (seq != null && seq.kind() == JsonValue.ARRAY) {
-            arr = seq.asArray();
+            arr = seq.array();
             count = arr.count();
         } else if (seq != null && seq.kind() == JsonValue.OBJECT) {
-            obj = seq.asObject();
+            obj = seq.object();
             count = obj.count();
         } else if (seq != null && seq.kind() == JsonValue.STRING) {
             throw heap LlamaException("chat template '" + this.t.name
@@ -486,7 +486,7 @@ final class TplEval {
             JsonValue item = arr.get(idx);
             if (nameCount > 1 && item != null
                     && item.kind() == JsonValue.ARRAY) {
-                JsonArray pair = item.asArray();
+                JsonArray pair = item.array();
                 this.push(n1, #TplEval.copy(pair.get(0)));
                 this.push(n2, #TplEval.copy(pair.get(1)));
             } else {
@@ -594,7 +594,7 @@ final class TplEval {
             }
             r.setStringOwned(#dst, sn);
         } else if (k == JsonValue.ARRAY) {
-            JsonArray src = v.asArray();
+            JsonArray src = v.array();
             JsonArray dst = heap JsonArray();
             int32 i = 0;
             while (i < src.count()) {
@@ -603,7 +603,7 @@ final class TplEval {
             }
             r.setArray(#dst);
         } else {
-            JsonObject src2 = v.asObject();
+            JsonObject src2 = v.object();
             JsonObject dst2 = heap JsonObject();
             int32 j = 0;
             while (j < src2.count()) {
@@ -754,7 +754,7 @@ final class TplEval {
         if (o == null || o.kind() != JsonValue.OBJECT) {
             return null;
         }
-        JsonValue got = o.asObject().get(name);
+        JsonValue got = o.object().get(name);
         if (got == null) {
             return null;
         }
@@ -766,7 +766,7 @@ final class TplEval {
             return null;
         }
         if (o.kind() == JsonValue.ARRAY) {
-            JsonArray a = o.asArray();
+            JsonArray a = o.array();
             int32 i = (int32) TplEval.asNum(idx);
             if (i < 0) {
                 i = a.count() + i;
@@ -777,7 +777,7 @@ final class TplEval {
             return #TplEval.copy(a.get(i));
         }
         if (o.kind() == JsonValue.OBJECT) {
-            JsonValue got = o.asObject().get(TplEval.text(idx));
+            JsonValue got = o.object().get(TplEval.text(idx));
             if (got == null) {
                 return null;
             }
@@ -801,7 +801,7 @@ final class TplEval {
             s = o.asString();
             n = s.byteLength();
         } else if (o.kind() == JsonValue.ARRAY) {
-            arr = o.asArray();
+            arr = o.array();
             n = arr.count();
         } else {
             return null;
@@ -889,14 +889,14 @@ final class TplEval {
             }
             if (l3 != null && l3.kind() == JsonValue.ARRAY) {
                 JsonArray dst = heap JsonArray();
-                JsonArray la = l3.asArray();
+                JsonArray la = l3.array();
                 int32 z = 0;
                 while (z < la.count()) {
                     dst.add(TplEval.copy(la.get(z)));
                     z = z + 1;
                 }
                 if (r != null && r.kind() == JsonValue.ARRAY) {
-                    JsonArray ra = r.asArray();
+                    JsonArray ra = r.array();
                     z = 0;
                     while (z < ra.count()) {
                         dst.add(TplEval.copy(ra.get(z)));
@@ -979,7 +979,7 @@ final class TplEval {
             return false;
         }
         if (haystack.kind() == JsonValue.ARRAY) {
-            JsonArray a = haystack.asArray();
+            JsonArray a = haystack.array();
             int32 i = 0;
             while (i < a.count()) {
                 if (TplEval.eq(a.get(i), needle)) {
@@ -990,7 +990,7 @@ final class TplEval {
             return false;
         }
         if (haystack.kind() == JsonValue.OBJECT) {
-            return haystack.asObject().containsKey(TplEval.text(needle));
+            return haystack.object().containsKey(TplEval.text(needle));
         }
         if (haystack.kind() == JsonValue.STRING) {
             return haystack.asString().contains(TplEval.text(needle));
@@ -1109,16 +1109,16 @@ final class TplEval {
         }
         if (name.equals("first")) {
             if (v != null && v.kind() == JsonValue.ARRAY
-                    && v.asArray().count() > 0) {
-                return #TplEval.copy(v.asArray().get(0));
+                    && v.array().count() > 0) {
+                return #TplEval.copy(v.array().get(0));
             }
             return null;
         }
         if (name.equals("last")) {
             if (v != null && v.kind() == JsonValue.ARRAY
-                    && v.asArray().count() > 0) {
+                    && v.array().count() > 0) {
                 return #TplEval.copy(
-                    v.asArray().get(v.asArray().count() - 1));
+                    v.array().get(v.array().count() - 1));
             }
             return null;
         }
@@ -1154,7 +1154,7 @@ final class TplEval {
             }
             TplBuf b = heap TplBuf();
             if (v != null && v.kind() == JsonValue.ARRAY) {
-                JsonArray a = v.asArray();
+                JsonArray a = v.array();
                 int32 z = 0;
                 while (z < a.count()) {
                     if (z > 0) {
@@ -1187,10 +1187,10 @@ final class TplEval {
             return 0;
         }
         if (v.kind() == JsonValue.ARRAY) {
-            return v.asArray().count();
+            return v.array().count();
         }
         if (v.kind() == JsonValue.OBJECT) {
-            return v.asObject().count();
+            return v.object().count();
         }
         if (v.kind() == JsonValue.STRING) {
             return v.asString().byteLength();
@@ -1300,7 +1300,7 @@ final class TplEval {
         if (m.equals("items")) {
             JsonArray pairsOut = heap JsonArray();
             if (obj != null && obj.kind() == JsonValue.OBJECT) {
-                JsonObject o = obj.asObject();
+                JsonObject o = obj.object();
                 int32 j = 0;
                 while (j < o.count()) {
                     String key = TplEval.keyOf(o, j);
@@ -1321,7 +1321,7 @@ final class TplEval {
             boolean wantKeys = m.equals("keys");
             JsonArray out2 = heap JsonArray();
             if (obj != null && obj.kind() == JsonValue.OBJECT) {
-                JsonObject o2 = obj.asObject();
+                JsonObject o2 = obj.object();
                 int32 j2 = 0;
                 while (j2 < o2.count()) {
                     if (wantKeys) {

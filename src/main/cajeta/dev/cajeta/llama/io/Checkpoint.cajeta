@@ -110,13 +110,13 @@ public final class Checkpoint {
                 + "' is missing or empty");
         }
         JsonValue v = Json.parse(raw, rawLen);
-        JsonObject root = v.asObject();
+        JsonObject root = v.object();
         JsonValue wm = root.get("weight_map");
         if (wm == null) {
             throw heap LlamaException("checkpoint: index '" + indexPath
                 + "' has no weight_map");
         }
-        JsonObject weightMap = wm.asObject();
+        JsonObject weightMap = wm.object();
         String dir = Checkpoint.dirOf(indexPath);
 
         // Unique shard files, in first-appearance order.

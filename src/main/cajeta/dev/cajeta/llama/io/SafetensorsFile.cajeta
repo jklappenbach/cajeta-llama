@@ -73,7 +73,7 @@ public final class SafetensorsFile {
         this.dataStart = 8 + hlen;
 
         JsonValue hv = Json.parse(hb, hlen);
-        JsonObject hdr = hv.asObject();
+        JsonObject hdr = hv.object();
 
         // First pass: count tensor entries (everything but __metadata__).
         int32 total = hdr.count();
@@ -99,14 +99,14 @@ public final class SafetensorsFile {
         while (k < total) {
             if (!this.isMetaKey(hdr, k)) {
                 String name = this.keyString(hdr, k);
-                JsonObject entry = hdr.valueAt(k).asObject();
+                JsonObject entry = hdr.valueAt(k).object();
                 JsonValue dv = entry.get("dtype");
                 if (dv == null) {
                     throw heap LlamaException("safetensors: '" + name
                         + "' has no dtype field");
                 }
-                JsonArray shapeArr = entry.get("shape").asArray();
-                JsonArray offs = entry.get("data_offsets").asArray();
+                JsonArray shapeArr = entry.get("shape").array();
+                JsonArray offs = entry.get("data_offsets").array();
                 int64 begin = offs.get(0).asInt64();
                 int64 end = offs.get(1).asInt64();
                 if (begin > end || end > payloadLen) {
