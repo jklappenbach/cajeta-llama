@@ -33,7 +33,10 @@ public class SafetensorsTest {
     // ── fixture plumbing ────────────────────────────────────────────────
 
     static #String tmpDir() {
-        return "/tmp/cajeta_llama_st_test";
+        // Repo-local tmp/ (gitignored), NEVER /tmp: the shared tmpfs
+        // gets saturated by concurrent sessions, and a truncated write
+        // there turned the big-load mmap into a SIGBUS.
+        return "tmp/cajeta_llama_st_test";
     }
 
     static void putU64(int8[] b, int64 at, int64 v) {

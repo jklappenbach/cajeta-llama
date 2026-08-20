@@ -15,6 +15,15 @@ set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
 CAJETA="${CAJETA:-cajeta}"
+
+# Ownership-migration switches (ownership/transfer-of-borrow compiler):
+# the return-side (OWNED_BIND) and captured-borrow checks land warn-first
+# there, and this library has NOT done its migration pass yet — the chat
+# rewire fixed its own sites, but the tensor/model code has hundreds of
+# owned-result receives. No-ops under released compilers that lack the
+# checks. REMOVE both lines when llama's ownership migration closes.
+export CAJETA_OWNED_BIND="${CAJETA_OWNED_BIND:-warn}"
+export CAJETA_CAPTURED_BORROW="${CAJETA_CAPTURED_BORROW:-warn}"
 UNIT_REPO="${UNIT_REPO:-$here/../cajeta-unit}"
 
 out="$(mktemp -d)"
@@ -94,9 +103,39 @@ if [[ ! -f "$codec_cja" ]]; then
 fi
 echo ">> dev.cajeta.codec: $codec_cja"
 
+# dev.cajeta.jinja (the chat-template engine, jinja plan Unit 9 /
+# llama 13.18): sibling checkout first, then store, then a
+# sha256-verified Olla fetch (once 9.2.1 publishes it).
+JINJA_VER="$(sed -n 's/.*"dev\.cajeta\.jinja"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+    "$here/cajeta.json" | head -1)"
+JINJA_REPO="${JINJA_REPO:-$here/../cajeta-jinja}"
+jinja_cja=""
+if [[ -d "$JINJA_REPO" ]]; then
+    echo ">> building dev.cajeta.jinja from checkout ($JINJA_REPO)"
+    ( cd "$JINJA_REPO" && "$CAJETA" build >/dev/null )
+    jinja_cja="$(ls -t "$JINJA_REPO"/build/archive/dev.cajeta.jinja-*.cja 2>/dev/null | head -1)"
+fi
+if [[ -z "$jinja_cja" ]]; then
+    jinja_cja="$OLLA_HOME/dev.cajeta.jinja/$JINJA_VER/dev.cajeta.jinja-$JINJA_VER.cja"
+fi
+if [[ ! -f "$jinja_cja" ]]; then
+    jinja_cja="$here/build/.unit-cache/dev.cajeta.jinja-$JINJA_VER.cja"
+    if [[ ! -f "$jinja_cja" ]]; then
+        echo ">> fetching dev.cajeta.jinja $JINJA_VER from $OLLA_URL"
+        meta="$(curl -fsS "$OLLA_URL/v2/resolve?name=dev.cajeta.jinja&version=$JINJA_VER")"
+        sha="$(printf '%s' "$meta" | sed -n 's/.*"sha256":"sha256:\([0-9a-f]*\)".*/\1/p')"
+        [[ -n "$sha" ]] || { echo "/v2/resolve gave no sha256 for jinja" >&2; exit 1; }
+        mkdir -p "$(dirname "$jinja_cja")"
+        curl -fsS -o "$jinja_cja" "$OLLA_URL/v2/blob/$sha"
+        got="$(sha256_of "$jinja_cja")"
+        [[ "$got" == "$sha" ]] || { rm -f "$jinja_cja"; echo "sha256 mismatch fetching jinja" >&2; exit 1; }
+    fi
+fi
+echo ">> dev.cajeta.jinja: $jinja_cja"
+
 echo ">> building llama library .cja"
 "$CAJETA" --emit=cja -o "$out/llama.cja" \
-    --classpath="$codec_cja" \
+    --classpath="$codec_cja,$jinja_cja" \
     dev.cajeta.llama.Llama.run "$here/src/main/cajeta" "$out" >/dev/null
 
 echo ">> building + running the test binary"
@@ -104,7 +143,7 @@ echo ">> building + running the test binary"
 # later the decode kernels) are exercised on the portable CPU backend, the
 # PlacementDispatchTests discipline — real KernelBuffers, no silicon needed.
 "$CAJETA" --emit=exe --profile=test --xpu-backend=cpu \
-    --classpath="$out/llama.cja,$unit_cja,$codec_cja" \
+    --classpath="$out/llama.cja,$unit_cja,$codec_cja,$jinja_cja" \
     -o "$out/llamatests" \
     dev.cajeta.llama.selftest.TestMain.run "$here/src/test/cajeta" "$out" >/dev/null
 
@@ -116,7 +155,7 @@ echo ">> building + running the test binary under --release --live-set=bounded"
 # codegen with the bounded live-set discipline — not only the test profile.
 "$CAJETA" --emit=exe --profile=test --release --live-set=bounded \
     --xpu-backend=cpu \
-    --classpath="$out/llama.cja,$unit_cja,$codec_cja" \
+    --classpath="$out/llama.cja,$unit_cja,$codec_cja,$jinja_cja" \
     -o "$out/llamatests-release" \
     dev.cajeta.llama.selftest.TestMain.run "$here/src/test/cajeta" "$out" >/dev/null
 

@@ -109,7 +109,7 @@ public final class Checkpoint {
             throw heap LlamaException("checkpoint: index '" + indexPath
                 + "' is missing or empty");
         }
-        JsonValue v = Json.parse(raw, rawLen);
+        JsonValue v #= Json.parse(raw, rawLen);
         JsonObject root = v.object();
         JsonValue wm = root.get("weight_map");
         if (wm == null) {
@@ -117,14 +117,14 @@ public final class Checkpoint {
                 + "' has no weight_map");
         }
         JsonObject weightMap = wm.object();
-        String dir = Checkpoint.dirOf(indexPath);
+        String dir #= Checkpoint.dirOf(indexPath);
 
         // Unique shard files, in first-appearance order.
         HashMap<String, int32> shardIdx = heap HashMap<String, int32>();
         ArrayList<String> shardFiles = heap ArrayList<String>();
         int32 k = 0;
         while (k < weightMap.count()) {
-            String fname = weightMap.valueAt(k).asString();
+            String fname #= weightMap.valueAt(k).asString();
             if (!shardIdx.containsKey(fname)) {
                 int32 pos = (int32) shardFiles.count();
                 // The LIST takes ownership; the dedup map's key borrows the

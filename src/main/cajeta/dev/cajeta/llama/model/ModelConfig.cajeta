@@ -123,7 +123,7 @@ public final class ModelConfig {
             throw heap LlamaException("model config: '" + path
                 + "' is missing or empty");
         }
-        JsonValue v = Json.parse(raw, rawLen);
+        JsonValue v #= Json.parse(raw, rawLen);
         JsonObject root = v.object();
 
         JsonValue archs = root.get("architectures");

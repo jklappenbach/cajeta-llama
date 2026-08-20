@@ -38,7 +38,8 @@
         // run-tests.sh resolves the archive (sibling checkout, then store,
         // then a sha256-verified Olla fetch at this pin).
         "dev-dependencies": {
-            "dev.cajeta.unit": "0.2.2"
+            "dev.cajeta.unit": "0.2.2",
+            "dev.cajeta.jinja": "0.1.0"
         },
 
         "repositories": [

@@ -1,12 +1,17 @@
 package dev.cajeta.llama.chat;
 
 import cajeta.codec.json.Json;
+import cajeta.codec.json.JsonArray;
+import cajeta.codec.json.JsonObject;
 import cajeta.codec.json.JsonReader;
 import cajeta.codec.json.JsonToken;
 import cajeta.codec.json.JsonValue;
 import cajeta.io.file.File;
 import cajeta.lang.String;
 import dev.cajeta.llama.LlamaException;
+import dev.cajeta.jinja.Environment;
+import dev.cajeta.jinja.Template;
+import dev.cajeta.jinja.JinjaException;
 
 /**
  * Chat-prompt rendering (spec 7.11–7.14, 13.18): the model's OWN
@@ -18,27 +23,59 @@ import dev.cajeta.llama.LlamaException;
  *
  * `renderPre` is permanent API surface (7.13), not a stopgap: a caller
  * that has already rendered a prompt passes it through untouched.
+ *
+ * RENDERING IS `dev.cajeta.jinja` (jinja plan Unit 9 / llama 13.18):
+ * the private interpreter this facade once carried (Tpl/TplParser/
+ * TplEval/TplBuf) is deleted — one engine, oracle-verified byte-exact
+ * against Jinja2 over this repo's own template corpus, renders for
+ * every consumer. The facade keeps extraction (tokenizer_config/GGUF),
+ * the token surface, and LlamaException error shaping.
  */
 public final class ChatTemplate {
 
-    Tpl tpl;
+    Template tpl;
+    String source;
+    String name;
     String bosToken;
     String eosToken;
-    String nowText;
+    int64 nowEpochSeconds;
 
-    ChatTemplate(#Tpl t, String bos, String eos) {
-        this.tpl #= t;
+    ChatTemplate(String templateSource, String name, String bos,
+            String eos) {
+        this.source = "" + templateSource;
+        this.name = "" + name;
         this.bosToken = "" + bos;
         this.eosToken = "" + eos;
-        this.nowText = "01 Jan 2026";
+        this.nowEpochSeconds = 1767225600;   // 01 Jan 2026 UTC
+        this.tpl #= this.compileNow();
+    }
+
+    /** Compile under the transformers environment (trim+lstrip on —
+     *  spec 7.12); jinja's compile-time errors surface as
+     *  LlamaException naming this template. */
+    #Template compileNow() {
+        Environment env = heap Environment();
+        env.trimBlocks(true);
+        env.lstripBlocks(true);
+        env.nowEpochSeconds(this.nowEpochSeconds);
+        try {
+            Template t #= env.compile(this.source);
+            return #= t;
+        } catch (JinjaException e) {
+            throw heap LlamaException("chat template '" + this.name
+                + "': " + e.getMessage());
+        }
     }
 
     /**
-     * The clock `strftime_now()` reads. Injectable so a template that
-     * stamps a date renders deterministically under test (13.1.8).
+     * The clock `strftime_now()` reads, as UTC epoch seconds.
+     * Injectable so a template that stamps a date renders
+     * deterministically under test (13.1.8). The compiled template
+     * snapshots its settings, so changing the clock recompiles.
      */
-    public void setNow(String text) {
-        this.nowText = "" + text;
+    public void setNowEpochSeconds(int64 epochSeconds) {
+        this.nowEpochSeconds = epochSeconds;
+        this.tpl #= this.compileNow();
     }
 
     public String bos() {
@@ -52,8 +89,7 @@ public final class ChatTemplate {
     /** Compile a template held as text (the GGUF path, 7.11). */
     public static #ChatTemplate fromString(String template, String name,
             String bos, String eos) {
-        Tpl t = TplParser.parse(template, name);
-        return heap ChatTemplate(#t, bos, eos);
+        return heap ChatTemplate(template, name, bos, eos);
     }
 
     /**
@@ -90,21 +126,21 @@ public final class ChatTemplate {
             if (tk != JsonToken.KEY) {
                 continue;
             }
-            String key = r.currentDecodedString();
+            String key #= r.currentDecodedString();
             if (key.equals("chat_template")) {
                 int32 vt = r.next();
                 if (vt == JsonToken.STRING) {
-                    text = r.currentDecodedString();
+                    text #= r.currentDecodedString();
                 } else if (vt == JsonToken.START_ARRAY) {
                     // Some repos ship a list of named templates.
-                    text = ChatTemplate.pickNamedTemplate(r);
+                    text #= ChatTemplate.pickNamedTemplate(r);
                 } else {
                     ChatTemplate.skipValue(r, vt);
                 }
             } else if (key.equals("bos_token")) {
-                bos = ChatTemplate.readToken(r);
+                bos #= ChatTemplate.readToken(r);
             } else if (key.equals("eos_token")) {
-                eos = ChatTemplate.readToken(r);
+                eos #= ChatTemplate.readToken(r);
             } else {
                 ChatTemplate.skipValue(r, r.next());
             }
@@ -138,12 +174,12 @@ public final class ChatTemplate {
                 if (e != JsonToken.KEY) {
                     continue;
                 }
-                String k = r.currentDecodedString();
+                String k #= r.currentDecodedString();
                 int32 vt = r.next();
                 if (k.equals("name") && vt == JsonToken.STRING) {
-                    nm = r.currentDecodedString();
+                    nm #= r.currentDecodedString();
                 } else if (k.equals("template") && vt == JsonToken.STRING) {
-                    tv = r.currentDecodedString();
+                    tv #= r.currentDecodedString();
                 } else {
                     ChatTemplate.skipValue(r, vt);
                 }
@@ -180,10 +216,10 @@ public final class ChatTemplate {
                 if (e != JsonToken.KEY) {
                     continue;
                 }
-                String k = r.currentDecodedString();
+                String k #= r.currentDecodedString();
                 int32 kv = r.next();
                 if (k.equals("content") && kv == JsonToken.STRING) {
-                    content = r.currentDecodedString();
+                    content #= r.currentDecodedString();
                 } else {
                     ChatTemplate.skipValue(r, kv);
                 }
@@ -220,26 +256,114 @@ public final class ChatTemplate {
      */
     public #String render(JsonValue messages, JsonValue tools,
             boolean addGenerationPrompt) {
-        TplEval ev = heap TplEval(this.tpl, this.nowText);
-        ev.push("messages", #TplEval.copy(messages));
+        JsonObject ctx = heap JsonObject();
+        ChatTemplate.putKey(ctx, "messages",
+            ChatTemplate.deepCopy(messages));
         if (tools != null) {
-            ev.push("tools", #TplEval.copy(tools));
+            ChatTemplate.putKey(ctx, "tools",
+                ChatTemplate.deepCopy(tools));
         }
-        ev.push("add_generation_prompt",
-            #TplEval.bool(addGenerationPrompt));
-        ev.push("bos_token", #TplEval.str(this.bosToken));
-        ev.push("eos_token", #TplEval.str(this.eosToken));
-        ev.run(this.tpl.root);
-        return #ev.out.take();
+        JsonValue agp = heap JsonValue();
+        agp.setBoolean(addGenerationPrompt);
+        ChatTemplate.putKey(ctx, "add_generation_prompt", #agp);
+        ChatTemplate.putKey(ctx, "bos_token",
+            ChatTemplate.strValue(this.bosToken));
+        ChatTemplate.putKey(ctx, "eos_token",
+            ChatTemplate.strValue(this.eosToken));
+        JsonValue root = heap JsonValue();
+        root.setObject(#ctx);
+        try {
+            return #this.tpl.render(root);
+        } catch (JinjaException e) {
+            throw heap LlamaException("chat template '" + this.name
+                + "': " + e.getMessage());
+        }
+    }
+
+    static void putKey(JsonObject o, String key, #JsonValue v) {
+        int32 n = key.byteLength();
+        int8[] kb = heap int8[n];
+        int32 i = 0;
+        while (i < n) {
+            kb[i] = (int8) key.byteAt(i);
+            i = i + 1;
+        }
+        o.put(#kb, n, #v);
+    }
+
+    static #JsonValue strValue(String s) {
+        JsonValue v = heap JsonValue();
+        int8[] w #= s.toBytes();
+        v.setStringOwned(#w, s.byteLength());
+        return #v;
+    }
+
+    /** Owned deep copy — context values must not borrow the caller's
+     *  tree (stdlib-ownership-convention spec 3.2). */
+    static #JsonValue deepCopy(JsonValue v) {
+        JsonValue r = heap JsonValue();
+        if (v == null) {
+            r.setNull();
+            return #r;
+        }
+        int32 k = v.kind();
+        if (k == JsonValue.NULL) {
+            r.setNull();
+        } else if (k == JsonValue.BOOLEAN) {
+            r.setBoolean(v.asBoolean());
+        } else if (k == JsonValue.NUMBER) {
+            if (v.isFloat()) {
+                r.setFloat(v.asFloat64());
+            } else {
+                r.setNumber(v.asInt64());
+            }
+        } else if (k == JsonValue.STRING) {
+            int32 sn = v.asBytesLength();
+            int8[] sb = v.asBytes();
+            int8[] dst = heap int8[sn];
+            int32 z = 0;
+            while (z < sn) {
+                dst[z] = sb[z];
+                z = z + 1;
+            }
+            r.setStringOwned(#dst, sn);
+        } else if (k == JsonValue.ARRAY) {
+            JsonArray src = v.array();
+            JsonArray dst2 = heap JsonArray();
+            int32 i = 0;
+            while (i < src.count()) {
+                dst2.add(ChatTemplate.deepCopy(src.get(i)));
+                i = i + 1;
+            }
+            r.setArray(#dst2);
+        } else {
+            JsonObject src3 = v.object();
+            JsonObject dst3 = heap JsonObject();
+            int32 j = 0;
+            while (j < src3.count()) {
+                int8[] kb = src3.keyAt(j);
+                int32 kl = src3.keyLenAt(j);
+                int8[] kc = heap int8[kl];
+                int32 z2 = 0;
+                while (z2 < kl) {
+                    kc[z2] = kb[z2];
+                    z2 = z2 + 1;
+                }
+                dst3.put(#kc, kl, ChatTemplate.deepCopy(src3.valueAt(j)));
+                j = j + 1;
+            }
+            r.setObject(#dst3);
+        }
+        return #r;
     }
 
     /** Render from JSON source text — the convenient entry point. */
     public #String renderJson(String messagesJson, String toolsJson,
             boolean addGenerationPrompt) {
-        JsonValue msgs = ChatTemplate.parseJson(messagesJson);
+        JsonValue msgs #= ChatTemplate.parseJson(messagesJson);
         JsonValue tools = null;
         if (toolsJson != null && toolsJson.byteLength() > 0) {
-            tools = ChatTemplate.parseJson(toolsJson);
+            tools #= ChatTemplate.parseJson(toolsJson);
         }
         return #this.render(msgs, tools, addGenerationPrompt);
     }

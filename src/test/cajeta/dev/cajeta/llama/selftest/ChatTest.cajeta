@@ -23,8 +23,9 @@ public class ChatTest {
 
     static final String DIR = "src/test/fixtures/tpl/";
     static final String FIX = "src/test/fixtures/tpl/expected-prompts.json";
-    // The instant frozen when the fixtures were generated (13.1.8).
-    static final String NOW = "14 Aug 2026";
+    // The instant frozen when the fixtures were generated (13.1.8):
+    // 2026-08-14 00:00 UTC — strftime_now('%d %b %Y') = "14 Aug 2026".
+    static final int64 NOW = 1786665600;
 
     static final String SIMPLE =
         "[{\"role\": \"user\", \"content\": \"What is the capital of France?\"}]";
@@ -67,7 +68,7 @@ public class ChatTest {
             eos = "<|im_end|>";
         }
         ChatTemplate t = ChatTemplate.fromString(text, tag, bos, eos);
-        t.setNow(ChatTest.NOW);
+        t.setNowEpochSeconds(ChatTest.NOW);
         return #t;
     }
 
@@ -212,7 +213,7 @@ public class ChatTest {
     static #String render(String tpl, String msgs) {
         ChatTemplate t = ChatTemplate.fromString(tpl, "inline", "<s>",
             "</s>");
-        t.setNow(ChatTest.NOW);
+        t.setNowEpochSeconds(ChatTest.NOW);
         return #t.renderJson(msgs, null, false);
     }
 
@@ -359,12 +360,14 @@ public class ChatTest {
         // An unsupported construct names the construct AND the line.
         threw = false;
         try {
-            String s2 = ChatTest.render("line1\n{% with x = 1 %}{% endwith %}",
+            // {% with %} joined the supported set when rendering moved
+            // to dev.cajeta.jinja; {% do %} stays outside it.
+            String s2 = ChatTest.render("line1\n{% do thing %}",
                 "[]");
             Assert.isTrue(s2.byteLength() < 0);     // unreachable
         } catch (LlamaException ex2) {
             threw = true;
-            Assert.isTrue(ex2.getMessage().contains("with"));
+            Assert.isTrue(ex2.getMessage().contains("do"));
             Assert.isTrue(ex2.getMessage().contains("line 2"));
         }
         Assert.isTrue(threw);
@@ -386,9 +389,9 @@ public class ChatTest {
     public void strftimeNowUsesInjectedClock() {
         ChatTemplate t = ChatTemplate.fromString(
             "today={{ strftime_now('%d %b %Y') }}", "clock", "", "");
-        t.setNow("03 Mar 2031");
+        t.setNowEpochSeconds((int64) 1930262400);   // 2031-03-03 UTC
         Assert.equals("today=03 Mar 2031", t.renderJson("[]", null, false));
-        t.setNow("04 Apr 2032");
+        t.setNowEpochSeconds((int64) 1964649600);   // 2032-04-04 UTC
         Assert.equals("today=04 Apr 2032", t.renderJson("[]", null, false));
     }
 
@@ -410,14 +413,14 @@ public class ChatTest {
         // identically and match the reference (7.11).
         ChatTemplate fromCfg = ChatTemplate.fromTokenizerConfig(
             ChatTest.DIR + "qwen25-tokenizer_config.json");
-        fromCfg.setNow(ChatTest.NOW);
+        fromCfg.setNowEpochSeconds(ChatTest.NOW);
         Assert.equals("<|im_end|>", fromCfg.eos());
 
         int8[] tplRaw = File.readAllBytes(ChatTest.DIR + "qwen25.jinja");
         String tplText = heap String(#tplRaw, (int32) tplRaw.count());
         ChatTemplate fromGguf = ChatTemplate.fromString(tplText, "gguf",
             "", "<|im_end|>");
-        fromGguf.setNow(ChatTest.NOW);
+        fromGguf.setNowEpochSeconds(ChatTest.NOW);
 
         String a = fromCfg.renderJson(ChatTest.MULTI, null, true);
         String b = fromGguf.renderJson(ChatTest.MULTI, null, true);

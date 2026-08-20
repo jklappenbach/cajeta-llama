@@ -72,7 +72,7 @@ public final class SafetensorsFile {
         this.map.read(8, hb, 0, hlen);
         this.dataStart = 8 + hlen;
 
-        JsonValue hv = Json.parse(hb, hlen);
+        JsonValue hv #= Json.parse(hb, hlen);
         JsonObject hdr = hv.object();
 
         // First pass: count tensor entries (everything but __metadata__).
@@ -98,7 +98,7 @@ public final class SafetensorsFile {
         k = 0;
         while (k < total) {
             if (!this.isMetaKey(hdr, k)) {
-                String name = this.keyString(hdr, k);
+                String name #= this.keyString(hdr, k);
                 JsonObject entry = hdr.valueAt(k).object();
                 JsonValue dv = entry.get("dtype");
                 if (dv == null) {

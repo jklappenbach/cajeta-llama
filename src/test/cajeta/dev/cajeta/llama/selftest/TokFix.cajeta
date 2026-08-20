@@ -51,7 +51,7 @@ public final class TokFix {
             if (tk != JsonToken.KEY) {
                 continue;
             }
-            String key = r.currentDecodedString();
+            String key #= r.currentDecodedString();
             if (key.equals("corpus")) {
                 if (r.next() != JsonToken.START_ARRAY) {
                     throw heap LlamaException("tok fixture: bad corpus");
@@ -61,7 +61,7 @@ public final class TokFix {
                     if (e == JsonToken.END_ARRAY) {
                         break;
                     }
-                    String s = r.currentDecodedString();
+                    String s #= r.currentDecodedString();
                     f.corpus.add(#s);
                 }
                 f.n = (int32) f.corpus.count();

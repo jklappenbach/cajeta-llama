@@ -2,3 +2,4 @@ build/
 
 # Compiler cache — bitcode and prebuilt archives, regenerated on every build.
 **/.cajeta/cache/
+tmp/
