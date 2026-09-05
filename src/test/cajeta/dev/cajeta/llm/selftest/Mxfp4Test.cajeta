@@ -459,4 +459,41 @@ public class Mxfp4Test {
             r = r + 1;
         }
     }
+
+    @Test
+    public void gpuCoopQ8SurfaceMatchesTheHostQ8Reference() {
+        if (!Mxfp4Test.coopQ8Here()) {
+            System.stdout.println("  (skipped: backend "
+                + Device.activeBackend() + " has no coopQ8 kernel)");
+            return;
+        }
+        int64 rows = 8L;
+        int64 cols = 256L;   // 8 blocks per row; x32 not x256
+        int8[] packed #= Mxfp4Test.fillPacked(rows, cols / 32L);
+        float32[] x #= heap float32[cols];
+        int64 c = 0;
+        while (c < cols) {
+            x[c] = (float32) ((c % 5L) - 2L) * 0.5f + 0.25f;
+            c = c + 1;
+        }
+        float32[] want #= heap float32[rows];
+        Mxfp4Test.refQ8(packed, rows, cols, x, want);
+
+        // The MXFP4 matvec re-expressed on the cajeta.xpu cooperative-tile
+        // surface (Group.stripe / Group.mac / Group.reduce) must reproduce the
+        // hand coopQ8 kernel's numerics — the abstraction costs nothing (§8.1).
+        float32[] got #= heap float32[rows];
+        QuantKernel.mxfp4MatVecCoopQ8SurfaceIntoDevice(packed, rows, cols,
+            x, 0L, got, 0L);
+
+        Mxfp4Test.assertLive(want, "host Q8 reference");
+        Mxfp4Test.assertLive(got, "mxfp4 coopQ8-surface matvec");
+        int64 r = 0;
+        while (r < rows) {
+            Mxfp4Test.eqQ8(want[r], got[r],
+                "coopQ8-SURFACE vs host-Q8 matvec row");
+            r = r + 1;
+        }
+    }
+
 }

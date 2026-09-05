@@ -7,6 +7,8 @@ import cajeta.xpu.KernelStream;
 import cajeta.xpu.KernelThread;
 import cajeta.xpu.Shared;
 import cajeta.xpu.Wave;
+import cajeta.xpu.Group;
+import cajeta.xpu.GroupOp;
 import cajeta.xpu.MemoryOrder;
 import cajeta.lang.Cajeta;
 
@@ -10703,6 +10705,91 @@ public final class QuantKernel {
         xb.upload(x);
         yb.upload(y);
         QuantKernel.mxfp4MatVecCoopQ8Launch(yb, pb, xb, xq, xd,
+            rows, cols, xOff, yOff);
+        yb.download(y);
+        return;
+    }
+
+    /**
+     * The Q8 coop MXFP4 mat-vec RE-EXPRESSED on the cajeta.xpu cooperative-tile
+     * surface (xpu-cooperative-tile spec §8.1, Phase A Unit 4 — witness A).
+     * Byte-for-byte the same algorithm as {@link #mxfp4MatVecKernelCoopQ8}, but
+     * it names NO wave-width literal, NO dotSum, and NO Wave.reduce:
+     *   - the row is globalId / Group.width() (32 folds per target, no `& 31`);
+     *   - Group.stripe(blocks) is the lane-strided block loop (the `b += 32`);
+     *   - Group.mac(s, dl, aLo) is the dp4a dot (the compiler picks v_dot4);
+     *   - Group.reduce(GroupOp.Add, acc) is the wave reduce;
+     *   - Group.laneId() == 0 commits the row.
+     * Same launch geometry as the hand kernel (block 256 = 8 waves), so it is
+     * per-wave-identical; the surface ops fold to the same ISA. wave32 backends.
+     */
+    @Kernel
+    public static void mxfp4MatVecKernelCoopQ8Surface(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<int8> xq,
+            KernelBuffer<float32> xd,
+            uint32 rows, int64 blocksPerRow, int64 yOff) {
+        uint32 row = KernelThread.globalIdX() / (uint32) Group.width();
+        if (row < rows) {
+            int64 i = (int64) row;
+            int64 rowBytes = blocksPerRow * 17L;
+            Vector<int8,16> kv = QuantKernel.mxfp4Kv();
+            float32 acc = 0.0f;
+            for (int32 bb : Group.stripe((int32) blocksPerRow)) {
+                int64 b = (int64) bb;
+                int64 ro = i * rowBytes + b * 17L;
+                float32 dw = QuantKernel.mxfp4ScaleDev(
+                    (int32) packed[ro] & 255);
+                float32 dx = xd[b];
+                Vector<int8,16> v = packed.vload<16>(ro + 1L);
+                Vector<int8,16> dl = (v & 15).lut4(kv);
+                Vector<int8,16> dh = ((v >> 4) & 15).lut4(kv);
+                int64 xb = b * 32L;
+                Vector<int8,16> aLo = xq.vload<16>(xb);
+                Vector<int8,16> aHi = xq.vload<16>(xb + 16L);
+                int32 s = 0;
+                s = Group.mac(s, dl, aLo);
+                s = Group.mac(s, dh, aHi);
+                acc = acc + (float32) s * dw * dx;
+            }
+            float32 total = Group.reduce(GroupOp.Add, acc);
+            if (Group.laneId() == 0) { y[yOff + i] = total; }
+        }
+    }
+
+    /** {@link #mxfp4MatVecCoopQ8Launch} for the surface kernel — identical
+     *  geometry, so a like-for-like comparison against the hand kernel. */
+    public static void mxfp4MatVecCoopQ8SurfaceLaunch(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<float32> x,
+            KernelBuffer<int8> xq, KernelBuffer<float32> xd,
+            int64 rows, int64 cols, int64 xOff, int64 yOff) {
+        QuantKernel.mxfp4QuantActLaunch(xq, xd, x, cols, xOff);
+        uint32 threads = (uint32) (rows * 32L);
+        uint32 blk = (uint32) 256;
+        KernelStream s = QuantKernel.stream();
+        mxfp4MatVecKernelCoopQ8Surface.launch(s,
+            grid: [(threads + blk - 1) / blk], block: [blk])
+            (y, packed, xq, xd, (uint32) rows, cols / 32L, yOff);
+        s.sync();
+        return;
+    }
+
+    /** {@link #mxfp4MatVecCoopQ8IntoDevice} for the surface kernel. */
+    public static void mxfp4MatVecCoopQ8SurfaceIntoDevice(int8[] packed,
+            int64 rows, int64 cols, float32[] x, int64 xOff, float32[] y,
+            int64 yOff) {
+        KernelBuffer<int8> pb #= heap KernelBuffer<int8>(
+            (uint64) packed.count());
+        KernelBuffer<float32> xb #= heap KernelBuffer<float32>(
+            (uint64) x.count());
+        KernelBuffer<float32> yb #= heap KernelBuffer<float32>(
+            (uint64) y.count());
+        KernelBuffer<int8> xq #= heap KernelBuffer<int8>((uint64) cols);
+        KernelBuffer<float32> xd #= heap KernelBuffer<float32>(
+            (uint64) (cols / 32L));
+        pb.upload(packed);
+        xb.upload(x);
+        yb.upload(y);
+        QuantKernel.mxfp4MatVecCoopQ8SurfaceLaunch(yb, pb, xb, xq, xd,
             rows, cols, xOff, yOff);
         yb.download(y);
         return;
