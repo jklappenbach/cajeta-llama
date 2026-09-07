@@ -136,6 +136,20 @@ plan's acceptance and in the bench memory.
       in the TEST harness (CoopQuantGemmTest-style) where the kernel stays
       reachable. The coopsync1/2 bench arms in cc05c21 set flags with NO use
       site in Linear (dead) — ignore their earlier "brackets".
+      LATER THE SAME NIGHT: a direct `cajeta --emit=cja` of the library
+      (same fixed compiler, same sources, same classpath as run-tests.sh)
+      FAILS with `CAJETA_ERROR_OWNED_RESULT_NEEDS_TRANSFER` at
+      SafetensorsFile.cajeta:199 (`t = Tensor.zeros<float32>`), :214/:221/
+      :228 (`t = this.loadF16/Bf16/F32(name)` in the *Device loaders), and
+      after those are spelled `#=` a further `this.x = Tensor.zeros(...)`
+      site — while run-tests.sh builds the identical library CLEAN (its
+      log, line 10 → 359 passed). The ownership checker is ORDER-DEPENDENT
+      (a cajeta defect: false negatives in the default order); the sites
+      are genuine Producer results bound with `=`. Not fixed tonight — a
+      partial one-file migration was reverted; needs a focused sweep with
+      the compiler as oracle. Consequence for the instrument: build the
+      bench through run-tests.sh's enumeration (or fix the sweep first),
+      with `--tree-shake=off` so the coop kernels survive.
 - [ ] 2.1.2 `LinearKernelRouteTest`: on gfx1151, a Q8_0 / Q2_K / Q3_K /
       Q5_K `Linear` built from the `kquant/` fixture blocks reports
       `isBatchRoutedFor(128) == true` with `prefillWeights=packed`, and the
