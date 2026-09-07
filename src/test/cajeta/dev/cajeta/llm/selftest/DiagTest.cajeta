@@ -245,6 +245,69 @@ public class DiagTest {
         }
     }
 
+    /** prefill-routes 1.1.1 — a per-row prefill NAMES its refusals: one
+     *  `batch-refused` record per distinct (projection, format, reason),
+     *  and asking again on the same model says nothing new. The toy
+     *  model's weights are not quantized, so on every backend every
+     *  projection refuses for the same reason — 7 projections over 2
+     *  layers: between 1 and 7 records, never 14. */
+    @Test
+    public void aPerRowPrefillNamesEachRefusalOnce() {
+        Capture cap = heap Capture();
+        Diag.register(cap);
+        CausalLM m = SchedulerTest.mk("diagrefuse", 1, 0);
+        int32[] p #= SchedulerTest.promptOf(4, 17);
+        m.prefill(p, 4);
+        int32 first = cap.countOf("batch-refused");
+        Assert.isTrue(first >= 1);
+        Assert.isTrue(first <= 7);
+        int32 i = 0;
+        while (i < cap.n) {
+            if (cap.cats.get(i).equals("batch-refused")) {
+                // "<proj> <format>: <reason>"; rows ride in v1.
+                Assert.isTrue(cap.names.get(i).contains(": "));
+                Assert.equals(4L, cap.w1[i]);
+            }
+            i = i + 1;
+        }
+        // The same predicate scan again (the public probe runs
+        // batchReady): the same refusals are not said twice.
+        m.batchRoutedFor(4);
+        m.batchRoutedFor(4);
+        Diag.register(null);
+        Assert.equals((int64) first, (int64) cap.countOf("batch-refused"));
+    }
+
+    /** prefill-routes 1.1.2 — the `prefill-mode per-row` record carries
+     *  the refusing-projection count in v1, so a log says WHY beside
+     *  WHETHER; it is at least the number of distinct refusals named
+     *  (14 projections refused, 7 distinct names on the toy). */
+    @Test
+    public void perRowPrefillModeCarriesTheRefusalCount() {
+        Capture cap = heap Capture();
+        Diag.register(cap);
+        CausalLM m = SchedulerTest.mk("diagcount", 1, 0);
+        int32[] p #= SchedulerTest.promptOf(4, 23);
+        m.prefill(p, 4);
+        Diag.register(null);
+        int32 named = cap.countOf("batch-refused");
+        boolean saw = false;
+        int32 i = 0;
+        while (i < cap.n) {
+            if (cap.cats.get(i).equals("prefill-mode")) {
+                saw = true;
+                if (cap.names.get(i).equals("per-row")) {
+                    Assert.isTrue(cap.w1[i] > 0L);
+                    Assert.isTrue(cap.w1[i] >= (int64) named);
+                } else {
+                    Assert.equals(0L, cap.w1[i]);
+                }
+            }
+            i = i + 1;
+        }
+        Assert.isTrue(saw);
+    }
+
     /** 21.1.6 — a launch failure becomes a RECORD attributed to the
      *  step window's session (21.2.5), not just a stderr line. Forced
      *  with a genuinely dead device buffer: an owner is dropped while a

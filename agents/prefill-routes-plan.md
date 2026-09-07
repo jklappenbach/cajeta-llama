@@ -27,10 +27,26 @@ plan's acceptance and in the bench memory.
 ## Unit 1 — Name the refusal (spec §2)
 
 ### 1.1 TDD
-- [ ] 1.1.1 `DiagTest`: a `Linear` whose format has no batched route on the
+- [~] 1.1.1 `DiagTest`: a `Linear` whose format has no batched route on the
       active backend makes `batchReady` emit one `batch-refused` record
       naming layer, projection, format and predicate; a second layer with
       the same (projection, format, reason) does not emit again.
+      WRITTEN 2026-09-06; BLOCKED on a cajeta compiler regression: cajeta
+      67690686 SIGSEGVs in LLVM RAGreedy (`SplitEditor::deleteRematVictims`,
+      fault +0x8) codegen-ing the test module (`--emit=exe --profile=test
+      --xpu-backend=cpu`), with or without this test; the Sep 5 compiler
+      (cajeta-llama-u34, 0.26.0 46b1337d) builds it. Repro:
+      cajeta-llm `tmp/u1/build.log`; per-class `--emit=ir` modules all
+      pass `llc -O2 -mcpu=znver5`, so the crashing function is in a module
+      that snapshot never sees — `CAJETA_DUMP_CODEGEN_BC` added to name it.
+      NAMED + BISECTED 2026-09-06: `opt -passes=verify` on the dumped
+      WmmaKernel module: `use of undefined value '%wi.tx'` in the launch
+      wrapper's inlined copy of `q4kWmmaDeqEpiKernel`'s block function —
+      the work-item latch adds (`wi.next`, `wi.y.next`) still reference the
+      block function's original PHIs (a detached/foreign value the inliner's
+      map never saw). Reverting cajeta 66041f35 (CpuBarrierFission: latch as
+      scaffold after the last barrier — the fix that newly ACCEPTS these WMMA
+      kernels) makes the module compile. Fix lands in cajeta.
 - [ ] 1.1.2 `DiagTest`: the `prefill-mode per-row` record carries the
       refusal count in `v1`.
 
@@ -43,8 +59,13 @@ plan's acceptance and in the bench memory.
       prints them.
 
 ### 1.3 Acceptance
-- [ ] 1.3.1 `schedthroughput <Mixtral> prompt=128 gen=1 trace` names the
+- [x] 1.3.1 `schedthroughput <Mixtral> prompt=128 gen=1 trace` names the
       refusing tensor(s) — the measured answer to spec §4.1's first half.
+      MEASURED 2026-09-06 (bench built with the Unit 1 engine): one record,
+      `batch-refused attn_k q8_0: only route is the int8 Mw8 GEMM
+      (prefillWeights=int8); prefillWeights=packed` (layer 0, rows 128) —
+      Mixtral-8x7B Q4_K_M carries Q8_0 attention keys, so it is the same
+      missing route as the 8B Q8_0; Unit 2 closes both.
 
 ## Unit 2 — Coop GEMM route on HIP for the formats without a batch kernel (spec §3)
 
@@ -55,6 +76,38 @@ plan's acceptance and in the bench memory.
       spike is batched and faster; if the coop kernels misbehave on HIP the
       finding is recorded here and Unit 2 re-plans around the int8 Mw8
       route instead.
+      SPIKE 2026-09-06 (`schedthroughput <8B Q8_0> prompt=512 gen=32 trace
+      coophip`, bench built with cajeta 67690686): the route ENGAGES —
+      `prefill-mode batched 128`, `batch-route coop ty=8 4096 4096` — and the
+      GPU faults: `HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION` on the ROCm
+      queue, after which every number the process prints is garbage (first
+      token 0). The coop kernels have never run on HIP before; the Vulkan
+      driver would have hidden an out-of-range read (robust buffer access),
+      HIP does not. Next: `CoopQuantGemmTest` on gfx1151 (the kernels' own
+      parity tests) to split kernel indexing from the AMD `Tile.load` lowering.
+      RESULT: the whole selftest suite built with the Sep 5 compiler runs
+      on gfx1151 at 359 passed / 0 failed / 1 skipped, every
+      `CoopQuantGemmTest` (Q8_0, Q2_K, Q3_K, Q5_K, Q4_0, Q5_0, and the
+      non-256 widths) matching the host — the coop kernels and the AMD tile
+      lowering are sound at the test shapes. The fault is in the ENGINE's
+      HIP plumbing of the route (repack `wordView`, f16 staging, pad rows,
+      or a missing sync) or a shape the tests never reach (128x4096x4096).
+      SERIALIZED (`AMD_SERIALIZE_KERNEL=3`): NO fault, first token 77 = the
+      per-row baseline's, prefill 512 in 3169 ms = 161.6 tok/s (12x the
+      per-row 13.2) even with a device sync after every one of ~3300
+      kernels — the coop route on HIP is CORRECT and fast; the fault is a
+      RACE (a queued kernel against a buffer's lifetime or an unfinished
+      transfer), deterministic unserialized (2/2), gone under
+      `AMD_LOG_LEVEL=4` alone (dispatch slowed enough).
+      BRACKETS (bench arms, 2026-09-07 00:xx): `pfsync` (sync at phase marks)
+      → still faults; `coopsync1` (sync right after `ensureBtXh`, before the
+      GEMM) → still faults; `coopsync2` (sync right after the GEMM) → the
+      process printed nothing (aborted). So the fault is raised BY the coop
+      GEMM dispatch (or its repack) itself when it is not preceded by a
+      device-wide sync — its inputs at launch time are the suspects: the
+      `packedDev` the repack reads (weight prefetch stream? handle not yet
+      assigned?), `coopW` = `coopDev.wordView()`, `btXh`. Under serialization
+      the same launch computes the right tokens.
 - [ ] 2.1.2 `LinearKernelRouteTest`: on gfx1151, a Q8_0 / Q2_K / Q3_K /
       Q5_K `Linear` built from the `kquant/` fixture blocks reports
       `isBatchRoutedFor(128) == true` with `prefillWeights=packed`, and the

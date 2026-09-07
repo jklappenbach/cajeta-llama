@@ -717,17 +717,23 @@ public final class GgufFile {
         return (float32) mag;
     }
 
-    static #String typeName(int32 ty) {
+    /** ggml type name for diagnostics; public since prefill-routes 1.2.1
+     *  (the `batch-refused` record names the format). */
+    public static #String typeName(int32 ty) {
+        if (ty == 0) { return #"f32"; }
+        if (ty == 1) { return #"f16"; }
         if (ty == 2) { return #"q4_0"; }
         if (ty == 3) { return #"q4_1"; }
         if (ty == 6) { return #"q5_0"; }
         if (ty == 7) { return #"q5_1"; }
+        if (ty == 8) { return #"q8_0"; }
         if (ty == 10) { return #"q2_k"; }
         if (ty == 11) { return #"q3_k"; }
         if (ty == 12) { return #"q4_k"; }
         if (ty == 13) { return #"q5_k"; }
         if (ty == 14) { return #"q6_k"; }
         if (ty == 16) { return #"iq2_xxs"; }
+        if (ty == 30) { return #"bf16"; }
         if (ty == 39) { return #"mxfp4"; }
         String u = "type_" + ty;
         return #u;

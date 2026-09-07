@@ -10,6 +10,7 @@ import dev.cajeta.llm.DiagRecord;
 import dev.cajeta.llm.Diag;
 import dev.cajeta.llm.sched.Scheduler;
 import dev.cajeta.llm.model.CausalLM;
+import dev.cajeta.llm.model.Linear;
 import cajeta.xpu.Device;
 
 /** Prints the engine's Diag records straight out, for the `trace` arm.
@@ -102,7 +103,7 @@ public final class SchedThroughput {
         if (args.count() < 1) {
             System.stdout.println("usage: <model.gguf> [seqs=N] [slots=N] "
                 + "[prompt=N] [gen=N] [chunk=N] [ctx=N] [vary] [poff=N] "
-                + "[nodevattn] [trace]");
+                + "[nodevattn] [coophip] [trace]");
             return;
         }
         String path = args[0];
@@ -142,6 +143,30 @@ public final class SchedThroughput {
         if (devOff) { CausalLM.setDeviceAttention(false); }
         System.stdout.println("device attention: "
             + (CausalLM.deviceAttentionEnabled() ? "on" : "OFF"));
+
+        // `coophip` (prefill-routes 2.1.1 spike arm): formats without a
+        // native int8 batch kernel take the coop f16 GEMM on this backend
+        // instead of the per-row path, so the two can be measured on the
+        // same checkpoint.
+        int32 ci = 0;
+        boolean coopAll = false;
+        while (ci < (int32) args.count()) {
+            if (args[ci].equals("coophip")) { coopAll = true; }
+            ci = ci + 1;
+        }
+        if (coopAll) { Linear.setCoopAllBackends(true); }
+        System.stdout.println("coop GEMM on every backend: "
+            + (Linear.coopAllBackendsOn() ? "on" : "off"));
+        // `pfsync`: a stream sync after every prefill projection (the
+        // PackedResident arm), so a race between a queued GEMM and a
+        // buffer's lifetime can be bracketed without new code.
+        int32 pi = 0;
+        while (pi < (int32) args.count()) {
+            if (args[pi].equals("pfsync")) { CausalLM.setPfSync(true); }
+            if (args[pi].equals("coopsync1")) { Linear.setCoopSync(1, true); }
+            if (args[pi].equals("coopsync2")) { Linear.setCoopSync(2, true); }
+            pi = pi + 1;
+        }
 
         // `slots=N` sets maxSeqs INDEPENDENTLY of how many sequences are
         // submitted. Without it the two are the same number and the

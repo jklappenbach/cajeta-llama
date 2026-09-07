@@ -18,6 +18,12 @@ import cajeta.lang.String;
  * Categories and their fields (v-slots unused by a category are 0):
  *
  *   "prefill-mode"    name=route ("batched"/"per-row")  v0=rows
+ *                     v1=refusing projections (0 when batched)
+ *   "batch-refused"   name="<proj> <format>: <reason>"  v0=layer
+ *                     v1=rows  v2=ggml type — once per distinct name for
+ *                     the life of the model, just before "prefill-mode"
+ *                     (prefill-routes plan 1.2.1: a per-row prefill names
+ *                     the tensor that refused the batched route)
  *   "decode-mode"     name=path ("resident"/"host") — said once per
  *                     engine at the first decode row (unit 38)
  *   "kernel-avail"    v0=bitmask (b0 q4Mw8, b1 q4Mw4, b2 q6Mw8,

@@ -13,6 +13,7 @@ import cajeta.math.Tensor;
 import dev.cajeta.llm.LlmException;
 import dev.cajeta.llm.io.QuantKernel;
 import dev.cajeta.llm.io.Checkpoint;
+import dev.cajeta.llm.io.GgufFile;
 import dev.cajeta.llm.io.Quant;
 
 /**
@@ -528,9 +529,12 @@ public final class CausalLM extends InfModule {
             // Q6_K — so `batchReady` was false and the whole prefill ran
             // per row. It read as "batching bought 4%" when it never ran.
             this.batchSaid = true;
+            // v1 = how many projections refused (0 when batched), so a
+            // bench log says WHY beside WHETHER; each refusal was named
+            // by its own `batch-refused` record just before this one.
             Diag.emit("prefill-mode", 0 - 1,
                 batched ? "batched" : "per-row", (int64) rows,
-                0L, 0L, 0L, 0L, 0L);
+                (int64) this.batchRefusals, 0L, 0L, 0L, 0L);
         }
         if (batched) {
             this.forwardRowsBatched(seq, hs, xn, q, k, v, ao, proj, gate,
@@ -1312,6 +1316,12 @@ public final class CausalLM extends InfModule {
      *  THIS row count (10.12.45.D: Q5_K/Q8_0 batch only at the Mw8
      *  shape, so the answer depends on rows). */
     boolean batchReady(int32 rows) {
+        // Every layer is scanned, not just to the first refusal: the
+        // `batch-refused` diagnostic (prefill-routes plan 1.2.1) names
+        // EVERY distinct (projection, format, reason), because a mixture
+        // like Q4_K_M refuses on the odd Q6_K/Q5_K tensor, not the first
+        // one. The count of refusing projections rides on `prefill-mode`.
+        int32 refusals = 0;
         int32 l = 0;
         while (l < this.model.numLayers) {
             DecoderLayer d = this.model.layerArr[l];
@@ -1319,13 +1329,15 @@ public final class CausalLM extends InfModule {
             // Unit 29: qNorm no longer disqualifies — the batched path
             // applies the per-head norms between projection and rope
             // (llama.cpp's build_qwen3 order, read rather than assumed).
-            if (d.fourNorm) { return false; }
-            if (!a.qProj.isBatchRoutedFor((int64) rows)
-                    || !a.kProj.isBatchRoutedFor((int64) rows)
-                    || !a.vProj.isBatchRoutedFor((int64) rows)
-                    || !a.oProj.isBatchRoutedFor((int64) rows)) {
-                return false;
+            if (d.fourNorm) {
+                refusals = refusals + this.refuse(l, "layer", 0 - 1,
+                    "fourNorm layer: the batched path has no 4-norm order",
+                    rows);
             }
+            refusals = refusals + this.refuseIf(l, "attn_q", a.qProj, rows);
+            refusals = refusals + this.refuseIf(l, "attn_k", a.kProj, rows);
+            refusals = refusals + this.refuseIf(l, "attn_v", a.vProj, rows);
+            refusals = refusals + this.refuseIf(l, "attn_output", a.oProj, rows);
             if (d.moe != null) {
                 // Unit 29: an MoE FFN places no static claim here — the
                 // grouped dispatch (unit 28) chooses device or host PER
@@ -1334,14 +1346,42 @@ public final class CausalLM extends InfModule {
                 l = l + 1;
                 continue;
             }
-            if (!d.mlp.gateProj.isBatchRoutedFor((int64) rows)
-                    || !d.mlp.upProj.isBatchRoutedFor((int64) rows)
-                    || !d.mlp.downProj.isBatchRoutedFor((int64) rows)) {
-                return false;
-            }
+            refusals = refusals + this.refuseIf(l, "ffn_gate", d.mlp.gateProj, rows);
+            refusals = refusals + this.refuseIf(l, "ffn_up", d.mlp.upProj, rows);
+            refusals = refusals + this.refuseIf(l, "ffn_down", d.mlp.downProj, rows);
             l = l + 1;
         }
-        return true;
+        this.batchRefusals = refusals;
+        return refusals == 0;
+    }
+
+    /** 1 when `lin` refuses the batched route at `rows` (said once per
+     *  distinct projection/format/reason), else 0. */
+    int32 refuseIf(int32 layer, String proj, Linear lin, int32 rows) {
+        String why = lin.batchRefusal((int64) rows);
+        if (why == null) { return 0; }
+        return this.refuse(layer, proj, lin.packedType(), why, rows);
+    }
+
+    /** Emits `batch-refused` once per distinct (projection, format,
+     *  reason) for the life of this model: name = "<proj> <format>:
+     *  <reason>", v0 = layer, v1 = rows, v2 = ggml type. Returns 1. */
+    int32 refuse(int32 layer, String proj, int32 ty, String why, int32 rows) {
+        if (!Diag.on()) { return 1; }
+        String tn #= GgufFile.typeName(ty);
+        String key = proj + " " + tn + ": " + why;
+        if (this.refusedKeys == null) {
+            this.refusedKeys = heap ArrayList<String>();
+        }
+        int32 i = 0;
+        while (i < this.refusedKeys.count()) {
+            if (this.refusedKeys.get(i).equals(key)) { return 1; }
+            i = i + 1;
+        }
+        Diag.emit("batch-refused", 0 - 1, key, (int64) layer, (int64) rows,
+            (int64) ty, 0L, 0L, 0L);
+        this.refusedKeys.add(#key);
+        return 1;
     }
 
     /**
@@ -1389,6 +1429,12 @@ public final class CausalLM extends InfModule {
     int64 stageTag;
     boolean batchSaid;
     boolean decSaid;
+    /** Refusing projections in the last `batchReady` scan (rides on the
+     *  `prefill-mode` record as v1). */
+    int32 batchRefusals;
+    /** Distinct "<proj> <format>: <reason>" keys already said by
+     *  `batch-refused`, for the life of the model. */
+    ArrayList<String> refusedKeys;
 
     /**
      * The layer stack with the PROJECTIONS BATCHED over all rows.

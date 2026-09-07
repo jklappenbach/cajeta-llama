@@ -1087,6 +1087,30 @@ public final class Linear extends InfModule {
     static KernelBuffer<int32> btXpW;   // dword view, refreshed with btXp
     static boolean mmqOn = true;        // vulkan Q4_K batch -> mmq kernel
     static boolean coopOn = true;       // vulkan Q4_K batch -> f16 coopmat
+    // prefill-routes plan 2.1.1 (spike arm): open the coop f16 GEMM on
+    // EVERY backend for the formats without a native batch kernel
+    // (Q2_K/Q3_K/Q5_K/Q8_0/Q4_0/Q5_0), instead of the per-row path the
+    // 2026-09-06 sweep measured at 13–18 tok/s. Off until measured.
+    static boolean coopAllBackends = false;
+    public static void setCoopAllBackends(boolean on) { Linear.coopAllBackends = on; }
+    public static boolean coopAllBackendsOn() { return Linear.coopAllBackends; }
+    // Race-bracket switches for the coop route on HIP (prefill-routes 2.1.1
+    // spike): a stream sync after the f16 staging (1) and after the GEMM (2).
+    static boolean coopSync1 = false;
+    static boolean coopSync2 = false;
+    public static void setCoopSync(int32 which, boolean on) {
+        if (which == 1) { Linear.coopSync1 = on; } else { Linear.coopSync2 = on; }
+    }
+    /** The coop f16 GEMM is this weight's batched route on a non-vulkan
+     *  backend: the spike arm is on, no native batch kernel exists for
+     *  the format, and the tile divides the shape. */
+    boolean coopRoutedHere() {
+        return Linear.coopAllBackends && Linear.coopOn
+            && !Linear.backendIsVulkan()
+            && !QuantKernel.hasBatchKernel(this.packedTy)
+            && QuantKernel.coopColsOk(this.packedTy, (int64) this.inDim)
+            && (int64) this.outDim % 128L == 0L;
+    }
     // f16 twin of the staged batch activations, converted LAZILY on the
     // first coop consumer of a staging (the pack above serves the dp4a
     // kernels). btXhSrc is a deliberate non-owning alias of the staged
@@ -1734,7 +1758,10 @@ public final class Linear extends InfModule {
             if (this.packedTy == Quant.GG_Q6_K) { return Linear.avQ6Batch; }
             return this.packedTy == Quant.GG_Q4_K;
         }
-        return QuantKernel.hasBatchKernel(this.packedTy);
+        if (QuantKernel.hasBatchKernel(this.packedTy)) { return true; }
+        // prefill-routes 2.2.1: no native int8 batch kernel for this
+        // format — the coop f16 GEMM is the batched route when its arm is on.
+        return this.coopRoutedHere();
     }
 
     /**
@@ -1744,23 +1771,60 @@ public final class Linear extends InfModule {
      * announced per-row path rather than a throw.
      */
     boolean isBatchRoutedFor(int64 rows) {
-        if (this.isBatchRouted()) { return true; }
+        return this.batchRefusal(rows) == null;
+    }
+
+    /**
+     * WHY `isBatchRoutedFor(rows)` says no — null when it says yes. This
+     * is the one place the predicate chain is spelled out with a reason
+     * on every branch, and `isBatchRoutedFor` is defined THROUGH it, so
+     * the `batch-refused` diagnostic (prefill-routes plan 1.2.1) and the
+     * decision cannot disagree. The 2026-09-06 sweep found five
+     * checkpoints prefilling per-row with nothing naming the tensor.
+     */
+    String batchRefusal(int64 rows) {
+        if (this.packedTy < 0) { return "not a quantized weight (packedTy < 0)"; }
+        if (!QuantKernel.routingEnabled()) { return "kernel routing disabled"; }
+        if (!Linear.waveMv()) { return "no device mat-vec on this backend"; }
+        if (!Linear.wmmaBackend()) { return "no batch GEMM kernels on this backend"; }
+        if (this.isBatchRouted()) { return null; }
+        if (Linear.backendIsVulkan()) {
+            return "vulkan: coop tile does not divide cols/outDim and no batch kernel";
+        }
+        // Not vulkan and hasBatchKernel(ty) is false. With the coop arm
+        // on, the coop f16 GEMM would have taken it unless the tile does
+        // not divide the shape — say which.
+        if (Linear.coopAllBackends && Linear.coopOn) {
+            if (!QuantKernel.coopColsOk(this.packedTy, (int64) this.inDim)) {
+                return "coop GEMM: cols not a multiple of the tile (256 k-quant, 64 legacy)";
+            }
+            if ((int64) this.outDim % 128L != 0L) {
+                return "coop GEMM: outDim not a multiple of 128";
+            }
+        }
+        // Otherwise the int8 Mw8 deq GEMM is the only other batched route,
+        // and four formats have one.
         if (this.packedTy != Quant.GG_Q5_K
                 && this.packedTy != Quant.GG_Q8_0
                 && this.packedTy != Quant.GG_Q2_K
                 && this.packedTy != Quant.GG_Q3_K) {
-            return false;
+            return "no batched GEMM kernel for this format";
         }
+        if (!Linear.deqPrefill) {
+            return "only route is the int8 Mw8 GEMM (prefillWeights=int8); prefillWeights=packed";
+        }
+        if (!Linear.wmmaOn) { return "wmma off"; }
         Linear.ensureKernelAvail();
         boolean mw8Avail =
             this.packedTy == Quant.GG_Q5_K ? Linear.avQ5Mw8
             : this.packedTy == Quant.GG_Q8_0 ? Linear.avQ80Mw8
             : this.packedTy == Quant.GG_Q2_K ? Linear.avQ2Mw8
             : Linear.avQ3Mw8;
-        return Linear.deqPrefill && Linear.wmmaOn
-            && QuantKernel.routingEnabled() && Linear.waveMv()
-            && Linear.wmmaBackend() && mw8Avail
-            && WmmaKernel.fitsMw8(rows, (int64) this.outDim);
+        if (!mw8Avail) { return "Mw8 deq kernel not registered on this backend"; }
+        if (!WmmaKernel.fitsMw8(rows, (int64) this.outDim)) {
+            return "rows or outDim not a multiple of 128 (Mw8 tile)";
+        }
+        return null;
     }
 
     /**
@@ -1831,7 +1895,8 @@ public final class Linear extends InfModule {
         // Every route below the coop pair reads the int8 activations, so
         // this is where the lazy pack comes due — one predicate covering
         // the whole else-if chain rather than a call in each arm.
-        boolean coopHere = Linear.coopOn && Linear.backendIsVulkan()
+        boolean coopHere = Linear.coopOn
+            && (Linear.backendIsVulkan() || this.coopRoutedHere())
             && Linear.btXhSrc != null
             && QuantKernel.coopColsOk(this.packedTy, (int64) this.inDim)
             && (int64) this.outDim % 128L == 0L;
@@ -2049,7 +2114,8 @@ public final class Linear extends InfModule {
                     (int64) rows, (int64) this.outDim,
                     (int64) this.inDim);
             }
-        } else if (Linear.coopOn && Linear.backendIsVulkan()
+        } else if (Linear.coopOn
+                && (Linear.backendIsVulkan() || this.coopRoutedHere())
                 && Linear.btXhSrc != null
                 && QuantKernel.coopColsOk(this.packedTy,
                     (int64) this.inDim)

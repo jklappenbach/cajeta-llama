@@ -59,7 +59,12 @@ public final class LoggingDiagCallback implements DiagCallback {
      *  lagged. */
     static #String render(DiagRecord r) {
         if (r.category.equals("prefill-mode")) {
-            return #= "prefill: " + r.name + " projections rows=" + r.v0;
+            return #= "prefill: " + r.name + " projections rows=" + r.v0
+                + " refusals=" + r.v1;
+        }
+        if (r.category.equals("batch-refused")) {
+            return #= "batch-refused: " + r.name + " layer=" + r.v0
+                + " rows=" + r.v1;
         }
         if (r.category.equals("decode-mode")) {
             return #= "decode: " + r.name + " path";
