@@ -165,6 +165,7 @@ public final class SchedThroughput {
             if (args[pi].equals("pfsync")) { CausalLM.setPfSync(true); }
             if (args[pi].equals("coopsync1")) { Linear.setCoopSync(1, true); }
             if (args[pi].equals("coopsync2")) { Linear.setCoopSync(2, true); }
+            if (args[pi].equals("coopargs")) { Linear.setCoopArgTrace(true); }
             pi = pi + 1;
         }
 

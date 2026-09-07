@@ -1098,6 +1098,11 @@ public final class Linear extends InfModule {
     // spike): a stream sync after the f16 staging (1) and after the GEMM (2).
     static boolean coopSync1 = false;
     static boolean coopSync2 = false;
+    // Spike instrument (prefill-routes 2.1.1): one record per coop GEMM with
+    // the four buffer handles the launch marshals, so a GPU read fault at a
+    // HOST address can be matched to the argument that carried it.
+    static boolean coopArgTrace = false;
+    public static void setCoopArgTrace(boolean on) { Linear.coopArgTrace = on; }
     public static void setCoopSync(int32 which, boolean on) {
         if (which == 1) { Linear.coopSync1 = on; } else { Linear.coopSync2 = on; }
     }
@@ -2135,6 +2140,18 @@ public final class Linear extends InfModule {
             int64 padRows = ((int64) rows + 127L) / 128L * 128L;
             this.ensureBatchOut((int32) padRows);
             Linear.ensureBtXh(padRows);
+            if (Linear.coopArgTrace) {
+                Diag.emit("coop-args", 0 - 1, "handles ty=" + this.packedTy
+                    + " out=" + this.outDim + " in=" + this.inDim,
+                    this.yBatch.handle(), this.coopW.handle(),
+                    Linear.btXh.handle(), Linear.btXhSrc.handle(),
+                    (int64) padRows, 0L);
+                Diag.emit("coop-args", 0 - 1, "lengths",
+                    (int64) this.yBatch.length(), (int64) this.coopW.length(),
+                    (int64) Linear.btXh.length(),
+                    (int64) Linear.btXhSrc.length(),
+                    (int64) Linear.btRows, (int64) Linear.btN);
+            }
             // NoSync: the batched prefill path is fully stream-ordered
             // (device pack, f16 convert, GEMM, device attend), so the
             // per-call sync the mmq route carries only serializes 224

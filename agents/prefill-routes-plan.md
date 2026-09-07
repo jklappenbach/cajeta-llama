@@ -76,7 +76,7 @@ plan's acceptance and in the bench memory.
 ## Unit 2 — Coop GEMM route on HIP for the formats without a batch kernel (spec §3)
 
 ### 2.1 TDD
-- [ ] 2.1.1 Spike first (no half-measures): force the coop route on HIP for
+- [x] 2.1.1 Spike first (no half-measures): force the coop route on HIP for
       Q8_0 and measure `schedthroughput` prefill at 512 on the 8B Q8_0
       against the 13.2 tok/s before row. The unit proceeds only if the
       spike is batched and faster; if the coop kernels misbehave on HIP the
@@ -147,6 +147,84 @@ plan's acceptance and in the bench memory.
       fixtures never engage it. The coopsync1/2 bench arms in cc05c21 set
       flags with NO use site in Linear (dead) — ignore their earlier
       "brackets".
+      MEASURED (2026-09-07, host, no GPU): (1) `Diag.emit` is the VICTIM —
+      `DiagTest.emitWithHeapTemporaryNamesLeavesTheHeapIntact` relays 256
+      heap-temporary names through a plain param with same-size-class bait
+      allocated between emits: every bait intact, live count balanced
+      (360/0/1 both profiles, commit 457d4cf). Mechanism read in the IR +
+      runtime: the caller passes the temp with transfer word 0 and drops it
+      right after the call; the callee's `#=` on a String field routes a
+      lend through `__cajeta_string_resolve`, which returns a FRESH wrapper
+      the field owns (owned copy for len <= 256, shared stake above), then
+      sets the own-bit — safe. (2) `#=` on a CLASS field from a lent param
+      (`probe.Q.keep` IR): reads the arriving title flag, displaces the old
+      value only if it was owned, stores, and sets own-bit = title flag —
+      i.e. records a BORROW for a lend, exactly CLAUDE.md §2.3. A static
+      `#=` from a param (`probe.Q.park`) just stores the pointer. The
+      caller frees the object at scope end, so `Linear.btXhSrc #= src`
+      (stageBatchFromDevice) DANGLES if `src` dies before the coop
+      route's `ensureBtXh` reads it; the callers pass `this.pfXnDev`,
+      `dkv.prefillAttendResident(...)` (= the DeviceKv FIELD `aoDev`, long-
+      lived) and `d.mlp.gateProj.yBatch` (a Linear field that
+      `ensureBatchOut` can REALLOCATE — check that growth path). (3) The
+      bench builds cleanly THROUGH run-tests.sh's enumeration
+      (`tmp/u4/build-bench.sh`: its prologue + `--emit=cja` + `--emit=exe
+      --tree-shake=off --xpu-backend=amdgpu`), which is the order-dependence
+      of the ownership check demonstrated by construction; note the copied
+      prologue's `trap rm -rf $out EXIT` — delete it or the exe vanishes.
+      (4) The 2026-09-06 leg logs and the working spike runs never printed
+      `no registered kernel`; it was new to tonight's four runs.
+      NAMED (2026-09-07, fresh bench = run-tests enumeration + tree-shake
+      off, cajeta 057f4fe9): `no registered kernel` is NOT corruption — the
+      runtime resolves kernels LAZILY (`hipModuleGetFunction` at first
+      launch, cajeta_xpu_launch.c) and ignores HIP return codes; after a GPU
+      fault every HIP call returns `hipErrorIllegalAddress`, so every
+      not-yet-resolved kernel prints that line and the process exits 0 with
+      garbage. With `AMD_LOG_LEVEL=4 AMD_SERIALIZE_KERNEL=3` (`tmp/u4/coop-
+      log4.log`) the dispatch order before the first error is: blockRepack2
+      → f32ToF16 (grid 2048 = 128x4096) → q80F16CoopX3Kernel (grid 32 =
+      the 4096x4096 **o_proj** GEMM, first use) → addF32 launch returns
+      hipErrorIllegalAddress. The q/k/v GEMMs (same kernel, same shape) ran
+      fine just before. The kernel log for that pid: READ faults (client
+      TCP) walking HOST-HEAP pages 0x5fe7c2551000..0x5fe7c2567000 — the
+      region holding the process's HIP objects (its stream is at
+      0x5fe7c2574740). So the o_proj coop launch marshals a HANDLE that is
+      a host pointer: a KernelBuffer wrapper freed and its memory reused
+      by libamdhip, read back as `deviceHandle` at launch — layout- and
+      timing-dependent by nature, and it faults SERIALIZED too now. Diag
+      trace `coop-args` (bench arm `coopargs`) prints the four handles +
+      lengths per coop launch to name the argument.
+      ROOT CAUSE (2026-09-07, measured in IR, `cajeta/tmp/probe-emit/src/probe/T.cajeta`):
+      a local bound from a TERNARY of a borrowed field and a literal —
+      `String nm = r.name != null ? r.name : "-";` — gets an ARMED drop entry
+      (`__cajeta_drop_push … __cajeta_string_drop`) and frees the field's
+      wrapper at scope end; `String nm = r.name;` gets none. cajeta's
+      LocalVariableDeclaration classifies an initializer as a borrow only for
+      the shapes it recognises (literal, identifier, field read, array
+      element, plain-return call); a BooleanSwitchExpression matches none and
+      defaults to OWNED. The bench's `StdoutTrace.onRecord` (trace arm) and
+      the CLI's `LoggingDiagCallback.cajeta:102` both have that exact line,
+      so every diag record under trace/debug logging double-frees the scratch
+      record's name wrapper; the block is reused (a KernelBuffer wrapper,
+      an arena tensor carrying 524288 = 128x4096 — the deterministic fault
+      addr 0x80000), and the next emit frees the impostor. THAT is the whole
+      "GPU race": a freed KernelBuffer wrapper's handle read back as a host
+      pointer. Same class as [[kernel-ternary-mislowers]], host side. Fix in
+      the COMPILER (ternary arms classified; mixed arms carry a runtime title
+      flag like flagged calls); the two cajeta-llm lines are legal as written.
+      FIXED IN CAJETA (2026-09-07, `fix(ownership): a local bound from a
+      ternary owns exactly what the taken arm produced`, on main; tests
+      TernaryOwnershipTests 4/4, 48 ownership suites 288/0/2). VERIFIED HERE:
+      bench rebuilt with that compiler (`tmp/u4/build-bench.sh`, tree-shake
+      off), `<8B Q8_0> prompt=512 gen=8 trace coophip`: first token 77 both
+      SERIALIZED and UNSERIALIZED, no GPU fault (kernel log clean), no `no
+      registered kernel`, no SIGSEGV (`tmp/u4/fix-ser3.log`, `fix-unser.log`).
+      Unserialized: prefill 512 in 2013 ms = 254 tok/s, decode 27.6 tok/s —
+      INDICATIVE ONLY (the cpu suite ran beside it; box not quiet); the
+      per-row row of record is 13.2 tok/s. The coop route on HIP is correct;
+      2.2.x (structural default) and 2.1.2–2.1.5 can proceed; 2.3.1 is the
+      announced acceptance leg. The `coopargs` arm + `coop-args` Diag record
+      (Linear/SchedThroughput) stay as a launch-handle instrument.
       LATER THE SAME NIGHT: a direct `cajeta --emit=cja` of the library
       (same fixed compiler, same sources, same classpath as run-tests.sh)
       FAILS with `CAJETA_ERROR_OWNED_RESULT_NEEDS_TRANSFER` at
