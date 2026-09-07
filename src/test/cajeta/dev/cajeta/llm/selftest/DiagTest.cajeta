@@ -1,6 +1,7 @@
 package dev.cajeta.llm.selftest;
 
 import cajeta.collection.ArrayList;
+import cajeta.lang.Cajeta;
 import cajeta.lang.String;
 import cajeta.xpu.Device;
 import cajeta.xpu.KernelBuffer;
@@ -356,6 +357,69 @@ public class DiagTest {
                 Assert.equals(1L, cap.w0[i]);
             }
             i = i + 1;
+        }
+    }
+
+    /** A consumer that keeps nothing: the record's strings are borrows
+     *  valid during the callback, and this one never copies them. */
+    static class Sink implements DiagCallback {
+        public int32 n;
+        public Sink() { this.n = 0; }
+        public void onRecord(DiagRecord r) { this.n = this.n + 1; return; }
+    }
+
+    /** The `Linear.sayRoute` hop: a plain-param relay of a caller's
+     *  temporary into `Diag.emit`. */
+    static void relay(String name) {
+        Diag.emit("probe", 0 - 1, name, 1L, 0L, 0L, 0L, 0L, 0L);
+        return;
+    }
+
+    /**
+     * prefill-routes 2.1.1 (2026-09-07). The coop route's `sayRoute` hands a
+     * HEAP TEMPORARY name (`"coop ty=" + ty`) through a plain param to
+     * `Diag.emit`, which stores it with `#=` in a static scratch record and
+     * drops the previous value on the next emit. On gfx1151 the bench died
+     * three different ways from that call site — a SIGSEGV symbolized to
+     * `__cajeta_string_drop_claimed` inside `Diag.emit`, kernel-registry
+     * lookups failing, and a GPU read of a host-heap address — the
+     * signature of a live object freed through a stale pointer. The bait
+     * strings are allocated right after each temporary dies, in the same
+     * size class, so a drop that treats the dead temporary as owned lands
+     * on a bait string; the read-back at the end is the oracle.
+     */
+    @Test
+    public void emitWithHeapTemporaryNamesLeavesTheHeapIntact() {
+        Sink sink = heap Sink();
+        Diag.register(sink);
+        ArrayList<String> churn = heap ArrayList<String>();
+        int64 live0 = Cajeta.liveCount();
+        int32 i = 0;
+        while (i < 256) {
+            DiagTest.relay("coop ty=" + i);
+            String bait = "bait-" + i;
+            churn.add(#bait);
+            i = i + 1;
+        }
+        int64 live1 = Cajeta.liveCount();
+        Diag.register(null);
+        Assert.equals(256L, (int64) sink.n);
+        i = 0;
+        while (i < 256) {
+            String want = "bait-" + i;
+            if (!churn.get(i).equals(want)) {
+                Assert.fail("bait " + i + " was clobbered: a dead temporary "
+                    + "passed to Diag.emit was dropped as owned");
+            }
+            i = i + 1;
+        }
+        // 256 bait strings are live by construction; at most one temporary
+        // may still be held by the scratch record. Fewer live objects than
+        // the bait alone means something freed what it did not own.
+        int64 delta = live1 - live0;
+        if (delta < 256L || delta > 257L) {
+            Assert.fail("live delta " + delta + " for 256 live bait strings "
+                + "(expected 256 or 257)");
         }
     }
 }
