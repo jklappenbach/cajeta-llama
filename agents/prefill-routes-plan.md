@@ -115,27 +115,38 @@ plan's acceptance and in the bench memory.
       assigned?), `coopW` = `coopDev.wordView()`, `btXh`. Under serialization
       the same launch computes the right tokens.
 
-      NIGHT 2 (2026-09-07, after the compiler fix landed as cajeta 057f4fe9):
-      the standalone spike binary `tmp/llmbench-spike/schedthroughput` is
-      VOID — its tree-shaker pruned `q80F16CoopX1Kernel` (and `gluF32`) as
-      unreachable, because on an amdgpu build the coop branch is statically
-      dead (`backendIsVulkan()` false; `coopRoutedHere()` gates on the
-      `coopAllBackends` static, flipped only at RUNTIME). Re-running it now
-      prints `no registered kernel q80F16CoopX1Kernel` and first token 0 for
-      every arm (base/serialize=1,2/copy=3), so those four arms measure
-      nothing. The GPU itself is HEALTHY: AttentionTest device tests pass and
-      the kernel log shows no new amdgpu page fault during these runs, so the
-      real 2026-09-06 aperture fault stands (it came from a build where the
-      kernel survived). PRODUCTION SIGNAL: 2.2.1 must open the coop branch
-      STRUCTURALLY on amdgpu (not behind a runtime-only flag) so tree-shake
-      keeps the kernels — a runtime `setCoopAllBackends` flag alone yields a
-      binary with no coop kernel. REPRO CONSTRAINT: the coop route needs
-      `outDim % 128 == 0` and `cols % 64|256 == 0`; the toy/kquant fixtures
-      are [out=8,in=256] and never engage it, so 2.1.2 needs a 128-aligned
-      Q8_0 fixture (a .cajeta gguf generator) OR the real 8B model on device,
-      in the TEST harness (CoopQuantGemmTest-style) where the kernel stays
-      reachable. The coopsync1/2 bench arms in cc05c21 set flags with NO use
-      site in Linear (dead) — ignore their earlier "brackets".
+      NIGHT 2 (2026-09-07, after the compiler fix landed as cajeta 057f4fe9)
+      — CORRECTED: the "race" is HOST HEAP CORRUPTION on the coop route.
+      Five runs of `tmp/llmbench-spike/schedthroughput <8B Q8_0> prompt=512
+      gen=2 trace coophip` (same args) gave three different failures: (a)
+      four runs exit 0 with every later launch saying `no registered kernel
+      'gluF32' / 'q80F16CoopX1Kernel'` and first token 0 — the kernels ARE
+      in the binary (`strings` shows both `.kd` descriptors; a first
+      "tree-shake pruned them" reading was wrong), so the registry lookups
+      themselves went bad; (b) two of those runs also page-faulted on the
+      GPU (dmesg 00:24:08 / 00:24:14, client TCP, a READ of
+      0x576a86f02000 — a host-heap-shaped address, i.e. a kernel handed a
+      corrupted pointer); (c) the fifth run: host SIGSEGV, exit 139, fault
+      addr 0x80000, symbolized against the binary:
+      `__cajeta_string_drop_claimed` ← `Diag.emit` +0x11c ← `Linear.sayRoute`
+      ← `matmulBatchKeep` (coop branch) — an owned string dropped inside
+      `Diag.emit`, right after `prefill-mode batched` and BEFORE any coop
+      launch. Heap-layout dependence is why `AMD_SERIALIZE_KERNEL=3` and
+      `AMD_LOG_LEVEL=4` "fixed" it last night. Leading suspect: `sayRoute`'s
+      coop call is the one that passes a HEAP TEMPORARY name (`"coop ty=" +
+      this.packedTy`; dotAccum at Linear:2166 is the other), and `Diag.emit`
+      does `r.name #= name` into its static scratch record and drops the
+      previous value on the next emit — measure whether the temp's title is
+      both tendered to the callee AND dropped by the caller (double drop),
+      or a dangling borrow is later dropped as owned. `DiagTest` passes the
+      same shape on CPU, so it is layout-dependent; write the probe as a
+      Diag test that emits two heap-temp names back to back under a
+      callback. GPU is HEALTHY (AttentionTest device tests pass, no new
+      fault during the crash run). Still true: the coop route needs
+      `outDim % 128 == 0` and `cols % 64|256 == 0`, so the [out=8,in=256]
+      fixtures never engage it. The coopsync1/2 bench arms in cc05c21 set
+      flags with NO use site in Linear (dead) — ignore their earlier
+      "brackets".
       LATER THE SAME NIGHT: a direct `cajeta --emit=cja` of the library
       (same fixed compiler, same sources, same classpath as run-tests.sh)
       FAILS with `CAJETA_ERROR_OWNED_RESULT_NEEDS_TRANSFER` at
