@@ -40,7 +40,7 @@ public class KvCacheTest {
         }
         ToyModel.writeConfigX(path, "LlamaForCausalLM", 16, 32, layers,
             2, 1, 0, 24, 64, true, extra);
-        ModelConfig cfg = ModelConfig.parse(path);
+        ModelConfig cfg #= ModelConfig.parse(path);
         cfg.blockTokens = 4;
         return #cfg;
     }
@@ -49,7 +49,7 @@ public class KvCacheTest {
     static #Tensor<float32> row(int32 kvDim, float32 base) {
         int64[] s = heap int64[1];
         s[0] = (int64) kvDim;
-        Tensor<float32> t = Tensor.zeros<float32>(s);
+        Tensor<float32> t #= Tensor.zeros<float32>(s);
         int64 d = 0;
         while (d < (int64) kvDim) {
             t.flatSet(d, base + (float32) d);
@@ -62,15 +62,15 @@ public class KvCacheTest {
 
     @Test
     public void appendedRowsReadBackExactly() {
-        ModelConfig cfg = KvCacheTest.cacheCfg(2, 0);
+        ModelConfig cfg #= KvCacheTest.cacheCfg(2, 0);
         PagedKvCache c = heap PagedKvCache(cfg, 64, 1, 32);
         int32 l = 0;
         while (l < 2) {
             int32 t = 0;
             while (t < 10) {
-                Tensor<float32> k = KvCacheTest.row(8,
+                Tensor<float32> k #= KvCacheTest.row(8,
                     1000.0f * (float32) l + 10.0f * (float32) t);
-                Tensor<float32> v = KvCacheTest.row(8,
+                Tensor<float32> v #= KvCacheTest.row(8,
                     1000.0f * (float32) l + 10.0f * (float32) t + 5.0f);
                 Assert.isTrue(c.appendRow(0, l, k, 0, v, 0, t));
                 t = t + 1;
@@ -100,12 +100,12 @@ public class KvCacheTest {
 
     @Test
     public void blockDrawnOnlyAtBoundary() {
-        ModelConfig cfg = KvCacheTest.cacheCfg(1, 0);
+        ModelConfig cfg #= KvCacheTest.cacheCfg(1, 0);
         PagedKvCache c = heap PagedKvCache(cfg, 64, 1, 8);
         int32 t = 0;
         while (t < 10) {
             int32 before = c.freeBlocks();
-            Tensor<float32> k = KvCacheTest.row(8, (float32) t);
+            Tensor<float32> k #= KvCacheTest.row(8, (float32) t);
             Assert.isTrue(c.appendRow(0, 0, k, 0, k, 0, t));
             int32 spent = before - c.freeBlocks();
             if (t % 4 == 0) {
@@ -126,10 +126,10 @@ public class KvCacheTest {
         String stPath = "/tmp/cajeta_llama_kvc_pd.safetensors";
         ForwardTest.writeA(cfgPath, stPath, 2);
 
-        ModelConfig cfgA = ModelConfig.parse(cfgPath);
+        ModelConfig cfgA #= ModelConfig.parse(cfgPath);
         cfgA.blockTokens = 4;
         CausalLM mA = heap CausalLM(#cfgA, 64, 1, 0);
-        Checkpoint ckA = Checkpoint.open(stPath);
+        Checkpoint ckA #= Checkpoint.open(stPath);
         mA.bind(ckA, false);
         ckA.close();
 
@@ -149,10 +149,10 @@ public class KvCacheTest {
         }
         Tensor<float32> la = mA.logits();
 
-        ModelConfig cfgB = ModelConfig.parse(cfgPath);
+        ModelConfig cfgB #= ModelConfig.parse(cfgPath);
         cfgB.blockTokens = 4;
         CausalLM mB = heap CausalLM(#cfgB, 64, 1, 0);
-        Checkpoint ckB = Checkpoint.open(stPath);
+        Checkpoint ckB #= Checkpoint.open(stPath);
         mB.bind(ckB, false);
         ckB.close();
         int32 nb = mB.prefill(toks, 8);
@@ -171,33 +171,33 @@ public class KvCacheTest {
 
     @Test
     public void exhaustionSurfacesAndContextLimitThrows() {
-        ModelConfig cfg = KvCacheTest.cacheCfg(1, 0);
+        ModelConfig cfg #= KvCacheTest.cacheCfg(1, 0);
         PagedKvCache c = heap PagedKvCache(cfg, 16, 1, 2);
         int32 t = 0;
         while (t < 8) {
-            Tensor<float32> k = KvCacheTest.row(8, (float32) t);
+            Tensor<float32> k #= KvCacheTest.row(8, (float32) t);
             Assert.isTrue(c.appendRow(0, 0, k, 0, k, 0, t));
             t = t + 1;
         }
         // Pool empty; the next boundary append SURFACES, no throw (6.4).
-        Tensor<float32> k8 = KvCacheTest.row(8, 8.0f);
+        Tensor<float32> k8 #= KvCacheTest.row(8, 8.0f);
         Assert.isFalse(c.appendRow(0, 0, k8, 0, k8, 0, 8));
         Assert.equals((int64) 8, (int64) c.lengthOf(0, 0));
         Assert.equals((int64) 0, (int64) c.freeBlocks());
 
         // Exceeding the CONFIGURED maximum context is the caller's error.
-        ModelConfig cfg2 = KvCacheTest.cacheCfg(1, 0);
+        ModelConfig cfg2 #= KvCacheTest.cacheCfg(1, 0);
         PagedKvCache c2 = heap PagedKvCache(cfg2, 4, 1, 8);
         t = 0;
         while (t < 4) {
-            Tensor<float32> k = KvCacheTest.row(8, (float32) t);
+            Tensor<float32> k #= KvCacheTest.row(8, (float32) t);
             Assert.isTrue(c2.appendRow(0, 0, k, 0, k, 0, t));
             t = t + 1;
         }
         boolean threw = false;
         String msg = "";
         try {
-            Tensor<float32> k4 = KvCacheTest.row(8, 4.0f);
+            Tensor<float32> k4 #= KvCacheTest.row(8, 4.0f);
             c2.appendRow(0, 0, k4, 0, k4, 0, 4);
         } catch (LlmException ex) {
             threw = true;
@@ -214,10 +214,10 @@ public class KvCacheTest {
         String cfgPath = "/tmp/cajeta_llama_kvc_za_cfg.json";
         String stPath = "/tmp/cajeta_llama_kvc_za.safetensors";
         ForwardTest.writeA(cfgPath, stPath, 2);
-        ModelConfig cfg = ModelConfig.parse(cfgPath);
+        ModelConfig cfg #= ModelConfig.parse(cfgPath);
         cfg.blockTokens = 4;
         CausalLM m = heap CausalLM(#cfg, 64, 1, 0);
-        Checkpoint ck = Checkpoint.open(stPath);
+        Checkpoint ck #= Checkpoint.open(stPath);
         m.bind(ck, false);
         ck.close();
         int32[] toks = heap int32[2];
@@ -242,20 +242,20 @@ public class KvCacheTest {
 
     @Test
     public void releaseReusesBlocksWithoutReallocationOrLeak() {
-        ModelConfig cfg = KvCacheTest.cacheCfg(1, 0);
+        ModelConfig cfg #= KvCacheTest.cacheCfg(1, 0);
         PagedKvCache c = heap PagedKvCache(cfg, 64, 2, 8);
         int32 initialFree = c.freeBlocks();
         // Warm one full cycle so first-touch costs are out of the way.
         int32 t = 0;
         while (t < 8) {
-            Tensor<float32> k = KvCacheTest.row(8, (float32) t);
+            Tensor<float32> k #= KvCacheTest.row(8, (float32) t);
             c.appendRow(0, 0, k, 0, k, 0, t);
             t = t + 1;
         }
         c.release(0);
         Assert.equals((int64) initialFree, (int64) c.freeBlocks());
 
-        Tensor<float32> kr = KvCacheTest.row(8, 1.0f);
+        Tensor<float32> kr #= KvCacheTest.row(8, 1.0f);
         int64 b0 = Cajeta.allocatedBytes();
         int32 cycle = 0;
         while (cycle < 50) {
@@ -282,7 +282,7 @@ public class KvCacheTest {
 
     @Test
     public void ringSizedToWindowAndPrefillPastWindowBounded() {
-        ModelConfig cfg = KvCacheTest.cacheCfg(1, 8);
+        ModelConfig cfg #= KvCacheTest.cacheCfg(1, 8);
         PagedKvCache c = heap PagedKvCache(cfg, 64, 1, 4);
         // Mistral's shape in miniature: cap 64, window 8 → an eighth.
         Assert.equals((int64) 8, (int64) c.ringRows(0));
@@ -290,7 +290,7 @@ public class KvCacheTest {
         // draw NOTHING from the pool.
         int32 t = 0;
         while (t < 20) {
-            Tensor<float32> k = KvCacheTest.row(8, 10.0f * (float32) t);
+            Tensor<float32> k #= KvCacheTest.row(8, 10.0f * (float32) t);
             Assert.isTrue(c.appendRow(0, 0, k, 0, k, 0, t));
             t = t + 1;
         }
@@ -302,11 +302,11 @@ public class KvCacheTest {
 
     @Test
     public void ringSlotMappingOverwritesPMinusW() {
-        ModelConfig cfg = KvCacheTest.cacheCfg(1, 8);
+        ModelConfig cfg #= KvCacheTest.cacheCfg(1, 8);
         PagedKvCache c = heap PagedKvCache(cfg, 64, 1, 4);
         int32 t = 0;
         while (t < 20) {
-            Tensor<float32> k = KvCacheTest.row(8, 10.0f * (float32) t);
+            Tensor<float32> k #= KvCacheTest.row(8, 10.0f * (float32) t);
             c.appendRow(0, 0, k, 0, k, 0, t);
             t = t + 1;
         }
@@ -332,19 +332,19 @@ public class KvCacheTest {
 
     @Test
     public void wrappedWindowMatchesFullCacheReference() {
-        ModelConfig cfg = KvCacheTest.cacheCfg(1, 8);
+        ModelConfig cfg #= KvCacheTest.cacheCfg(1, 8);
         PagedKvCache c = heap PagedKvCache(cfg, 64, 1, 4);
         // Also keep a PACKED unwindowed copy of all rows as reference.
         int64[] ps = heap int64[2];
         ps[0] = 21;
         ps[1] = 8;
-        Tensor<float32> pk = Tensor.zeros<float32>(ps);
-        Tensor<float32> pv = Tensor.zeros<float32>(ps);
+        Tensor<float32> pk #= Tensor.zeros<float32>(ps);
+        Tensor<float32> pv #= Tensor.zeros<float32>(ps);
         int32 t = 0;
         while (t < 21) {
-            Tensor<float32> k = KvCacheTest.row(8,
+            Tensor<float32> k #= KvCacheTest.row(8,
                 0.0625f * (float32) ((t * 7 + 1) % 11));
-            Tensor<float32> v = KvCacheTest.row(8,
+            Tensor<float32> v #= KvCacheTest.row(8,
                 0.0625f * (float32) ((t * 5 + 3) % 13));
             c.appendRow(0, 0, k, 0, v, 0, t);
             int32 d = 0;
@@ -360,7 +360,7 @@ public class KvCacheTest {
         // clamped to the same range.
         int64[] qs = heap int64[1];
         qs[0] = 16;
-        Tensor<float32> q = Tensor.zeros<float32>(qs);
+        Tensor<float32> q #= Tensor.zeros<float32>(qs);
         int64 j = 0;
         while (j < 16) {
             q.flatSet(j, 0.125f * (float32) ((j * 3 + 2) % 7) - 0.25f);
@@ -368,11 +368,11 @@ public class KvCacheTest {
         }
         int64[] ss = heap int64[1];
         ss[0] = 32;
-        Tensor<float32> scores = Tensor.zeros<float32>(ss);
+        Tensor<float32> scores #= Tensor.zeros<float32>(ss);
         int64[] os = heap int64[1];
         os[0] = 16;
-        Tensor<float32> outC = Tensor.zeros<float32>(os);
-        Tensor<float32> outR = Tensor.zeros<float32>(os);
+        Tensor<float32> outC #= Tensor.zeros<float32>(os);
+        Tensor<float32> outR #= Tensor.zeros<float32>(os);
         c.attendRow(0, 0, q, 0, 0.35f, scores, outC, 0, 2, 1, 8);
         Prim.attendRowHost(q, 0, pk, pv, 0, 13, 20, 0.35f, scores,
             outR, 0, 2, 1, 8);
@@ -388,18 +388,18 @@ public class KvCacheTest {
 
     @Test
     public void blockTableReadsAcrossBoundary() {
-        ModelConfig cfg = KvCacheTest.cacheCfg(1, 0);
+        ModelConfig cfg #= KvCacheTest.cacheCfg(1, 0);
         PagedKvCache c = heap PagedKvCache(cfg, 64, 1, 8);
         int64[] ps = heap int64[2];
         ps[0] = 10;
         ps[1] = 8;
-        Tensor<float32> pk = Tensor.zeros<float32>(ps);
-        Tensor<float32> pv = Tensor.zeros<float32>(ps);
+        Tensor<float32> pk #= Tensor.zeros<float32>(ps);
+        Tensor<float32> pv #= Tensor.zeros<float32>(ps);
         int32 t = 0;
         while (t < 10) {
-            Tensor<float32> k = KvCacheTest.row(8,
+            Tensor<float32> k #= KvCacheTest.row(8,
                 0.0625f * (float32) ((t * 3 + 2) % 9));
-            Tensor<float32> v = KvCacheTest.row(8,
+            Tensor<float32> v #= KvCacheTest.row(8,
                 0.0625f * (float32) ((t * 11 + 1) % 7));
             c.appendRow(0, 0, k, 0, v, 0, t);
             int32 d = 0;
@@ -412,7 +412,7 @@ public class KvCacheTest {
         }
         int64[] qs = heap int64[1];
         qs[0] = 16;
-        Tensor<float32> q = Tensor.zeros<float32>(qs);
+        Tensor<float32> q #= Tensor.zeros<float32>(qs);
         int64 j = 0;
         while (j < 16) {
             q.flatSet(j, 0.125f * (float32) ((j * 5 + 1) % 9) - 0.5f);
@@ -420,11 +420,11 @@ public class KvCacheTest {
         }
         int64[] ss = heap int64[1];
         ss[0] = 16;
-        Tensor<float32> scores = Tensor.zeros<float32>(ss);
+        Tensor<float32> scores #= Tensor.zeros<float32>(ss);
         int64[] os = heap int64[1];
         os[0] = 16;
-        Tensor<float32> outC = Tensor.zeros<float32>(os);
-        Tensor<float32> outR = Tensor.zeros<float32>(os);
+        Tensor<float32> outC #= Tensor.zeros<float32>(os);
+        Tensor<float32> outR #= Tensor.zeros<float32>(os);
         // p=9 spans blocks 0, 1, 2 (blockTokens 4).
         c.attendRow(0, 0, q, 0, 0.35f, scores, outC, 0, 2, 1, 8);
         Prim.attendRowHost(q, 0, pk, pv, 0, 0, 9, 0.35f, scores,
@@ -441,11 +441,11 @@ public class KvCacheTest {
 
     @Test
     public void prefixSharingFreesOnlyOnLastRelease() {
-        ModelConfig cfg = KvCacheTest.cacheCfg(1, 0);
+        ModelConfig cfg #= KvCacheTest.cacheCfg(1, 0);
         PagedKvCache c = heap PagedKvCache(cfg, 64, 2, 8);
         int32 t = 0;
         while (t < 8) {
-            Tensor<float32> k = KvCacheTest.row(8, (float32) t);
+            Tensor<float32> k #= KvCacheTest.row(8, (float32) t);
             c.appendRow(0, 0, k, 0, k, 0, t);
             t = t + 1;
         }
@@ -468,11 +468,11 @@ public class KvCacheTest {
 
     @Test
     public void copyOnWriteLeavesOtherHistoryUnchanged() {
-        ModelConfig cfg = KvCacheTest.cacheCfg(1, 0);
+        ModelConfig cfg #= KvCacheTest.cacheCfg(1, 0);
         PagedKvCache c = heap PagedKvCache(cfg, 64, 2, 8);
         int32 t = 0;
         while (t < 8) {
-            Tensor<float32> k = KvCacheTest.row(8, 10.0f * (float32) t);
+            Tensor<float32> k #= KvCacheTest.row(8, 10.0f * (float32) t);
             c.appendRow(0, 0, k, 0, k, 0, t);
             t = t + 1;
         }
@@ -480,7 +480,7 @@ public class KvCacheTest {
         // the fork — seq1's next append lands INSIDE it.
         c.forkPrefix(0, 1, 6);
         int32 freeBefore = c.freeBlocks();
-        Tensor<float32> kx = KvCacheTest.row(8, 777.0f);
+        Tensor<float32> kx #= KvCacheTest.row(8, 777.0f);
         Assert.isTrue(c.appendRow(1, 0, kx, 0, kx, 0, 6));
         // The write copied the shared block first (one block consumed)...
         Assert.equals((int64) (freeBefore - 1), (int64) c.freeBlocks());
@@ -504,10 +504,10 @@ public class KvCacheTest {
         String stPath = "/tmp/cajeta_llama_kvc_rope.safetensors";
         ToyModel.writeConfigX(cfgPath, "LlamaForCausalLM", 16, 32, 1,
             2, 1, 0, 24, 32, true, "\"sliding_window\":8,");
-        ToyModel s = ToyModel.specVariant(1, 16, 32, 2, 1, 8, 24, true,
+        ToyModel s #= ToyModel.specVariant(1, 16, 32, 2, 1, 8, 24, true,
             false, false);
         ToyModel.writeWeights(stPath, s);
-        CausalLM m = CausalLM.load(cfgPath, stPath, 32,
+        CausalLM m #= CausalLM.load(cfgPath, stPath, 32,
             false);
 
         int32[] t0 = heap int32[1];
@@ -525,8 +525,8 @@ public class KvCacheTest {
 
         // Expected K row for position 12: embed → input norm → k_proj →
         // RoPE at ABSOLUTE 12 (slot 12 % 8 = 4 would rotate by 4).
-        ArrayList<String> names = m.parameterNames();
-        ArrayList<Tensor<float32>> ts = m.parameterTensors();
+        ArrayList<String> names #= m.parameterNames();
+        ArrayList<Tensor<float32>> ts #= m.parameterTensors();
         Tensor<float32> emb = ts.get(AttentionTest.idx(names,
             "model.embed_tokens.weight"));
         Tensor<float32> wIn = ts.get(AttentionTest.idx(names,
@@ -536,19 +536,19 @@ public class KvCacheTest {
         int64[] xs = heap int64[2];
         xs[0] = 1;
         xs[1] = 16;
-        Tensor<float32> x = Tensor.zeros<float32>(xs);
+        Tensor<float32> x #= Tensor.zeros<float32>(xs);
         int32 d = 0;
         while (d < 16) {
             x.flatSet((int64) d, emb.get2((int64) fedAt12, (int64) d));
             d = d + 1;
         }
-        Tensor<float32> xn = Prim.rmsnormF32Op(x, wIn, 0.000001f, 0);
-        Tensor<float32> kAbs = Tensor.matmul<float32>(xn, wk);
-        Tensor<float32> kSlot = kAbs.copy();
-        float32[] inv = Prim.invFreq(8, 10000.0f, 0, 1.0f, 1.0f, 4.0f, 0);
+        Tensor<float32> xn #= Prim.rmsnormF32Op(x, wIn, 0.000001f, 0);
+        Tensor<float32> kAbs #= Tensor.matmul<float32>(xn, wk);
+        Tensor<float32> kSlot #= kAbs.copy();
+        float32[] inv #= Prim.invFreq(8, 10000.0f, 0, 1.0f, 1.0f, 4.0f, 0);
         int64[] ivs = heap int64[1];
         ivs[0] = 4;
-        Tensor<float32> invT = Tensor.zeros<float32>(ivs);
+        Tensor<float32> invT #= Tensor.zeros<float32>(ivs);
         int64 ii = 0;
         while (ii < 4) {
             invT.flatSet(ii, inv[(int32) ii]);
@@ -558,8 +558,8 @@ public class KvCacheTest {
         pAbs[0] = 12;
         int32[] pSlot = heap int32[1];
         pSlot[0] = 4;
-        Tensor<int32> pa = PrimTest.ivec(pAbs);
-        Tensor<int32> psl = PrimTest.ivec(pSlot);
+        Tensor<int32> pa #= PrimTest.ivec(pAbs);
+        Tensor<int32> psl #= PrimTest.ivec(pSlot);
         Prim.ropeF32Op(kAbs, pa, invT, 1, 8);
         Prim.ropeF32Op(kSlot, psl, invT, 1, 8);
 
@@ -596,13 +596,13 @@ public class KvCacheTest {
             + "\"sliding_attention\",\"sliding_attention\","
             + "\"sliding_attention\",\"sliding_attention\","
             + "\"full_attention\"],");
-        ToyModel s = ToyModel.specVariant(6, 16, 32, 2, 1, 8, 24, true,
+        ToyModel s #= ToyModel.specVariant(6, 16, 32, 2, 1, 8, 24, true,
             false, false);
         ToyModel.writeWeights(stPath, s);
-        ModelConfig cfg = ModelConfig.parse(cfgPath);
+        ModelConfig cfg #= ModelConfig.parse(cfgPath);
         cfg.blockTokens = 4;
         CausalLM m = heap CausalLM(#cfg, 32, 1, 0);
-        Checkpoint ck = Checkpoint.open(stPath);
+        Checkpoint ck #= Checkpoint.open(stPath);
         m.bind(ck, false);
         ck.close();
 
@@ -631,7 +631,7 @@ public class KvCacheTest {
         String cfgPath = "/tmp/cajeta_llama_kvc_tm_cfg.json";
         String stPath = "/tmp/cajeta_llama_kvc_tm.safetensors";
         ForwardTest.writeA(cfgPath, stPath, 2);
-        CausalLM m = CausalLM.load(cfgPath, stPath, 64,
+        CausalLM m #= CausalLM.load(cfgPath, stPath, 64,
             false);
         int32[] toks = heap int32[2];
         toks[0] = 3;

@@ -41,15 +41,15 @@ final class MoeScratch {
             int32 sharedW) {
         int64[] s = heap int64[1];
         s[0] = (int64) experts;
-        this.logits = Tensor.zeros<float32>(s);
+        this.logits #= Tensor.zeros<float32>(s);
         this.probs = heap float32[experts];
         this.sel = heap int32[used];
         this.w = heap float32[used];
         s[0] = (int64) width;
-        this.g = Tensor.zeros<float32>(s);
-        this.u = Tensor.zeros<float32>(s);
+        this.g #= Tensor.zeros<float32>(s);
+        this.u #= Tensor.zeros<float32>(s);
         s[0] = (int64) hidden;
-        this.eOut = Tensor.zeros<float32>(s);
+        this.eOut #= Tensor.zeros<float32>(s);
         this.bRows = 0;
         this.selAll = null;
         this.wAll = null;
@@ -68,10 +68,10 @@ final class MoeScratch {
         this.shOut = null;
         if (sharedW > 0) {
             s[0] = (int64) sharedW;
-            this.shG = Tensor.zeros<float32>(s);
-            this.shU = Tensor.zeros<float32>(s);
+            this.shG #= Tensor.zeros<float32>(s);
+            this.shU #= Tensor.zeros<float32>(s);
             s[0] = (int64) hidden;
-            this.shOut = Tensor.zeros<float32>(s);
+            this.shOut #= Tensor.zeros<float32>(s);
         }
     }
 
@@ -94,11 +94,11 @@ final class MoeScratch {
         this.gW = heap float32[rows * used];
         int64[] s = heap int64[1];
         s[0] = (int64) rows * (int64) hidden;
-        this.bx = Tensor.zeros<float32>(s);
-        this.be = Tensor.zeros<float32>(s);
+        this.bx #= Tensor.zeros<float32>(s);
+        this.be #= Tensor.zeros<float32>(s);
         s[0] = (int64) rows * (int64) width;
-        this.bg = Tensor.zeros<float32>(s);
-        this.bu = Tensor.zeros<float32>(s);
+        this.bg #= Tensor.zeros<float32>(s);
+        this.bu #= Tensor.zeros<float32>(s);
         if (this.dq == null) {
             this.dq = heap float32[width * hidden];
         }

@@ -314,7 +314,7 @@ public final class ModelConfig {
             throw heap LlmException("model config: '" + path
                 + "' declares no architectures");
         }
-        String arch = archs.array().get(0).asString();
+        String arch #= archs.array().get(0).asString();
         // The HF config's `architectures` value — EXTERNAL vocabulary,
         // not our driver class (that is CausalLM; the checkpoints say
         // LlamaForCausalLM and always will).
@@ -353,7 +353,7 @@ public final class ModelConfig {
             act = root.get("hidden_activation");
         }
         if (act != null) {
-            String a2 = act.asString();
+            String a2 #= act.asString();
             if (a2.equals("silu")) {
                 c.activation = 0;
             } else if (a2.equals("gelu_pytorch_tanh")) {
@@ -371,7 +371,7 @@ public final class ModelConfig {
                 ty = ro.get("type");
             }
             if (ty != null) {
-                String tn = ty.asString();
+                String tn #= ty.asString();
                 if (tn.equals("linear")) {
                     c.ropeScalingType = 1;
                 } else if (tn.equals("dynamic") || tn.equals("ntk")) {
@@ -408,7 +408,7 @@ public final class ModelConfig {
             int32[] lw = heap int32[n];
             int32 li = 0;
             while (li < n) {
-                String tname = lt.array().get(li).asString();
+                String tname #= lt.array().get(li).asString();
                 if (tname.equals("sliding_attention")) {
                     lw[li] = c.slidingWindow;
                 } else if (tname.equals("full_attention")) {

@@ -343,7 +343,7 @@ public class AttnKernelTest {
         }
         ToyModel.writeConfigX(path, "LlamaForCausalLM", 16, 32, layers,
             2, 1, 0, 24, 64, true, extra);
-        ModelConfig cfg = ModelConfig.parse(path);
+        ModelConfig cfg #= ModelConfig.parse(path);
         cfg.blockTokens = 4;
         return #cfg;
     }

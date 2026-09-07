@@ -235,10 +235,10 @@ public class BenchTest {
     // ── 15.1.11 — load/free cycles return resident memory to baseline ──
 
     static void loadOnce(String cfgPath, String stPath) {
-        ModelConfig cfg = ModelConfig.parse(cfgPath);
+        ModelConfig cfg #= ModelConfig.parse(cfgPath);
         cfg.blockTokens = 4;
         CausalLM m = heap CausalLM(#cfg, 64, 1, 0);
-        Checkpoint ck = Checkpoint.open(stPath);
+        Checkpoint ck #= Checkpoint.open(stPath);
         m.bind(ck, false);
         ck.close();
         int32[] toks = heap int32[4];
@@ -257,12 +257,12 @@ public class BenchTest {
         String cfgPath = "tmp/cajeta_llama_bench_cfg.json";
         String stPath = "tmp/cajeta_llama_bench.safetensors";
         ForwardTest.writeA(cfgPath, stPath, 2);
-        ModelConfig w1 = ModelConfig.parse(cfgPath);
-        ModelConfig w2 = ModelConfig.parse(cfgPath);
+        ModelConfig w1 #= ModelConfig.parse(cfgPath);
+        ModelConfig w2 #= ModelConfig.parse(cfgPath);
         int64 live0 = Cajeta.liveCount();
         int32 i = 0;
         while (i < 4) {
-            ModelConfig c = ModelConfig.parse(cfgPath);
+            ModelConfig c #= ModelConfig.parse(cfgPath);
             i = i + 1;
         }
         Assert.equals(0L, Cajeta.liveCount() - live0);
@@ -273,12 +273,12 @@ public class BenchTest {
         String cfgPath = "tmp/cajeta_llama_bench_cfg.json";
         String stPath = "tmp/cajeta_llama_bench.safetensors";
         ForwardTest.writeA(cfgPath, stPath, 2);
-        Checkpoint w = Checkpoint.open(stPath);
+        Checkpoint w #= Checkpoint.open(stPath);
         w.close();
         int64 live0 = Cajeta.liveCount();
         int32 i = 0;
         while (i < 4) {
-            Checkpoint ck = Checkpoint.open(stPath);
+            Checkpoint ck #= Checkpoint.open(stPath);
             ck.close();
             i = i + 1;
         }
@@ -286,10 +286,10 @@ public class BenchTest {
     }
 
     static void bindOnly(String cfgPath, String stPath) {
-        ModelConfig cfg = ModelConfig.parse(cfgPath);
+        ModelConfig cfg #= ModelConfig.parse(cfgPath);
         cfg.blockTokens = 4;
         CausalLM m = heap CausalLM(#cfg, 64, 1, 0);
-        Checkpoint ck = Checkpoint.open(stPath);
+        Checkpoint ck #= Checkpoint.open(stPath);
         m.bind(ck, false);
         ck.close();
         return;

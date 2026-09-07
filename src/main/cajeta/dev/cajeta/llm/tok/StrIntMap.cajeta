@@ -50,7 +50,7 @@ final class StrIntMap {
         }
         int32 i = this.slotFor(k);
         if (this.keys[i] == null) {
-            this.keys[i] = k;
+            this.keys[i] #= k;
             this.n = this.n + 1;
         }
         this.vals[i] = v;

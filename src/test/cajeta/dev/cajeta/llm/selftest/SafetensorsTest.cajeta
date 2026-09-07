@@ -66,7 +66,7 @@ public class SafetensorsTest {
 
     /** Assemble `8 + header + payload` and write it to `path`. */
     static void writeSt(String path, String header, int8[] payload, int64 payloadLen) {
-        int8[] hb = header.toBytes();
+        int8[] hb #= header.toBytes();
         int64 hlen = (int64) hb.count();
         int64 total = 8 + hlen + payloadLen;
         int8[] img = heap int8[total];
@@ -150,9 +150,9 @@ public class SafetensorsTest {
 
     @Test
     public void f16LoadsAtStoredDtype() {
-        String path = SafetensorsTest.writeSmallFixture();
+        String path #= SafetensorsTest.writeSmallFixture();
         SafetensorsFile f = heap SafetensorsFile(path);
-        Tensor<float16> t = f.loadF16("w.f16");
+        Tensor<float16> t #= f.loadF16("w.f16");
         Assert.equals((int64) 16, (int64) t.dtype().bits());
         Assert.equals((int64) 1, (int64) t.ndim());
         Assert.equals((int64) 4, t.shapeAt(0));
@@ -165,9 +165,9 @@ public class SafetensorsTest {
 
     @Test
     public void bf16LoadsAtStoredDtype() {
-        String path = SafetensorsTest.writeSmallFixture();
+        String path #= SafetensorsTest.writeSmallFixture();
         SafetensorsFile f = heap SafetensorsFile(path);
-        Tensor<bfloat16> t = f.loadBf16("w.bf16");
+        Tensor<bfloat16> t #= f.loadBf16("w.bf16");
         Assert.equals((int64) 16, (int64) t.dtype().bits());
         Assert.equals((int64) 2, (int64) t.ndim());
         Assert.equals((int64) 2, t.shapeAt(0));
@@ -181,7 +181,7 @@ public class SafetensorsTest {
 
     @Test
     public void f32LoadsAndDirectorySurfaceReads() {
-        String path = SafetensorsTest.writeSmallFixture();
+        String path #= SafetensorsTest.writeSmallFixture();
         SafetensorsFile f = heap SafetensorsFile(path);
         Assert.equals((int64) 3, (int64) f.tensorCount());
         int32 idx = f.indexOf("w.f32");
@@ -189,7 +189,7 @@ public class SafetensorsTest {
         Assert.equals("F32", f.dtypeOf(idx));
         Assert.equals((int64) 12, f.byteSizeOf(idx));
         Assert.isTrue(f.indexOf("nope") < 0);
-        Tensor<float32> t = f.loadF32("w.f32");
+        Tensor<float32> t #= f.loadF32("w.f32");
         Assert.isTrue(t.get1(0) == 1.5f);
         Assert.isTrue(t.get1(1) == 0.0f - 2.25f);
         Assert.isTrue(t.get1(2) == 4.0f);
@@ -219,23 +219,23 @@ public class SafetensorsTest {
         String idxJson = "{\"metadata\":{\"total_size\":8},\"weight_map\":{"
             + "\"alpha\":\"" + "cajeta_llama_st_test_s1.safetensors" + "\","
             + "\"beta\":\"" + "cajeta_llama_st_test_s2.safetensors" + "\"}}";
-        int8[] ib = idxJson.toBytes();
+        int8[] ib #= idxJson.toBytes();
         File.writeAllBytes(idx, ib, (int64) ib.count());
 
-        Checkpoint c = Checkpoint.open(idx);
+        Checkpoint c #= Checkpoint.open(idx);
         Assert.equals((int64) 2, (int64) c.tensorCount());
-        Tensor<float32> a = c.loadF32("alpha");
+        Tensor<float32> a #= c.loadF32("alpha");
         Assert.isTrue(a.get1(0) == 7.5f);
-        Tensor<bfloat16> b = c.loadBf16("beta");
+        Tensor<bfloat16> b #= c.loadBf16("beta");
         Assert.isTrue((float32) b.get1(0) == 1.0f);
         Assert.isTrue((float32) b.get1(1) == 3.0f);
         c.close();
 
         // A bare single .safetensors path opens through the same entry.
-        String small = SafetensorsTest.writeSmallFixture();
-        Checkpoint single = Checkpoint.open(small);
+        String small #= SafetensorsTest.writeSmallFixture();
+        Checkpoint single #= Checkpoint.open(small);
         Assert.equals((int64) 3, (int64) single.tensorCount());
-        Tensor<float32> w = single.loadF32("w.f32");
+        Tensor<float32> w #= single.loadF32("w.f32");
         Assert.isTrue(w.get1(2) == 4.0f);
         single.close();
     }
@@ -253,7 +253,7 @@ public class SafetensorsTest {
         boolean threw = false;
         String msg = "";
         try {
-            Tensor<float32> t = f.loadF32("odd.one");
+            Tensor<float32> t #= f.loadF32("odd.one");
         } catch (LlmException ex) {
             threw = true;
             msg = ex.message;
@@ -266,12 +266,12 @@ public class SafetensorsTest {
 
     @Test
     public void dtypeMismatchNamesTensorAndBothDtypes() {
-        String path = SafetensorsTest.writeSmallFixture();
+        String path #= SafetensorsTest.writeSmallFixture();
         SafetensorsFile f = heap SafetensorsFile(path);
         boolean threw = false;
         String msg = "";
         try {
-            Tensor<float16> t = f.loadF16("w.f32");    // stored F32, asked F16
+            Tensor<float16> t #= f.loadF16("w.f32");    // stored F32, asked F16
         } catch (LlmException ex) {
             threw = true;
             msg = ex.message;
@@ -314,9 +314,9 @@ public class SafetensorsTest {
         bound = bound * 1000000000;
         Assert.isTrue(t1 - t0 < bound);
         Assert.isTrue(f.indexOf("t2999") >= 0);
-        Tensor<float32> first = f.loadF32("t0");
+        Tensor<float32> first #= f.loadF32("t0");
         Assert.isTrue(first.get1(0) == 9.0f);
-        Tensor<float32> last = f.loadF32("t2999");
+        Tensor<float32> last #= f.loadF32("t2999");
         Assert.isTrue(last.get1(0) == 11.0f);
         f.close();
     }
@@ -325,9 +325,9 @@ public class SafetensorsTest {
 
     @Test
     public void deviceLoadIsDeviceResidentWithHostMirrorReleased() {
-        String path = SafetensorsTest.writeSmallFixture();
+        String path #= SafetensorsTest.writeSmallFixture();
         SafetensorsFile f = heap SafetensorsFile(path);
-        Tensor<bfloat16> t = f.loadBf16Device("w.bf16");
+        Tensor<bfloat16> t #= f.loadBf16Device("w.bf16");
         Assert.isTrue(t.isOnGpu());
         // The host mirror was released with the upload (Unit 3): a host
         // read now faults instead of serving stale staging bytes.
@@ -358,7 +358,7 @@ public class SafetensorsTest {
         int64 count = payload / 4;                     // 128M f32 elements
         String hdr = "{\"big\":{\"dtype\":\"F32\",\"shape\":[134217728],"
             + "\"data_offsets\":[0," + payload + "]}}";
-        int8[] hb = hdr.toBytes();
+        int8[] hb #= hdr.toBytes();
         int64 hlen = (int64) hb.count();
         int8[] head = heap int8[8 + hlen];
         SafetensorsTest.putU64(head, 0, hlen);
@@ -393,7 +393,7 @@ public class SafetensorsTest {
         // tensor's own bytes (1× at native dtype), not the old
         // readAllBytes shape's unreclaimable in-heap second copy of the
         // whole file held across decode.
-        Tensor<float32> t = st.loadF32("big");
+        Tensor<float32> t #= st.loadF32("big");
         Assert.isTrue(t.get1(0) == 0.0f);
         Assert.isTrue(t.get1(count - 1) == 0.0f);
         st.close();
@@ -458,7 +458,7 @@ public class SafetensorsTest {
         int64 payload = params * 2;
         String hdr = "{\"weights\":{\"dtype\":\"BF16\",\"shape\":["
             + params + "],\"data_offsets\":[0," + payload + "]}}";
-        int8[] hb = hdr.toBytes();
+        int8[] hb #= hdr.toBytes();
         int64 hlen = (int64) hb.count();
         int8[] head = heap int8[8 + hlen];
         SafetensorsTest.putU64(head, 0, hlen);
@@ -474,7 +474,7 @@ public class SafetensorsTest {
 
         int64 before = SafetensorsTest.rssKb();
         SafetensorsFile st = heap SafetensorsFile(path);
-        Tensor<bfloat16> t = st.loadBf16("weights");
+        Tensor<bfloat16> t #= st.loadBf16("weights");
         Assert.equals((int64) 16, (int64) t.dtype().bits());
         Assert.isTrue((float32) t.get1(0) == 0.0f);
         Assert.isTrue((float32) t.get1(params - 1) == 0.0f);

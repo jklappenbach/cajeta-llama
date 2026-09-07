@@ -162,8 +162,8 @@ public final class ToyModel {
         } else {
             sb.append("\"tie_word_embeddings\":false}");
         }
-        String s = sb.toString();
-        int8[] b = s.toBytes();
+        String s #= sb.toString();
+        int8[] b #= s.toBytes();
         File.writeAllBytes(path, b, (int64) b.count());
         return;
     }

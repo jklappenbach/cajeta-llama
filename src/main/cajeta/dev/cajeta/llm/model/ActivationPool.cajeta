@@ -29,22 +29,22 @@ public final class ActivationPool {
     ActivationPool(ModelConfig cfg, int32 maxSeq) {
         int64[] s = heap int64[1];
         s[0] = (int64) cfg.hiddenSize;
-        this.x = Tensor.zeros<float32>(s);
-        this.xn = Tensor.zeros<float32>(s);
-        this.attnProj = Tensor.zeros<float32>(s);
-        this.mlpOut = Tensor.zeros<float32>(s);
+        this.x #= Tensor.zeros<float32>(s);
+        this.xn #= Tensor.zeros<float32>(s);
+        this.attnProj #= Tensor.zeros<float32>(s);
+        this.mlpOut #= Tensor.zeros<float32>(s);
         s[0] = (int64) cfg.qDim();
-        this.q = Tensor.zeros<float32>(s);
-        this.attnOut = Tensor.zeros<float32>(s);
+        this.q #= Tensor.zeros<float32>(s);
+        this.attnOut #= Tensor.zeros<float32>(s);
         s[0] = (int64) cfg.kvDim();
-        this.k = Tensor.zeros<float32>(s);
-        this.v = Tensor.zeros<float32>(s);
+        this.k #= Tensor.zeros<float32>(s);
+        this.v #= Tensor.zeros<float32>(s);
         s[0] = (int64) cfg.intermediateSize;
-        this.gate = Tensor.zeros<float32>(s);
-        this.up = Tensor.zeros<float32>(s);
+        this.gate #= Tensor.zeros<float32>(s);
+        this.up #= Tensor.zeros<float32>(s);
         s[0] = (int64) maxSeq;
-        this.scores = Tensor.zeros<float32>(s);
+        this.scores #= Tensor.zeros<float32>(s);
         s[0] = (int64) cfg.vocabSize;
-        this.logits = Tensor.zeros<float32>(s);
+        this.logits #= Tensor.zeros<float32>(s);
     }
 }

@@ -69,7 +69,7 @@ public final class Attention extends InfModule {
         } else {
             this.scale = 1.0f / Math.sqrt((float32) cfg.headDim);
         }
-        this.ropeInv = Prim.invFreq(cfg.headDim, cfg.ropeTheta,
+        this.ropeInv #= Prim.invFreq(cfg.headDim, cfg.ropeTheta,
             cfg.ropeScalingType, cfg.ropeScalingFactor, cfg.ropeLowFreq,
             cfg.ropeHighFreq, cfg.ropeOrigMaxPos);
         // Precomputed per-dimension factors (GGUF `rope_freqs.weight`)

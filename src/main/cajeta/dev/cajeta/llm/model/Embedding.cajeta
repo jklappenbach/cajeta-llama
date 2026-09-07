@@ -98,7 +98,7 @@ public final class Embedding extends InfModule {
                 return;
             }
         }
-        Tensor<float32> t = ckpt.loadF32(name);
+        Tensor<float32> t #= ckpt.loadF32(name);
         if (t.ndim() != 2 || t.shapeAt(0) != (int64) this.vocab
                 || t.shapeAt(1) != (int64) this.dim) {
             throw heap LlmException("weight binding: '" + name

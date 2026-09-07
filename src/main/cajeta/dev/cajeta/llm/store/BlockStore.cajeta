@@ -74,7 +74,7 @@ public final class BlockStore {
         this.maxExtents = maxExtents;
         // The stamp clock resumes past every persisted stamp.
         this.stampClock = 0;
-        LtmCursor<int64, int64> c = this.recency.scan();
+        LtmCursor<int64, int64> c #= this.recency.scan();
         while (c.valid()) {
             if (c.key() > this.stampClock) {
                 this.stampClock = c.key();
@@ -234,7 +234,7 @@ public final class BlockStore {
 
     void evictColdest() {
         // The ordered scan over the recency index IS the coldness walk.
-        LtmCursor<int64, int64> c = this.recency.scan();
+        LtmCursor<int64, int64> c #= this.recency.scan();
         if (c.valid() == false) {
             throw heap LlmException("block store: size bound with an "
                 + "empty recency index");

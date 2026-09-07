@@ -58,7 +58,7 @@ public final class PagedKvCache {
         int64[] ps = heap int64[1];
         ps[0] = (int64) numBlocks * 2 * (int64) this.blockTokens
             * (int64) this.kvDim;
-        this.pool = Tensor.zeros<float32>(ps);
+        this.pool #= Tensor.zeros<float32>(ps);
         this.freeList = heap int32[numBlocks];
         int32 b = 0;
         while (b < numBlocks) {

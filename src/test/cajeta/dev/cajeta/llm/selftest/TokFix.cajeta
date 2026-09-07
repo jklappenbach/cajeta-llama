@@ -110,7 +110,7 @@ public final class TokFix {
                 if (idN >= (int32) ids.count()) {
                     // `#`-returning call: the local TAKES title. A plain
                     // `ids = bigger` would borrow a block-scoped array.
-                    ids = TokFix.grown(ids, idN);
+                    ids #= TokFix.grown(ids, idN);
                 }
                 ids[idN] = (int32) r.currentNumberAsInt64();
                 idN = idN + 1;

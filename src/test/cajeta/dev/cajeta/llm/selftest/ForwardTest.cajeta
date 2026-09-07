@@ -48,7 +48,7 @@ public class ForwardTest {
     static void writeA(String cfgPath, String stPath, int32 layers) {
         ToyModel.writeConfig(cfgPath, "LlamaForCausalLM", 64, 256, layers,
             4, 2, 0, 96, 64, false);
-        ToyModel s = ToyModel.spec(layers, 64, 256, 4, 2, 16, 96, false);
+        ToyModel s #= ToyModel.spec(layers, 64, 256, 4, 2, 16, 96, false);
         ToyModel.writeWeights(stPath, s);
         return;
     }
@@ -62,9 +62,9 @@ public class ForwardTest {
         // The reflective walk names bound tensors, so the key space is
         // asserted on a bound model (an unbound tree has null weights).
         ForwardTest.writeA(cfgPath, stPath, 2);
-        CausalLM m = CausalLM.load(cfgPath, stPath, 64, false);
-        ArrayList<String> names = m.parameterNames();
-        ToyModel s = ToyModel.spec(2, 64, 256, 4, 2, 16, 96, false);
+        CausalLM m #= CausalLM.load(cfgPath, stPath, 64, false);
+        ArrayList<String> names #= m.parameterNames();
+        ToyModel s #= ToyModel.spec(2, 64, 256, 4, 2, 16, 96, false);
         Assert.equals((int64) s.n, (int64) names.count());
         int32 i = 0;
         while (i < s.n) {
@@ -80,10 +80,10 @@ public class ForwardTest {
         String cfgPath = ForwardTest.pre() + "_tr_cfg.json";
         String stPath = ForwardTest.pre() + "_tr.safetensors";
         ForwardTest.writeA(cfgPath, stPath, 2);
-        CausalLM m = CausalLM.load(cfgPath, stPath, 64, false);
-        ArrayList<String> names = m.parameterNames();
-        ArrayList<Tensor<float32>> ts = m.parameterTensors();
-        ToyModel s = ToyModel.spec(2, 64, 256, 4, 2, 16, 96, false);
+        CausalLM m #= CausalLM.load(cfgPath, stPath, 64, false);
+        ArrayList<String> names #= m.parameterNames();
+        ArrayList<Tensor<float32>> ts #= m.parameterTensors();
+        ToyModel s #= ToyModel.spec(2, 64, 256, 4, 2, 16, 96, false);
 
         // k_proj: torch stores [kvDim=32, h=64]; the engine computes x·W and
         // must hold [64, 32] with W[i][o] == torch[o][i].
@@ -119,18 +119,18 @@ public class ForwardTest {
         // head_dim explicitly 8, though hidden/heads would derive 16.
         ToyModel.writeConfig(cfgPath, "LlamaForCausalLM", 64, 128, 1,
             4, 2, 8, 48, 32, true);
-        ToyModel s = ToyModel.spec(1, 64, 128, 4, 2, 8, 48, true);
+        ToyModel s #= ToyModel.spec(1, 64, 128, 4, 2, 8, 48, true);
         ToyModel.writeWeights(stPath, s);
-        CausalLM m = CausalLM.load(cfgPath, stPath, 32, false);
+        CausalLM m #= CausalLM.load(cfgPath, stPath, 32, false);
 
-        ArrayList<String> names = m.parameterNames();
+        ArrayList<String> names #= m.parameterNames();
         // Tied: no lm_head parameter exists anywhere in the tree.
         Assert.equals((int64) s.n, (int64) names.count());
         Assert.isTrue(ForwardTest.idxOf(names, "lm_head.weight") < 0);
 
         // Explicit head_dim drives the projection shapes: q is
         // [h=64, heads*head_dim=32], not [64, 64].
-        ArrayList<Tensor<float32>> ts = m.parameterTensors();
+        ArrayList<Tensor<float32>> ts #= m.parameterTensors();
         int32 qi = ForwardTest.idxOf(names, "model.layers.0.self_attn.q_proj.weight");
         Tensor<float32> qw = ts.get(qi);
         Assert.equals((int64) 64, qw.shapeAt(0));
@@ -159,7 +159,7 @@ public class ForwardTest {
         boolean threw = false;
         String msg = "";
         try {
-            ModelConfig cfg = ModelConfig.parse(cfgPath);
+            ModelConfig cfg #= ModelConfig.parse(cfgPath);
             Assert.isTrue(cfg == null);
         } catch (LlmException ex) {
             threw = true;
@@ -177,8 +177,8 @@ public class ForwardTest {
         String cfgPath = ForwardTest.pre() + "_dev_cfg.json";
         String stPath = ForwardTest.pre() + "_dev.safetensors";
         ForwardTest.writeA(cfgPath, stPath, 2);
-        CausalLM m = CausalLM.load(cfgPath, stPath, 64, true);
-        ArrayList<Tensor<float32>> ts = m.parameterTensors();
+        CausalLM m #= CausalLM.load(cfgPath, stPath, 64, true);
+        ArrayList<Tensor<float32>> ts #= m.parameterTensors();
         Assert.isTrue(ts.count() > 0);
         int32 i = 0;
         while (i < ts.count()) {
@@ -197,8 +197,8 @@ public class ForwardTest {
         String stD = ForwardTest.pre() + "_l4.safetensors";
         ForwardTest.writeA(cfgA, stA, 2);
         ForwardTest.writeA(cfgD, stD, 4);
-        CausalLM mA = CausalLM.load(cfgA, stA, 64, false);
-        CausalLM mD = CausalLM.load(cfgD, stD, 64, false);
+        CausalLM mA #= CausalLM.load(cfgA, stA, 64, false);
+        CausalLM mD #= CausalLM.load(cfgD, stD, 64, false);
 
         int32[] toks = heap int32[16];
         int32 i = 0;
@@ -245,7 +245,7 @@ public class ForwardTest {
         String cfgPath = ForwardTest.pre() + "_dec_cfg.json";
         String stPath = ForwardTest.pre() + "_dec.safetensors";
         ForwardTest.writeA(cfgPath, stPath, 2);
-        CausalLM m = CausalLM.load(cfgPath, stPath, 64, false);
+        CausalLM m #= CausalLM.load(cfgPath, stPath, 64, false);
 
         int32[] toks = heap int32[4];
         toks[0] = 3;

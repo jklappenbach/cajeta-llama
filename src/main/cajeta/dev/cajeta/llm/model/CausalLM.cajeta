@@ -298,7 +298,7 @@ public final class CausalLM extends InfModule {
             int32 maxSeq, boolean toDevice) {
         CausalLM m = heap CausalLM(
             ModelConfig.parse(configPath), maxSeq, 1, 0);
-        Checkpoint ckpt = Checkpoint.open(ckptPath);
+        Checkpoint ckpt #= Checkpoint.open(ckptPath);
         m.bind(ckpt, toDevice);
         ckpt.close();
         return #m;
@@ -374,16 +374,16 @@ public final class CausalLM extends InfModule {
         // One block sized to the ACTUAL sequence length (spec 4.9).
         int64 total = rows * (h * 4 + qd * 2 + kvd * 2 + inter * 2);
         PrefillArena arena = heap PrefillArena(total);
-        Tensor<float32> hs = arena.take(rows, h);
-        Tensor<float32> xn = arena.take(rows, h);
-        Tensor<float32> proj = arena.take(rows, h);
-        Tensor<float32> mlpOut = arena.take(rows, h);
-        Tensor<float32> q = arena.take(rows, qd);
-        Tensor<float32> ao = arena.take(rows, qd);
-        Tensor<float32> k = arena.take(rows, kvd);
-        Tensor<float32> v = arena.take(rows, kvd);
-        Tensor<float32> gate = arena.take(rows, inter);
-        Tensor<float32> up = arena.take(rows, inter);
+        Tensor<float32> hs #= arena.take(rows, h);
+        Tensor<float32> xn #= arena.take(rows, h);
+        Tensor<float32> proj #= arena.take(rows, h);
+        Tensor<float32> mlpOut #= arena.take(rows, h);
+        Tensor<float32> q #= arena.take(rows, qd);
+        Tensor<float32> ao #= arena.take(rows, qd);
+        Tensor<float32> k #= arena.take(rows, kvd);
+        Tensor<float32> v #= arena.take(rows, kvd);
+        Tensor<float32> gate #= arena.take(rows, inter);
+        Tensor<float32> up #= arena.take(rows, inter);
 
         Tensor<float32> emb = this.model.embedTokens.weight;
         int32 r = 0;

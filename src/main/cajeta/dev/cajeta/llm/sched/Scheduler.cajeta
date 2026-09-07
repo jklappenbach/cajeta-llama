@@ -67,7 +67,7 @@ public final class Scheduler {
         // 21.2.5: launch failures BEFORE this scheduler existed are not
         // its steps' to report.
         this.lfSeen = Device.launchFailures();
-        this.model = model;
+        this.model #= model;
         this.chunk = chunk;
         this.maxSeqs = model.maxSequences();
         this.reqs = heap ArrayList<Request>();
@@ -103,7 +103,7 @@ public final class Scheduler {
     /** Tokenizer for stop-string checks (spec 8.7) — without one, stop
      *  strings never fire. Borrow. */
     public void setTokenizer(Tokenizer tok) {
-        this.tok = tok;
+        this.tok #= tok;
     }
 
     /**
@@ -117,7 +117,7 @@ public final class Scheduler {
      */
     public void attachStore(BlockStore store, String modelId, String dtype,
             String quant) {
-        this.store = store;
+        this.store #= store;
         this.modelId = "" + modelId;
         this.modelDtype = "" + dtype;
         this.modelQuant = "" + quant;

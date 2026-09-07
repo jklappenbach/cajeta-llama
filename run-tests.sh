@@ -14,6 +14,10 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
+# Run from the repo root: the fixtures (ChatTest.FIX, the tokenizer JSONs)
+# are RELATIVE paths, and a launch from any other directory reads nil and
+# null-derefs in the first test that opens one (measured 2026-09-07).
+cd "$here"
 CAJETA="${CAJETA:-cajeta}"
 
 
@@ -112,8 +116,8 @@ run_suite() {
 # rewire fixed its own sites, but the tensor/model code has hundreds of
 # owned-result receives. No-ops under released compilers that lack the
 # checks. REMOVE both lines when llama's ownership migration closes.
-export CAJETA_OWNED_BIND="${CAJETA_OWNED_BIND:-warn}"
-export CAJETA_CAPTURED_BORROW="${CAJETA_CAPTURED_BORROW:-warn}"
+export CAJETA_OWNED_BIND="${CAJETA_OWNED_BIND:-error}"
+export CAJETA_CAPTURED_BORROW="${CAJETA_CAPTURED_BORROW:-error}"
 UNIT_REPO="${UNIT_REPO:-$here/../cajeta-unit}"
 
 out="$(mktemp -d)"

@@ -92,7 +92,7 @@ public final class Prim {
      */
     public static #Tensor<float32> rmsnormF32Op(Tensor<float32> x,
             Tensor<float32> w, float32 eps, int32 form) {
-        Tensor<float32> out = Tensor.zerosLike<float32>(x);
+        Tensor<float32> out #= Tensor.zerosLike<float32>(x);
         int64 dim = x.shapeAt(x.ndim() - 1);
         int64 rows = x.size() / dim;
         if (Placement.pair("rmsnorm", "x", x.isOnGpu(), "w", w.isOnGpu())) {
@@ -742,7 +742,7 @@ public final class Prim {
     /** Placement-routed GLU op over equal-shaped tensors. */
     public static #Tensor<float32> gluF32Op(Tensor<float32> g,
             Tensor<float32> u, int32 act) {
-        Tensor<float32> out = Tensor.zerosLike<float32>(g);
+        Tensor<float32> out #= Tensor.zerosLike<float32>(g);
         int64 n = g.size();
         if (Placement.pair("glu", "g", g.isOnGpu(), "u", u.isOnGpu())) {
             out.gpu();
@@ -1253,7 +1253,7 @@ public final class Prim {
             Tensor<float32> k, Tensor<float32> v, Tensor<int32> seqOf,
             Tensor<int32> qPos, Tensor<int32> kvBase,
             int32 nH, int32 nKv, int32 hd, int32 window, float32 scale) {
-        Tensor<float32> out = Tensor.zerosLike<float32>(q);
+        Tensor<float32> out #= Tensor.zerosLike<float32>(q);
         int64 totalRows = seqOf.size();
         if (Placement.pair("attend", "q", q.isOnGpu(), "k", k.isOnGpu())) {
             out.gpu();
@@ -1282,7 +1282,7 @@ public final class Prim {
             }
             int64[] ss = heap int64[1];
             ss[0] = (int64) longest;
-            Tensor<float32> scores = Tensor.zeros<float32>(ss);
+            Tensor<float32> scores #= Tensor.zeros<float32>(ss);
             r = 0;
             while (r < totalRows) {
                 int32 p = qPos.flatGet(r);
@@ -1312,7 +1312,7 @@ public final class Prim {
         int64[] os = heap int64[2];
         os[0] = totalRows;
         os[1] = (int64) (nH * hd);
-        Tensor<float32> out = Tensor.zeros<float32>(os);
+        Tensor<float32> out #= Tensor.zeros<float32>(os);
         if (Placement.pair("attend", "q", q.isOnGpu(), "k", k.isOnGpu())) {
             out.gpu();
             uint32 lanes = (uint32) (totalRows * (int64) nH * (int64) hd);
@@ -1339,7 +1339,7 @@ public final class Prim {
             }
             int64[] ss = heap int64[1];
             ss[0] = (int64) longest;
-            Tensor<float32> scores = Tensor.zeros<float32>(ss);
+            Tensor<float32> scores #= Tensor.zeros<float32>(ss);
             r = 0;
             while (r < totalRows) {
                 int32 p = qPos.flatGet(r);

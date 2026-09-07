@@ -49,11 +49,11 @@ public final class SpProto {
         int32 k = 0;
         while (k < count) {
             int32 slot = c.slotOfNth(1, k);
-            int8[] sub = c.readBytes(slot);
+            int8[] sub #= c.readBytes(slot);
             int64 subLen = (int64) sub.count();
             ProtobufCursor pc = heap ProtobufCursor(sub, subLen);
             if (pc.has(1)) {
-                int8[] pb = pc.readBytes(pc.slotOf(1));
+                int8[] pb #= pc.readBytes(pc.slotOf(1));
                 int32 pn = (int32) pb.count();
                 String s = heap String(#pb, pn);
                 out.pieces[k] #= s;

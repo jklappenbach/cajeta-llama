@@ -450,7 +450,7 @@ class RecordingSink implements TokenSink {
     int32 n;
 
     RecordingSink(Scheduler sch) {
-        this.sch = sch;
+        this.sch #= sch;
         this.toks = heap int32[256];
         this.steps = heap int32[256];
         this.n = 0;

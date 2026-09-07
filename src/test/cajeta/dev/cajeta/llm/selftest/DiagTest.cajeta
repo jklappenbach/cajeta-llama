@@ -125,7 +125,7 @@ public class DiagTest {
     public void twoSessionsInFlightProduceDistinguishableRecords() {
         Capture cap = heap Capture();
         Diag.register(cap);
-        CausalLM m = SchedulerTest.mk("diag2s", 2, 0);
+        CausalLM m #= SchedulerTest.mk("diag2s", 2, 0);
         Scheduler s = heap Scheduler(m, 4);
         int32[] pa #= SchedulerTest.promptOf(8, 3);
         int32[] pb #= SchedulerTest.promptOf(8, 11);
@@ -153,7 +153,7 @@ public class DiagTest {
 
         // A REAL decision path, not a bare emit: a toy prefill crosses
         // the prefill-mode site with rows > 1.
-        CausalLM m = SchedulerTest.mk("diagoff", 1, 0);
+        CausalLM m #= SchedulerTest.mk("diagoff", 1, 0);
         int32[] p #= SchedulerTest.promptOf(4, 5);
         m.prefill(p, 4);
 
@@ -175,7 +175,7 @@ public class DiagTest {
 
         // A whole generation survives a consumer that throws on EVERY
         // record — the turn completes and produces its tokens.
-        CausalLM m = SchedulerTest.mk("diagthrow", 1, 0);
+        CausalLM m #= SchedulerTest.mk("diagthrow", 1, 0);
         Scheduler s = heap Scheduler(m, 4);
         int32[] p #= SchedulerTest.promptOf(6, 7);
         int32 id = s.submit(p, 6, 3);
@@ -200,7 +200,7 @@ public class DiagTest {
     public void deliveryIsSynchronousWithTheStep() {
         Capture cap = heap Capture();
         Diag.register(cap);
-        CausalLM m = SchedulerTest.mk("diagsync", 1, 0);
+        CausalLM m #= SchedulerTest.mk("diagsync", 1, 0);
         Scheduler s = heap Scheduler(m, 4);
         int32[] p #= SchedulerTest.promptOf(12, 9);
         s.submit(p, 12, 4);
@@ -229,7 +229,7 @@ public class DiagTest {
     public void aKnownDecisionEmitsItsRecord() {
         Capture cap = heap Capture();
         Diag.register(cap);
-        CausalLM m = SchedulerTest.mk("diagpos", 1, 0);
+        CausalLM m #= SchedulerTest.mk("diagpos", 1, 0);
         int32[] p #= SchedulerTest.promptOf(4, 13);
         m.prefill(p, 4);
         Diag.register(null);
@@ -256,7 +256,7 @@ public class DiagTest {
     public void aPerRowPrefillNamesEachRefusalOnce() {
         Capture cap = heap Capture();
         Diag.register(cap);
-        CausalLM m = SchedulerTest.mk("diagrefuse", 1, 0);
+        CausalLM m #= SchedulerTest.mk("diagrefuse", 1, 0);
         int32[] p #= SchedulerTest.promptOf(4, 17);
         m.prefill(p, 4);
         int32 first = cap.countOf("batch-refused");
@@ -287,7 +287,7 @@ public class DiagTest {
     public void perRowPrefillModeCarriesTheRefusalCount() {
         Capture cap = heap Capture();
         Diag.register(cap);
-        CausalLM m = SchedulerTest.mk("diagcount", 1, 0);
+        CausalLM m #= SchedulerTest.mk("diagcount", 1, 0);
         int32[] p #= SchedulerTest.promptOf(4, 23);
         m.prefill(p, 4);
         Diag.register(null);
@@ -323,7 +323,7 @@ public class DiagTest {
         }
         Capture cap = heap Capture();
         Diag.register(cap);
-        CausalLM m = SchedulerTest.mk("diaglf", 1, 0);
+        CausalLM m #= SchedulerTest.mk("diaglf", 1, 0);
         Scheduler s = heap Scheduler(m, 4);
         // Long prompt: the session is still RUNNING when the failure
         // surfaces, so the window has a sole owner to attribute to.

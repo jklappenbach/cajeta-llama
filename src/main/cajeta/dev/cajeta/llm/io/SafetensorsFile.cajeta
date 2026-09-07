@@ -196,7 +196,7 @@ public final class SafetensorsFile {
     /** Load an F32 tensor. */
     public #Tensor<float32> loadF32(String name) {
         int32 i = this.require(name, "F32");
-        Tensor<float32> t = Tensor.zeros<float32>(this.shapeCopy(i));
+        Tensor<float32> t #= Tensor.zeros<float32>(this.shapeCopy(i));
         this.copyInto(i, t.hostAddress(), 4, name);
         return #t;
     }
@@ -211,21 +211,21 @@ public final class SafetensorsFile {
 
     /** Load an F16 tensor device-resident; host staging is released. */
     public #Tensor<float16> loadF16Device(String name) {
-        Tensor<float16> t = this.loadF16(name);
+        Tensor<float16> t #= this.loadF16(name);
         t.gpu();
         return #t;
     }
 
     /** Load a BF16 tensor device-resident; host staging is released. */
     public #Tensor<bfloat16> loadBf16Device(String name) {
-        Tensor<bfloat16> t = this.loadBf16(name);
+        Tensor<bfloat16> t #= this.loadBf16(name);
         t.gpu();
         return #t;
     }
 
     /** Load an F32 tensor device-resident; host staging is released. */
     public #Tensor<float32> loadF32Device(String name) {
-        Tensor<float32> t = this.loadF32(name);
+        Tensor<float32> t #= this.loadF32(name);
         t.gpu();
         return #t;
     }

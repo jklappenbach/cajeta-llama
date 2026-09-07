@@ -25,7 +25,7 @@ public class TokTest {
 
     static void assertRow(Tokenizer t, String text, int32[] ids,
             int32 from, int32 to) {
-        int32[] got = t.encode(text);
+        int32[] got #= t.encode(text);
         Assert.equals((int64) (to - from), (int64) got.count());
         int32 j = 0;
         while (j < to - from) {
@@ -38,13 +38,13 @@ public class TokTest {
 
     @Test
     public void hfJsonParsesVocabMergesAddedSpecial() {
-        Tokenizer q = Tokenizer.fromHfJson(TokTest.QWEN);
+        Tokenizer q #= Tokenizer.fromHfJson(TokTest.QWEN);
         Assert.equals((int64) 151665, (int64) q.vocabSize());
         Assert.equals((int64) 22, (int64) q.addedCount());
         Assert.equals((int64) 151643, (int64) q.idOf("<|endoftext|>"));
         Assert.equals("!", q.tokenOf(0));
         Assert.equals((int64) Tokenizer.FAM_BYTELEVEL, (int64) q.family);
-        Tokenizer l = Tokenizer.fromHfJson(TokTest.LLAMA);
+        Tokenizer l #= Tokenizer.fromHfJson(TokTest.LLAMA);
         Assert.equals((int64) 32000, (int64) l.vocabSize());
         Assert.equals((int64) 3, (int64) l.addedCount());
         Assert.equals((int64) 0, (int64) l.idOf("<unk>"));
@@ -56,8 +56,8 @@ public class TokTest {
 
     @Test
     public void byteLevelCorpusMatchesReference() {
-        TokFix f = TokFix.load(TokTest.FIX);
-        Tokenizer q = Tokenizer.fromHfJson(TokTest.QWEN);
+        TokFix f #= TokFix.load(TokTest.FIX);
+        Tokenizer q #= Tokenizer.fromHfJson(TokTest.QWEN);
         int32 i = 0;
         while (i < f.n) {
             TokTest.assertRow(q, f.corpus.get(i), f.qwenIds,
@@ -70,8 +70,8 @@ public class TokTest {
 
     @Test
     public void metaspaceCorpusMatchesReference() {
-        TokFix f = TokFix.load(TokTest.FIX);
-        Tokenizer l = Tokenizer.fromHfJson(TokTest.LLAMA);
+        TokFix f #= TokFix.load(TokTest.FIX);
+        Tokenizer l #= Tokenizer.fromHfJson(TokTest.LLAMA);
         int32 i = 0;
         while (i < f.n) {
             TokTest.assertRow(l, f.corpus.get(i), f.llamaIds,
@@ -87,11 +87,11 @@ public class TokTest {
         // The llama family from GGUF-shaped arrays (tokens/scores/types
         // — here read out of the raw SP model, no GGUF file needed)
         // must encode identically to the HF-declared pipeline.
-        SpProto sp = SpProto.read(TokTest.SPM);
-        Tokenizer g = Tokenizer.fromGgml("llama", "default", sp.pieces,
+        SpProto sp #= SpProto.read(TokTest.SPM);
+        Tokenizer g #= Tokenizer.fromGgml("llama", "default", sp.pieces,
             sp.scores, sp.types, null);
-        Tokenizer h = Tokenizer.fromHfJson(TokTest.LLAMA);
-        TokFix f = TokFix.load(TokTest.FIX);
+        Tokenizer h #= Tokenizer.fromHfJson(TokTest.LLAMA);
+        TokFix f #= TokFix.load(TokTest.FIX);
         int32 i = 0;
         while (i < f.n) {
             TokTest.assertRow(g, f.corpus.get(i), f.llamaIds,
@@ -112,18 +112,18 @@ public class TokTest {
         bad[3] = (int8) 0xFF;        // never valid in UTF-8
         bad[4] = (int8) 0x80;        // stray continuation
         bad[5] = (int8) 98;          // 'b'
-        Tokenizer q = Tokenizer.fromHfJson(TokTest.QWEN);
-        int32[] qi = q.encodeBytes(bad, 6);
-        int8[] qb = q.decode(qi, (int32) qi.count());
+        Tokenizer q #= Tokenizer.fromHfJson(TokTest.QWEN);
+        int32[] qi #= q.encodeBytes(bad, 6);
+        int8[] qb #= q.decode(qi, (int32) qi.count());
         Assert.equals((int64) 6, (int64) qb.count());
         int32 i = 0;
         while (i < 6) {
             Assert.isTrue(qb[i] == bad[i]);
             i = i + 1;
         }
-        Tokenizer l = Tokenizer.fromHfJson(TokTest.LLAMA);
-        int32[] li = l.encodeBytes(bad, 6);
-        int8[] lb = l.decode(li, (int32) li.count());
+        Tokenizer l #= Tokenizer.fromHfJson(TokTest.LLAMA);
+        int32[] li #= l.encodeBytes(bad, 6);
+        int8[] lb #= l.decode(li, (int32) li.count());
         Assert.equals((int64) 6, (int64) lb.count());
         i = 0;
         while (i < 6) {
@@ -150,7 +150,7 @@ public class TokTest {
         w.close();
         boolean threw = false;
         try {
-            Tokenizer bad = Tokenizer.fromHfJson(path);
+            Tokenizer bad #= Tokenizer.fromHfJson(path);
             Assert.isTrue(bad.vocabSize() < 0);   // unreachable
         } catch (LlmException ex) {
             threw = true;
@@ -162,7 +162,7 @@ public class TokTest {
         toks[0] = "x";
         threw = false;
         try {
-            Tokenizer bad2 = Tokenizer.fromGgml("unigram", "default",
+            Tokenizer bad2 #= Tokenizer.fromGgml("unigram", "default",
                 toks, null, null, null);
             Assert.isTrue(bad2.vocabSize() < 0);  // unreachable
         } catch (LlmException ex2) {
@@ -176,8 +176,8 @@ public class TokTest {
 
     @Test
     public void spProtoVocabMatchesJson() {
-        SpProto sp = SpProto.read(TokTest.SPM);
-        Tokenizer h = Tokenizer.fromHfJson(TokTest.LLAMA);
+        SpProto sp #= SpProto.read(TokTest.SPM);
+        Tokenizer h #= Tokenizer.fromHfJson(TokTest.LLAMA);
         Assert.equals((int64) 32000, (int64) sp.n);
         int32 i = 0;
         while (i < sp.n) {
@@ -200,7 +200,7 @@ public class TokTest {
      */
     @Test
     public void eogIdsFindBothQwenEnders() {
-        Tokenizer t = Tokenizer.fromHfJson(TokTest.QWEN);
+        Tokenizer t #= Tokenizer.fromHfJson(TokTest.QWEN);
         int32 endText = t.idOf("<|endoftext|>");
         int32 imEnd = t.idOf("<|im_end|>");
         Assert.isTrue(endText >= 0);
@@ -225,7 +225,7 @@ public class TokTest {
      *  (LlmEngine.unionEog is where metadata ids join the set.) */
     @Test
     public void eogIdsFindNothingInALlama2Vocab() {
-        Tokenizer t = Tokenizer.fromHfJson(TokTest.LLAMA);
+        Tokenizer t #= Tokenizer.fromHfJson(TokTest.LLAMA);
         int32[] eog #= t.eogIds();
         Assert.equals(0, (int32) eog.count());
     }

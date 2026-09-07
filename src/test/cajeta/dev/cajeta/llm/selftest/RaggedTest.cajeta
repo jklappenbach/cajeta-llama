@@ -26,7 +26,7 @@ public class RaggedTest {
     static #Tensor<int32> ivec(int32[] v) {
         int64[] s = heap int64[1];
         s[0] = (int64) v.count();
-        Tensor<int32> t = Tensor.zeros<int32>(s);
+        Tensor<int32> t #= Tensor.zeros<int32>(s);
         int64 i = 0;
         while (i < s[0]) {
             t.flatSet(i, v[i]);
@@ -48,12 +48,12 @@ public class RaggedTest {
         int64[] qs = heap int64[2];
         qs[0] = (int64) totalQ;
         qs[1] = (int64) (nH * hd);
-        Tensor<float32> q = Tensor.zeros<float32>(qs);
+        Tensor<float32> q #= Tensor.zeros<float32>(qs);
         int64[] ks = heap int64[2];
         ks[0] = (int64) totalKv;
         ks[1] = (int64) (nKv * hd);
-        Tensor<float32> k = Tensor.zeros<float32>(ks);
-        Tensor<float32> v = Tensor.zeros<float32>(ks);
+        Tensor<float32> k #= Tensor.zeros<float32>(ks);
+        Tensor<float32> v #= Tensor.zeros<float32>(ks);
         int64 i = 0;
         while (i < (int64) (totalQ * nH * hd)) {
             q.flatSet(i, 0.0625f * (float32) ((i * 5 + 1) % 13) - 0.375f);
@@ -88,7 +88,7 @@ public class RaggedTest {
             s2 = s2 + 1;
         }
         float32 sc = 0.5f;
-        Tensor<float32> outAll = Prim.attendRaggedF32Op(q, k, v,
+        Tensor<float32> outAll #= Prim.attendRaggedF32Op(q, k, v,
             RaggedTest.ivec(so), RaggedTest.ivec(qp),
             RaggedTest.ivec(bases), nH, nKv, hd, 0, sc);
 
@@ -101,7 +101,7 @@ public class RaggedTest {
             int64[] q1s = heap int64[2];
             q1s[0] = (int64) len;
             q1s[1] = (int64) (nH * hd);
-            Tensor<float32> q1 = Tensor.zeros<float32>(q1s);
+            Tensor<float32> q1 #= Tensor.zeros<float32>(q1s);
             int64 j = 0;
             while (j < (int64) (len * nH * hd)) {
                 q1.flatSet(j, q.flatGet((int64) (row * nH * hd) + j));
@@ -126,7 +126,7 @@ public class RaggedTest {
             }
             int32[] b1 = heap int32[1];
             b1[0] = bases[s2];
-            Tensor<float32> out1 = Prim.attendRaggedF32Op(q1, k, v,
+            Tensor<float32> out1 #= Prim.attendRaggedF32Op(q1, k, v,
                 RaggedTest.ivec(so1c), RaggedTest.ivec(qp1c),
                 RaggedTest.ivec(b1), nH, nKv, hd, 0, sc);
             j = 0;
@@ -143,13 +143,13 @@ public class RaggedTest {
         q.gpu();
         k.gpu();
         v.gpu();
-        Tensor<int32> soT = RaggedTest.ivec(so);
-        Tensor<int32> qpT = RaggedTest.ivec(qp);
-        Tensor<int32> kbT = RaggedTest.ivec(bases);
+        Tensor<int32> soT #= RaggedTest.ivec(so);
+        Tensor<int32> qpT #= RaggedTest.ivec(qp);
+        Tensor<int32> kbT #= RaggedTest.ivec(bases);
         soT.gpu();
         qpT.gpu();
         kbT.gpu();
-        Tensor<float32> outDev = Prim.attendRaggedF32Op(q, k, v, soT, qpT,
+        Tensor<float32> outDev #= Prim.attendRaggedF32Op(q, k, v, soT, qpT,
             kbT, nH, nKv, hd, 0, sc);
         Assert.isTrue(outDev.isOnGpu());
         outDev.cpu();
@@ -182,8 +182,8 @@ public class RaggedTest {
         int64[] ks = heap int64[2];
         ks[0] = (int64) totalKv;
         ks[1] = (int64) hd;
-        Tensor<float32> k = Tensor.zeros<float32>(ks);
-        Tensor<float32> v = Tensor.zeros<float32>(ks);
+        Tensor<float32> k #= Tensor.zeros<float32>(ks);
+        Tensor<float32> v #= Tensor.zeros<float32>(ks);
         int32 s2 = 0;
         while (s2 < 3) {
             int32 t = 0;
@@ -206,7 +206,7 @@ public class RaggedTest {
         int64[] qs = heap int64[2];
         qs[0] = (int64) totalQ;
         qs[1] = (int64) hd;
-        Tensor<float32> q = Tensor.zeros<float32>(qs);
+        Tensor<float32> q #= Tensor.zeros<float32>(qs);
         int64 i = 0;
         while (i < (int64) (totalQ * hd)) {
             q.flatSet(i, 0.25f);
@@ -226,7 +226,7 @@ public class RaggedTest {
             }
             s2 = s2 + 1;
         }
-        Tensor<float32> out = Prim.attendRaggedF32Op(q, k, v,
+        Tensor<float32> out #= Prim.attendRaggedF32Op(q, k, v,
             RaggedTest.ivec(so), RaggedTest.ivec(qp),
             RaggedTest.ivec(bases), 1, 1, hd, 0, 0.5f);
         row = 0;
@@ -268,8 +268,8 @@ public class RaggedTest {
         int64[] ks = heap int64[2];
         ks[0] = (int64) totalKv;
         ks[1] = (int64) (nKv * hd);
-        Tensor<float32> k = Tensor.zeros<float32>(ks);
-        Tensor<float32> v = Tensor.zeros<float32>(ks);
+        Tensor<float32> k #= Tensor.zeros<float32>(ks);
+        Tensor<float32> v #= Tensor.zeros<float32>(ks);
         int64 i = 0;
         while (i < (int64) (totalKv * nKv * hd)) {
             k.flatSet(i, 0.0625f * (float32) ((i * 11 + 3) % 13) - 0.375f);
@@ -280,7 +280,7 @@ public class RaggedTest {
         int64[] qs = heap int64[2];
         qs[0] = (int64) totalQ;
         qs[1] = (int64) (nH * hd);
-        Tensor<float32> q = Tensor.zeros<float32>(qs);
+        Tensor<float32> q #= Tensor.zeros<float32>(qs);
         i = 0;
         while (i < (int64) (totalQ * nH * hd)) {
             q.flatSet(i, 0.0625f * (float32) ((i * 9 + 2) % 11) - 0.3125f);
@@ -305,7 +305,7 @@ public class RaggedTest {
         bases[1] = kvA;
         bases[2] = kvA + kvB;
         float32 sc = 0.5f;
-        Tensor<float32> outAll = Prim.attendRaggedF32Op(q, k, v,
+        Tensor<float32> outAll #= Prim.attendRaggedF32Op(q, k, v,
             RaggedTest.ivec(so), RaggedTest.ivec(qp),
             RaggedTest.ivec(bases), nH, nKv, hd, 0, sc);
 
@@ -324,7 +324,7 @@ public class RaggedTest {
             int64[] q1s = heap int64[2];
             q1s[0] = (int64) rows;
             q1s[1] = (int64) (nH * hd);
-            Tensor<float32> q1 = Tensor.zeros<float32>(q1s);
+            Tensor<float32> q1 #= Tensor.zeros<float32>(q1s);
             int64 j = 0;
             while (j < (int64) (rows * nH * hd)) {
                 q1.flatSet(j, q.flatGet(
@@ -341,7 +341,7 @@ public class RaggedTest {
             }
             int32[] b1 = heap int32[1];
             b1[0] = bases[it];
-            Tensor<float32> out1 = Prim.attendRaggedF32Op(q1, k, v,
+            Tensor<float32> out1 #= Prim.attendRaggedF32Op(q1, k, v,
                 RaggedTest.ivec(so1), RaggedTest.ivec(qp1),
                 RaggedTest.ivec(b1), nH, nKv, hd, 0, sc);
             j = 0;

@@ -95,7 +95,7 @@ public class AttentionTest {
         int64[] s = heap int64[2];
         s[0] = (int64) rows;
         s[1] = (int64) cols;
-        Tensor<float32> t = Tensor.zeros<float32>(s);
+        Tensor<float32> t #= Tensor.zeros<float32>(s);
         int64 i = 0;
         while (i < (int64) (rows * cols)) {
             t.flatSet(i, 0.0625f
@@ -108,7 +108,7 @@ public class AttentionTest {
     static #Tensor<int32> ivec(int32[] v) {
         int64[] s = heap int64[1];
         s[0] = (int64) v.count();
-        Tensor<int32> t = Tensor.zeros<int32>(s);
+        Tensor<int32> t #= Tensor.zeros<int32>(s);
         int64 i = 0;
         while (i < s[0]) {
             t.flatSet(i, v[i]);
@@ -125,22 +125,22 @@ public class AttentionTest {
         int32 nKv = 2;
         int32 hd = 16;
         int32 tt = 512;
-        Tensor<float32> q = AttentionTest.filled2(1, nH * hd, 1);
-        Tensor<float32> k = AttentionTest.filled2(tt, nKv * hd, 2);
-        Tensor<float32> v = AttentionTest.filled2(tt, nKv * hd, 3);
+        Tensor<float32> q #= AttentionTest.filled2(1, nH * hd, 1);
+        Tensor<float32> k #= AttentionTest.filled2(tt, nKv * hd, 2);
+        Tensor<float32> v #= AttentionTest.filled2(tt, nKv * hd, 3);
         int32[] so = heap int32[1];
         so[0] = 0;
         int32[] qp = heap int32[1];
         qp[0] = tt - 1;
         int32[] kb = heap int32[1];
         kb[0] = 0;
-        Tensor<int32> soT = AttentionTest.ivec(so);
-        Tensor<int32> qpT = AttentionTest.ivec(qp);
-        Tensor<int32> kbT = AttentionTest.ivec(kb);
+        Tensor<int32> soT #= AttentionTest.ivec(so);
+        Tensor<int32> qpT #= AttentionTest.ivec(qp);
+        Tensor<int32> kbT #= AttentionTest.ivec(kb);
         float32 sc = 0.25f;
 
         int64 b0 = Cajeta.allocatedBytes();
-        Tensor<float32> out = Prim.attendRaggedF32Op(q, k, v, soT, qpT,
+        Tensor<float32> out #= Prim.attendRaggedF32Op(q, k, v, soT, qpT,
             kbT, nH, nKv, hd, 0, sc);
         int64 delta = Cajeta.allocatedBytes() - b0;
         // A materialized per-query-head repeat of K and V would cost
@@ -173,9 +173,9 @@ public class AttentionTest {
         int32 nKv = 2;
         int32 hd = 8;
         int32 tt = 64;
-        Tensor<float32> q = AttentionTest.filled2(tt, nH * hd, 5);
-        Tensor<float32> k = AttentionTest.filled2(tt, nKv * hd, 6);
-        Tensor<float32> v = AttentionTest.filled2(tt, nKv * hd, 7);
+        Tensor<float32> q #= AttentionTest.filled2(tt, nH * hd, 5);
+        Tensor<float32> k #= AttentionTest.filled2(tt, nKv * hd, 6);
+        Tensor<float32> v #= AttentionTest.filled2(tt, nKv * hd, 7);
         int32[] so = heap int32[64];
         int32[] qp = heap int32[64];
         int32 r = 0;
@@ -189,7 +189,7 @@ public class AttentionTest {
         float32 sc = 1.0f / Math.sqrt((float32) hd);
 
         int64 b0 = Cajeta.allocatedBytes();
-        Tensor<float32> out = Prim.attendRaggedF32Op(q, k, v,
+        Tensor<float32> out #= Prim.attendRaggedF32Op(q, k, v,
             AttentionTest.ivec(so), AttentionTest.ivec(qp),
             AttentionTest.ivec(kb), nH, nKv, hd, 0, sc);
         int64 delta = Cajeta.allocatedBytes() - b0;
@@ -228,12 +228,12 @@ public class AttentionTest {
         int32 hd = 4;
         int32 tt = 24;
         int32 w = 8;
-        Tensor<float32> q = AttentionTest.filled2(1, hd, 9);
-        Tensor<float32> k = AttentionTest.filled2(tt, hd, 10);
+        Tensor<float32> q #= AttentionTest.filled2(1, hd, 9);
+        Tensor<float32> k #= AttentionTest.filled2(tt, hd, 10);
         int64[] vs = heap int64[2];
         vs[0] = (int64) tt;
         vs[1] = (int64) hd;
-        Tensor<float32> v = Tensor.zeros<float32>(vs);
+        Tensor<float32> v #= Tensor.zeros<float32>(vs);
         // Poison V outside the window of decode position 20 ([13, 20]);
         // sane values inside.
         int32 t = 0;
@@ -256,7 +256,7 @@ public class AttentionTest {
         int32[] kb = heap int32[1];
         kb[0] = 0;
         float32 sc = 0.5f;
-        Tensor<float32> out = Prim.attendRaggedF32Op(q, k, v,
+        Tensor<float32> out #= Prim.attendRaggedF32Op(q, k, v,
             AttentionTest.ivec(so), AttentionTest.ivec(qp),
             AttentionTest.ivec(kb), 1, 1, hd, w, sc);
         // Any out-of-window leakage drags the output toward 10^6.
@@ -275,8 +275,8 @@ public class AttentionTest {
         // windowed result equals the full causal reference.
         int32[] qp2 = heap int32[1];
         qp2[0] = 5;
-        Tensor<float32> q2 = AttentionTest.filled2(1, hd, 11);
-        Tensor<float32> out2 = Prim.attendRaggedF32Op(q2, k, v,
+        Tensor<float32> q2 #= AttentionTest.filled2(1, hd, 11);
+        Tensor<float32> out2 #= Prim.attendRaggedF32Op(q2, k, v,
             AttentionTest.ivec(so), AttentionTest.ivec(qp2),
             AttentionTest.ivec(kb), 1, 1, hd, w, sc);
         AttentionTest.refHead(q2, 0, k, v, 0, hd, 0, hd, 0, 5,
@@ -300,10 +300,10 @@ public class AttentionTest {
             48, 64, false);
         ToyModel.writeConfigX(cfgW, "LlamaForCausalLM", 32, 64, 2, 2, 1, 0,
             48, 64, false, "\"sliding_window\":8,");
-        ToyModel s = ToyModel.spec(2, 32, 64, 2, 1, 16, 48, false);
+        ToyModel s #= ToyModel.spec(2, 32, 64, 2, 1, 16, 48, false);
         ToyModel.writeWeights(st, s);
-        CausalLM mu = CausalLM.load(cfgU, st, 64, false);
-        CausalLM mw = CausalLM.load(cfgW, st, 64, false);
+        CausalLM mu #= CausalLM.load(cfgU, st, 64, false);
+        CausalLM mw #= CausalLM.load(cfgW, st, 64, false);
 
         int32[] toks = heap int32[4];
         toks[0] = 1;
@@ -352,22 +352,22 @@ public class AttentionTest {
     public void queryScaleOverridesDefault() {
         int32 hd = 4;
         int32 tt = 6;
-        Tensor<float32> q = AttentionTest.filled2(1, hd, 13);
-        Tensor<float32> k = AttentionTest.filled2(tt, hd, 14);
-        Tensor<float32> v = AttentionTest.filled2(tt, hd, 15);
+        Tensor<float32> q #= AttentionTest.filled2(1, hd, 13);
+        Tensor<float32> k #= AttentionTest.filled2(tt, hd, 14);
+        Tensor<float32> v #= AttentionTest.filled2(tt, hd, 15);
         int32[] so = heap int32[1];
         so[0] = 0;
         int32[] qp = heap int32[1];
         qp[0] = tt - 1;
         int32[] kb = heap int32[1];
         kb[0] = 0;
-        Tensor<int32> soT = AttentionTest.ivec(so);
-        Tensor<int32> qpT = AttentionTest.ivec(qp);
-        Tensor<int32> kbT = AttentionTest.ivec(kb);
+        Tensor<int32> soT #= AttentionTest.ivec(so);
+        Tensor<int32> qpT #= AttentionTest.ivec(qp);
+        Tensor<int32> kbT #= AttentionTest.ivec(kb);
 
-        Tensor<float32> outD = Prim.attendRaggedF32Op(q, k, v, soT, qpT,
+        Tensor<float32> outD #= Prim.attendRaggedF32Op(q, k, v, soT, qpT,
             kbT, 1, 1, hd, 0, 0.5f);
-        Tensor<float32> outC = Prim.attendRaggedF32Op(q, k, v, soT, qpT,
+        Tensor<float32> outC #= Prim.attendRaggedF32Op(q, k, v, soT, qpT,
             kbT, 1, 1, hd, 0, 0.125f);
         float64[] outRef = heap float64[hd];
         AttentionTest.refHead(q, 0, k, v, 0, hd, 0, hd, 0, tt - 1,
@@ -390,7 +390,7 @@ public class AttentionTest {
         String cfgPath = "/tmp/cajeta_llama_att_qs_cfg.json";
         ToyModel.writeConfigX(cfgPath, "LlamaForCausalLM", 32, 64, 1, 2, 1,
             0, 32, 16, false, "\"query_pre_attn_scalar\":64,");
-        ModelConfig cfg = ModelConfig.parse(cfgPath);
+        ModelConfig cfg #= ModelConfig.parse(cfgPath);
         Assert.isTrue(AttentionTest.fabs((float64) cfg.queryScale
             - 0.125) < 0.000001);
     }
@@ -407,7 +407,7 @@ public class AttentionTest {
      */
     static void assertBlockMatchesComposition(String cfgPath, String stPath,
             boolean qkNorm, boolean fourNorm, int32 normForm, int32 act) {
-        ModelConfig cfg = ModelConfig.parse(cfgPath);
+        ModelConfig cfg #= ModelConfig.parse(cfgPath);
         cfg.qkNorm = qkNorm;
         cfg.fourNorm = fourNorm;
         cfg.normForm = normForm;
@@ -419,12 +419,12 @@ public class AttentionTest {
         int32 vocab = cfg.vocabSize;
         float32 eps = cfg.rmsNormEps;
         CausalLM m = heap CausalLM(#cfg, 32, 1, 0);
-        Checkpoint ck = Checkpoint.open(stPath);
+        Checkpoint ck #= Checkpoint.open(stPath);
         m.bind(ck, false);
         ck.close();
 
-        ArrayList<String> names = m.parameterNames();
-        ArrayList<Tensor<float32>> ts = m.parameterTensors();
+        ArrayList<String> names #= m.parameterNames();
+        ArrayList<Tensor<float32>> ts #= m.parameterTensors();
 
         int32[] toks = heap int32[2];
         toks[0] = 1;
@@ -438,7 +438,7 @@ public class AttentionTest {
         int64[] xs = heap int64[2];
         xs[0] = 2;
         xs[1] = (int64) h;
-        Tensor<float32> x = Tensor.zeros<float32>(xs);
+        Tensor<float32> x #= Tensor.zeros<float32>(xs);
         int32 r = 0;
         while (r < 2) {
             int32 d = 0;
@@ -469,10 +469,10 @@ public class AttentionTest {
         Tensor<float32> wDown = ts.get(AttentionTest.idx(names,
             p + "mlp.down_proj.weight"));
 
-        Tensor<float32> xn = Prim.rmsnormF32Op(x, wIn, eps, normForm);
-        Tensor<float32> q = Tensor.matmul<float32>(xn, wq);
-        Tensor<float32> k = Tensor.matmul<float32>(xn, wk);
-        Tensor<float32> v = Tensor.matmul<float32>(xn, wv);
+        Tensor<float32> xn #= Prim.rmsnormF32Op(x, wIn, eps, normForm);
+        Tensor<float32> q #= Tensor.matmul<float32>(xn, wq);
+        Tensor<float32> k #= Tensor.matmul<float32>(xn, wk);
+        Tensor<float32> v #= Tensor.matmul<float32>(xn, wv);
         if (qkNorm) {
             // QK-norm BEFORE RoPE (5.10), per head: reshape to
             // [rows·heads, hd] so each head is one norm row, then write
@@ -485,8 +485,8 @@ public class AttentionTest {
             int64[] qhs = heap int64[2];
             qhs[0] = (int64) (2 * nH);
             qhs[1] = (int64) hd;
-            Tensor<float32> qh = q.reshape(qhs);
-            Tensor<float32> qn2 = Prim.rmsnormF32Op(qh, wqn, eps, normForm);
+            Tensor<float32> qh #= q.reshape(qhs);
+            Tensor<float32> qn2 #= Prim.rmsnormF32Op(qh, wqn, eps, normForm);
             int64 z = 0;
             while (z < qn2.size()) {
                 q.flatSet(z, qn2.flatGet(z));
@@ -495,19 +495,19 @@ public class AttentionTest {
             int64[] khs = heap int64[2];
             khs[0] = (int64) (2 * nKv);
             khs[1] = (int64) hd;
-            Tensor<float32> kh = k.reshape(khs);
-            Tensor<float32> kn2 = Prim.rmsnormF32Op(kh, wkn, eps, normForm);
+            Tensor<float32> kh #= k.reshape(khs);
+            Tensor<float32> kn2 #= Prim.rmsnormF32Op(kh, wkn, eps, normForm);
             z = 0;
             while (z < kn2.size()) {
                 k.flatSet(z, kn2.flatGet(z));
                 z = z + 1;
             }
         }
-        float32[] inv = Prim.invFreq(hd, cfg.ropeTheta, 0, 1.0f, 1.0f,
+        float32[] inv #= Prim.invFreq(hd, cfg.ropeTheta, 0, 1.0f, 1.0f,
             4.0f, 0);
         int64[] ivs = heap int64[1];
         ivs[0] = (int64) (hd / 2);
-        Tensor<float32> invT = Tensor.zeros<float32>(ivs);
+        Tensor<float32> invT #= Tensor.zeros<float32>(ivs);
         int64 ii = 0;
         while (ii < ivs[0]) {
             invT.flatSet(ii, inv[(int32) ii]);
@@ -516,7 +516,7 @@ public class AttentionTest {
         int32[] pv = heap int32[2];
         pv[0] = 0;
         pv[1] = 1;
-        Tensor<int32> posT = AttentionTest.ivec(pv);
+        Tensor<int32> posT #= AttentionTest.ivec(pv);
         Prim.ropeF32Op(q, posT, invT, nH, hd);
         Prim.ropeF32Op(k, posT, invT, nKv, hd);
         int32[] so = heap int32[2];
@@ -525,35 +525,35 @@ public class AttentionTest {
         int32[] kb = heap int32[1];
         kb[0] = 0;
         float32 sc = 1.0f / Math.sqrt((float32) hd);
-        Tensor<float32> ao = Prim.attendRaggedF32Op(q, k, v,
+        Tensor<float32> ao #= Prim.attendRaggedF32Op(q, k, v,
             AttentionTest.ivec(so), posT, AttentionTest.ivec(kb),
             nH, nKv, hd, 0, sc);
-        Tensor<float32> proj = Tensor.matmul<float32>(ao, wo);
+        Tensor<float32> proj #= Tensor.matmul<float32>(ao, wo);
         if (fourNorm) {
-            proj = Prim.rmsnormF32Op(proj, wPa, eps, normForm);
+            proj #= Prim.rmsnormF32Op(proj, wPa, eps, normForm);
         }
-        x = Tensor.add<float32>(x, proj);
+        x #= Tensor.add<float32>(x, proj);
 
         Tensor<float32> preW = wPa;
         if (fourNorm) {
             preW = ts.get(AttentionTest.idx(names,
                 p + "pre_feedforward_layernorm.weight"));
         }
-        Tensor<float32> x2 = Prim.rmsnormF32Op(x, preW, eps, normForm);
-        Tensor<float32> gate = Tensor.matmul<float32>(x2, wGate);
-        Tensor<float32> up = Tensor.matmul<float32>(x2, wUp);
-        Tensor<float32> glu = Prim.gluF32Op(gate, up, act);
-        Tensor<float32> mo = Tensor.matmul<float32>(glu, wDown);
+        Tensor<float32> x2 #= Prim.rmsnormF32Op(x, preW, eps, normForm);
+        Tensor<float32> gate #= Tensor.matmul<float32>(x2, wGate);
+        Tensor<float32> up #= Tensor.matmul<float32>(x2, wUp);
+        Tensor<float32> glu #= Prim.gluF32Op(gate, up, act);
+        Tensor<float32> mo #= Tensor.matmul<float32>(glu, wDown);
         if (fourNorm) {
             Tensor<float32> wPf = ts.get(AttentionTest.idx(names,
                 p + "post_feedforward_layernorm.weight"));
-            mo = Prim.rmsnormF32Op(mo, wPf, eps, normForm);
+            mo #= Prim.rmsnormF32Op(mo, wPf, eps, normForm);
         }
-        x = Tensor.add<float32>(x, mo);
+        x #= Tensor.add<float32>(x, mo);
 
         Tensor<float32> wNorm = ts.get(AttentionTest.idx(names,
             "model.norm.weight"));
-        Tensor<float32> xf = Prim.rmsnormF32Op(x, wNorm, eps, normForm);
+        Tensor<float32> xf #= Prim.rmsnormF32Op(x, wNorm, eps, normForm);
         // Tied output projection against the embedding matrix, last row.
         float64 maxDiff = 0.0;
         int32 t = 0;
@@ -595,7 +595,7 @@ public class AttentionTest {
         String stPath = "/tmp/cajeta_llama_att_blk2.safetensors";
         ToyModel.writeConfig(cfgPath, "LlamaForCausalLM", 16, 32, 1, 2, 1,
             0, 24, 32, true);
-        ToyModel s = ToyModel.specVariant(1, 16, 32, 2, 1, 8, 24, true,
+        ToyModel s #= ToyModel.specVariant(1, 16, 32, 2, 1, 8, 24, true,
             false, false);
         ToyModel.writeWeights(stPath, s);
         AttentionTest.assertBlockMatchesComposition(cfgPath, stPath,
@@ -608,7 +608,7 @@ public class AttentionTest {
         String stPath = "/tmp/cajeta_llama_att_blk4.safetensors";
         ToyModel.writeConfig(cfgPath, "LlamaForCausalLM", 16, 32, 1, 2, 1,
             0, 24, 32, true);
-        ToyModel s = ToyModel.specVariant(1, 16, 32, 2, 1, 8, 24, true,
+        ToyModel s #= ToyModel.specVariant(1, 16, 32, 2, 1, 8, 24, true,
             true, true);
         ToyModel.writeWeights(stPath, s);
         // Full Gemma shape: four norms, QK-norm, (1+w) form, GeGLU.

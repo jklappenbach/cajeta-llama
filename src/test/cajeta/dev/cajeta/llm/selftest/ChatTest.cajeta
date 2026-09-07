@@ -67,7 +67,7 @@ public class ChatTest {
             bos = "";
             eos = "<|im_end|>";
         }
-        ChatTemplate t = ChatTemplate.fromString(text, tag, bos, eos);
+        ChatTemplate t #= ChatTemplate.fromString(text, tag, bos, eos);
         t.setNowEpochSeconds(ChatTest.NOW);
         return #t;
     }
@@ -150,12 +150,12 @@ public class ChatTest {
 
     static void assertCase(String tag, String caseName, String msgs,
             String tools, boolean addGen) {
-        String want = ChatTest.expected(tag, caseName);
+        String want #= ChatTest.expected(tag, caseName);
         if (want == null) {
             return;                       // family lacks this case
         }
-        ChatTemplate t = ChatTest.load(tag);
-        String got = t.renderJson(msgs, tools, addGen);
+        ChatTemplate t #= ChatTest.load(tag);
+        String got #= t.renderJson(msgs, tools, addGen);
         Assert.equals(want, got);
     }
 
@@ -211,7 +211,7 @@ public class ChatTest {
     // ── 13.1.2 — control constructs and whitespace control ──────────────
 
     static #String render(String tpl, String msgs) {
-        ChatTemplate t = ChatTemplate.fromString(tpl, "inline", "<s>",
+        ChatTemplate t #= ChatTemplate.fromString(tpl, "inline", "<s>",
             "</s>");
         t.setNowEpochSeconds(ChatTest.NOW);
         return #t.renderJson(msgs, null, false);
@@ -348,7 +348,7 @@ public class ChatTest {
     public void raiseExceptionAndUnsupportedConstructsError() {
         boolean threw = false;
         try {
-            String s = ChatTest.render(
+            String s #= ChatTest.render(
                 "{% if true %}{{ raise_exception('boom town') }}{% endif %}",
                 "[]");
             Assert.isTrue(s.byteLength() < 0);      // unreachable
@@ -362,7 +362,7 @@ public class ChatTest {
         try {
             // {% with %} joined the supported set when rendering moved
             // to dev.cajeta.jinja; {% do %} stays outside it.
-            String s2 = ChatTest.render("line1\n{% do thing %}",
+            String s2 #= ChatTest.render("line1\n{% do thing %}",
                 "[]");
             Assert.isTrue(s2.byteLength() < 0);     // unreachable
         } catch (LlmException ex2) {
@@ -374,7 +374,7 @@ public class ChatTest {
         // An unsupported filter is named too.
         threw = false;
         try {
-            String s3 = ChatTest.render("{{ 'x' | frobnicate }}", "[]");
+            String s3 #= ChatTest.render("{{ 'x' | frobnicate }}", "[]");
             Assert.isTrue(s3.byteLength() < 0);     // unreachable
         } catch (LlmException ex3) {
             threw = true;
@@ -387,7 +387,7 @@ public class ChatTest {
 
     @Test
     public void strftimeNowUsesInjectedClock() {
-        ChatTemplate t = ChatTemplate.fromString(
+        ChatTemplate t #= ChatTemplate.fromString(
             "today={{ strftime_now('%d %b %Y') }}", "clock", "", "");
         t.setNowEpochSeconds((int64) 1930262400);   // 2031-03-03 UTC
         Assert.equals("today=03 Mar 2031", t.renderJson("[]", null, false));
@@ -411,19 +411,19 @@ public class ChatTest {
         // real `tokenizer_config.json` (HF), and handed over as raw text
         // (the GGUF `tokenizer.chat_template` shape) — must render
         // identically and match the reference (7.11).
-        ChatTemplate fromCfg = ChatTemplate.fromTokenizerConfig(
+        ChatTemplate fromCfg #= ChatTemplate.fromTokenizerConfig(
             ChatTest.DIR + "qwen25-tokenizer_config.json");
         fromCfg.setNowEpochSeconds(ChatTest.NOW);
         Assert.equals("<|im_end|>", fromCfg.eos());
 
         int8[] tplRaw = File.readAllBytes(ChatTest.DIR + "qwen25.jinja");
         String tplText = heap String(#tplRaw, (int32) tplRaw.count());
-        ChatTemplate fromGguf = ChatTemplate.fromString(tplText, "gguf",
+        ChatTemplate fromGguf #= ChatTemplate.fromString(tplText, "gguf",
             "", "<|im_end|>");
         fromGguf.setNowEpochSeconds(ChatTest.NOW);
 
-        String a = fromCfg.renderJson(ChatTest.MULTI, null, true);
-        String b = fromGguf.renderJson(ChatTest.MULTI, null, true);
+        String a #= fromCfg.renderJson(ChatTest.MULTI, null, true);
+        String b #= fromGguf.renderJson(ChatTest.MULTI, null, true);
         Assert.equals(a, b);
         Assert.equals(ChatTest.expected("qwen25", "multi_gen"), a);
     }

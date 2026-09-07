@@ -928,7 +928,7 @@ public final class Tokenizer {
                 int32 bl = s.byteLength();
                 int32 j = 0;
                 while (j < bl) {
-                    String bt = Tokenizer.byteTokenName(
+                    String bt #= Tokenizer.byteTokenName(
                         (int32) s.byteAt(j) & 255);
                     int32 bid = this.vocab.get(bt);
                     if (bid < 0) {
@@ -972,7 +972,7 @@ public final class Tokenizer {
                 i = i + 1;
             }
             String s = heap String(#seg, to - from);
-            String normed = s.nfc();
+            String normed #= s.nfc();
             int32 nl = normed.byteLength();
             int8[] nb = heap int8[nl];
             i = 0;
@@ -1160,7 +1160,7 @@ public final class Tokenizer {
         String[] syms = heap String[bn];
         i = 0;
         while (i < bn) {
-            String s = Tokenizer.cpStr(this.b2u[(int32) pb[i] & 255]);
+            String s #= Tokenizer.cpStr(this.b2u[(int32) pb[i] & 255]);
             syms[i] #= s;
             i = i + 1;
         }
