@@ -27,7 +27,7 @@ plan's acceptance and in the bench memory.
 ## Unit 1 — Name the refusal (spec §2)
 
 ### 1.1 TDD
-- [~] 1.1.1 `DiagTest`: a `Linear` whose format has no batched route on the
+- [x] 1.1.1 `DiagTest`: a `Linear` whose format has no batched route on the
       active backend makes `batchReady` emit one `batch-refused` record
       naming layer, projection, format and predicate; a second layer with
       the same (projection, format, reason) does not emit again.
@@ -47,15 +47,21 @@ plan's acceptance and in the bench memory.
       map never saw). Reverting cajeta 66041f35 (CpuBarrierFission: latch as
       scaffold after the last barrier — the fix that newly ACCEPTS these WMMA
       kernels) makes the module compile. Fix lands in cajeta.
-- [ ] 1.1.2 `DiagTest`: the `prefill-mode per-row` record carries the
+      FIXED 2026-09-07, cajeta 057f4fe9: the cause was not the inliner but
+      the fission walk regioning the `if (t0 < rows && i0 < outDim)` join
+      block twice (pre-loop and post-loop region); a barrier loop under
+      divergent control flow is now DECLINED by name (the host-stub
+      fallback that ran before 66041f35). Suite on that compiler, cpu:
+      359 passed / 0 failed / 1 skipped, both DiagTest tests green.
+- [x] 1.1.2 `DiagTest`: the `prefill-mode per-row` record carries the
       refusal count in `v1`.
 
 ### 1.2 Coding
-- [ ] 1.2.1 `CausalLM.batchReady` collects the first failing predicate per
+- [x] 1.2.1 `CausalLM.batchReady` collects the first failing predicate per
       projection through a `Linear.batchRefusal()` string (`"deqPrefill
       off"`, `"no batch kernel for <ty>"`, `"rows % 128"`, `"coop cols"`,
       `"packedTy < 0"`) and emits `batch-refused` once per distinct triple.
-- [ ] 1.2.2 `DiagRecord` documents the two records; `LoggingDiagCallback`
+- [x] 1.2.2 `DiagRecord` documents the two records; `LoggingDiagCallback`
       prints them.
 
 ### 1.3 Acceptance
@@ -108,6 +114,28 @@ plan's acceptance and in the bench memory.
       `packedDev` the repack reads (weight prefetch stream? handle not yet
       assigned?), `coopW` = `coopDev.wordView()`, `btXh`. Under serialization
       the same launch computes the right tokens.
+
+      NIGHT 2 (2026-09-07, after the compiler fix landed as cajeta 057f4fe9):
+      the standalone spike binary `tmp/llmbench-spike/schedthroughput` is
+      VOID — its tree-shaker pruned `q80F16CoopX1Kernel` (and `gluF32`) as
+      unreachable, because on an amdgpu build the coop branch is statically
+      dead (`backendIsVulkan()` false; `coopRoutedHere()` gates on the
+      `coopAllBackends` static, flipped only at RUNTIME). Re-running it now
+      prints `no registered kernel q80F16CoopX1Kernel` and first token 0 for
+      every arm (base/serialize=1,2/copy=3), so those four arms measure
+      nothing. The GPU itself is HEALTHY: AttentionTest device tests pass and
+      the kernel log shows no new amdgpu page fault during these runs, so the
+      real 2026-09-06 aperture fault stands (it came from a build where the
+      kernel survived). PRODUCTION SIGNAL: 2.2.1 must open the coop branch
+      STRUCTURALLY on amdgpu (not behind a runtime-only flag) so tree-shake
+      keeps the kernels — a runtime `setCoopAllBackends` flag alone yields a
+      binary with no coop kernel. REPRO CONSTRAINT: the coop route needs
+      `outDim % 128 == 0` and `cols % 64|256 == 0`; the toy/kquant fixtures
+      are [out=8,in=256] and never engage it, so 2.1.2 needs a 128-aligned
+      Q8_0 fixture (a .cajeta gguf generator) OR the real 8B model on device,
+      in the TEST harness (CoopQuantGemmTest-style) where the kernel stays
+      reachable. The coopsync1/2 bench arms in cc05c21 set flags with NO use
+      site in Linear (dead) — ignore their earlier "brackets".
 - [ ] 2.1.2 `LinearKernelRouteTest`: on gfx1151, a Q8_0 / Q2_K / Q3_K /
       Q5_K `Linear` built from the `kquant/` fixture blocks reports
       `isBatchRoutedFor(128) == true` with `prefillWeights=packed`, and the
