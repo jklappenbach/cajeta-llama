@@ -64,7 +64,7 @@ public class ResidencyProbe {
         int64 dataStart = (hlen + 31L) / 32L * 32L;
         int64 rowBytes = (int64) cols / 256L * 144L;
         int64 payload = (int64) experts * (int64) rows * rowBytes;
-        File f = File.open(path, OpenMode.READ_WRITE);
+        File f #= File.open(path, OpenMode.READ_WRITE);
         f.truncate(dataStart + payload);
         f.close();
         System.stdout.println("file written, payload " + payload);

@@ -137,7 +137,7 @@ public class TokTest {
     @Test
     public void unsupportedModelTypeNamesIt() {
         String path = "/tmp/cajeta_llama_tok_ugm.json";
-        File w = File.open(path, OpenMode.WRITE);
+        File w #= File.open(path, OpenMode.WRITE);
         String doc = "{\"model\": {\"type\": \"Unigram\", \"vocab\": []}}";
         int32 n = doc.byteLength();
         int8[] b = heap int8[n];

@@ -116,7 +116,7 @@ public class SafetensorsTest {
      * helper returns an empty array.
      */
     static int64 rssKb() {
-        File f = File.open("/proc/self/status", OpenMode.READ);
+        File f #= File.open("/proc/self/status", OpenMode.READ);
         int8[] st = heap int8[8192];
         int64 n = f.read(st, 0, 8192);
         f.close();
@@ -368,7 +368,7 @@ public class SafetensorsTest {
             i = i + 1;
         }
         File.writeAllBytes(path, head, 8 + hlen);
-        File f = File.open(path, OpenMode.READ_WRITE);
+        File f #= File.open(path, OpenMode.READ_WRITE);
         f.truncate(8 + hlen + payload);
         f.close();
 
@@ -409,7 +409,7 @@ public class SafetensorsTest {
 
     /** MemAvailable in KiB from /proc/meminfo (-1 if unreadable). */
     static int64 memAvailableKb() {
-        File f = File.open("/proc/meminfo", OpenMode.READ);
+        File f #= File.open("/proc/meminfo", OpenMode.READ);
         int8[] st = heap int8[4096];
         int64 n = f.read(st, 0, 4096);
         f.close();
@@ -468,7 +468,7 @@ public class SafetensorsTest {
             i = i + 1;
         }
         File.writeAllBytes(path, head, 8 + hlen);
-        File fh = File.open(path, OpenMode.READ_WRITE);
+        File fh #= File.open(path, OpenMode.READ_WRITE);
         fh.truncate(8 + hlen + payload);
         fh.close();
 

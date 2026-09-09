@@ -387,7 +387,7 @@ public final class Checkpoint {
     }
 
     void openSharded(String indexPath) {
-        int8[] raw = File.readAllBytes(indexPath);
+        int8[] raw #= File.readAllBytes(indexPath);
         int64 rawLen = (int64) raw.count();
         if (rawLen <= 0) {
             throw heap LlmException("checkpoint: index '" + indexPath

@@ -51,7 +51,7 @@ public class ChatTest {
         + " \"fahrenheit\"]}}, \"required\": [\"location\"]}}}]";
 
     static #ChatTemplate load(String tag) {
-        int8[] raw = File.readAllBytes(ChatTest.DIR + tag + ".jinja");
+        int8[] raw #= File.readAllBytes(ChatTest.DIR + tag + ".jinja");
         int32 n = (int32) raw.count();
         if (n <= 0) {
             throw heap LlmException("missing fixture: " + tag);
@@ -86,7 +86,7 @@ public class ChatTest {
      * `ChatTemplate.fromTokenizerConfig` (spec 13.7).
      */
     static #String expected(String tag, String caseName) {
-        int8[] raw = File.readAllBytes(ChatTest.FIX);
+        int8[] raw #= File.readAllBytes(ChatTest.FIX);
         JsonReader r = heap JsonReader(raw, (int64) raw.count());
         // {"cases": {"<tag>": {"<caseName>": "<text>"}}}
         if (!ChatTest.enterKey(r, "cases")) { return null; }
@@ -416,7 +416,7 @@ public class ChatTest {
         fromCfg.setNowEpochSeconds(ChatTest.NOW);
         Assert.equals("<|im_end|>", fromCfg.eos());
 
-        int8[] tplRaw = File.readAllBytes(ChatTest.DIR + "qwen25.jinja");
+        int8[] tplRaw #= File.readAllBytes(ChatTest.DIR + "qwen25.jinja");
         String tplText = heap String(#tplRaw, (int32) tplRaw.count());
         ChatTemplate fromGguf #= ChatTemplate.fromString(tplText, "gguf",
             "", "<|im_end|>");

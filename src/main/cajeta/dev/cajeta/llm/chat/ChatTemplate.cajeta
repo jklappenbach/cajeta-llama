@@ -104,7 +104,7 @@ public final class ChatTemplate {
      * Unit 12 accessor exists for.
      */
     public static #ChatTemplate fromTokenizerConfig(String path) {
-        int8[] raw = File.readAllBytes(path);
+        int8[] raw #= File.readAllBytes(path);
         int64 rawLen = (int64) raw.count();
         if (rawLen <= 0) {
             throw heap LlmException("chat template: '" + path

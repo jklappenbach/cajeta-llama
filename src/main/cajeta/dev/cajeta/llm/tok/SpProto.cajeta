@@ -33,7 +33,7 @@ public final class SpProto {
 
     /** Read every piece (string, score, type) from a ModelProto file. */
     public static #SpProto read(String path) {
-        int8[] raw = File.readAllBytes(path);
+        int8[] raw #= File.readAllBytes(path);
         int64 rawLen = (int64) raw.count();
         if (rawLen <= 0) {
             throw heap LlmException("sp model: '" + path

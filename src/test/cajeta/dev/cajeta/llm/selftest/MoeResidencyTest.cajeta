@@ -78,7 +78,7 @@ public class MoeResidencyTest {
         int64 rowBytes = (int64) MoeResidencyTest.COLS / 256L * 144L;
         int64 payload = (int64) MoeResidencyTest.EXPERTS
             * (int64) MoeResidencyTest.ROWS * rowBytes;
-        File f = File.open(path, OpenMode.READ_WRITE);
+        File f #= File.open(path, OpenMode.READ_WRITE);
         f.truncate(dataStart + payload);
         f.close();
         return #path;

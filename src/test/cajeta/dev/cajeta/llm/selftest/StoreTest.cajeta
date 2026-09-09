@@ -24,7 +24,7 @@ public class StoreTest {
     public StoreTest() { return; }
 
     static void truncate(String path) {
-        File f = File.open(path, OpenMode.WRITE);
+        File f #= File.open(path, OpenMode.WRITE);
         f.close();
         return;
     }
@@ -131,7 +131,7 @@ public class StoreTest {
         // directly in the data file → verified read becomes a MISS.
         int64 hitsBefore = s2.hits();
         s2.close();
-        File df = File.open(base + ".data", OpenMode.READ_WRITE);
+        File df #= File.open(base + ".data", OpenMode.READ_WRITE);
         // key 1013 was the 14th put → extent 13; header 16B + payload.
         df.seek(13 * (16 + 64) + 16 + 5);
         int8[] one = heap int8[1];
